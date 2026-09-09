@@ -93,3 +93,19 @@ keychain via `/usr/bin/security` by default; everywhere else, and when
 readable only by the owner. swapd never reads another tool's state beyond
 the provider's own login files (Claude Code's `.credentials.json`,
 `.claude.json`); it does not read or write any other CLI's configuration.
+
+## Migrate from cswap
+
+1. Export your accounts by hand, from cswap: `cswap export ~/swapd-import.json`.
+2. Import them into swapd: `swapd import ~/swapd-import.json`.
+3. Check the two engines agree before trusting swapd:
+   `python3 tools/parity.py` — it re-runs the import, then diffs
+   `swapd list --json --provider claude` against `cswap list --json`
+   (usage percentages, reset times, active slot, alias) and exits 1 on
+   any mismatch.
+4. Point Infinitus at the swapd engine, in its Engines pane.
+
+swapd never reads cswap's state directly. The only two touchpoints
+between the two tools are the export file you produce by hand and, only
+inside `tools/parity.py`, a `cswap list --json` subprocess call for the
+diff — swapd itself never runs or shells out to cswap.

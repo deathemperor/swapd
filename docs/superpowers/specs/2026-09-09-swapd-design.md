@@ -362,6 +362,7 @@ TUI, directory mappings, session resume, cmux, Slack/Telegram sending
 - API-key slots cannot be activated in phase 1 (`can_activate`); `includeApiKeyAccounts` is stored only.
 - Settings defaults are cswap's `AutoSwitchSettings` (threshold 90.0, interval 60, cooldown 300, hysteresis 10, strategy best, unhealthyTicks 3, model/preferred empty); a plain `rotate` uses `settings.strategy`.
 - The auto tick nominates fetches like cswap `_collect_scheduled_usage` (active if due + one due candidate + escalation band) via `CollectOpts.only`; consume-first re-measures `{current, target}` before committing.
+- `collect` = `prepare` (lock, live, secrets, adopt/heal) + `execute` (fetch set); the auto tick prepares once and re-prepares after a switch; a second `execute` re-reads only the slots it claimed so a rotated token is never re-spent.
 - `ignite`/`run`: refresh-if-expired first; `rotated` persisted before a non-zero exit is reported; `run` on the active slot execs directly (same-account fast path); the profile seed marker advances only after the rotation is persisted (`commit_profile`); `remove` calls `forget_profile`.
 - Tests never touch the real keychain, `~/.claude*`, `~/.swapd`, the real `claude` or the network: `SWAPD_SECRETS=file|memory`, `SWAPD_LIVE_STORE=file|keychain`, `SWAPD_HOME`, `SWAPD_URL_*`, `SWAPD_CLAUDE_CLI`, all via `Command::env`.
 

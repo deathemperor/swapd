@@ -5,7 +5,7 @@
 //! network, no keychain, no `~/.claude*`.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
@@ -47,6 +47,13 @@ impl FakeDriver {
     pub fn usable(self, token: &str) -> Self {
         self.usable.lock().unwrap().insert(token.to_string());
         self
+    }
+
+    /// Retire this refresh token's access token — the ordinary way a
+    /// credential a pass measured needs refreshing by the time the next one
+    /// uses it.
+    pub fn unusable(&self, token: &str) {
+        self.usable.lock().unwrap().remove(token);
     }
 
     pub fn slow_refresh(mut self, delay: Duration) -> Self {
@@ -186,6 +193,100 @@ impl Driver for FakeDriver {
             run: true,
         }
     }
+}
+
+/// The in-memory secret store, counting every read and able to fail from a
+/// given read onwards.
+///
+/// What a pass costs in secret reads is not an implementation detail: each one
+/// is a `/usr/bin/security` spawn on macOS, and each one is a fallible call
+/// whose position in the pass decides what a fault can take down with it.
+struct CountingSecrets {
+    inner: crate::secrets::MemorySecrets,
+    probe: SecretsProbe,
+}
+
+/// The handle a test keeps on a `CountingSecrets` the context owns.
+#[derive(Clone, Default)]
+struct SecretsProbe {
+    gets: Arc<Mutex<Vec<String>>>,
+    /// Fail every read from this one onwards — a keychain that goes down
+    /// partway through a pass.
+    fail_from: Arc<Mutex<Option<usize>>>,
+}
+
+impl SecretsProbe {
+    fn gets(&self) -> Vec<String> {
+        self.gets.lock().unwrap().clone()
+    }
+
+    fn fail_from(&self, nth: usize) {
+        *self.fail_from.lock().unwrap() = Some(nth);
+    }
+}
+
+impl crate::secrets::Secrets for CountingSecrets {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        let mut gets = self.probe.gets.lock().unwrap();
+        gets.push(key.to_string());
+        let nth = gets.len();
+        drop(gets);
+        if self
+            .probe
+            .fail_from
+            .lock()
+            .unwrap()
+            .is_some_and(|n| nth >= n)
+        {
+            return Err(SwapdError::new(ErrorCode::Io, "the secret store is down"));
+        }
+        self.inner.get(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<()> {
+        self.inner.set(key, value)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key)
+    }
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+}
+
+/// A two-slot fleet, slot 1 live, both credentials usable — one pass fetches
+/// both and refreshes neither, so every secret read the pass makes is the
+/// collector's own.
+fn two_slots(dir: &std::path::Path) -> (Ctx, SecretsProbe) {
+    let mut ctx = ctx_for(dir);
+    let probe = SecretsProbe::default();
+    ctx.secrets = Box::new(CountingSecrets {
+        inner: crate::secrets::MemorySecrets::new(),
+        probe: probe.clone(),
+    });
+    for (slot, email, token) in [
+        (1, "one@example.com", "rt-1"),
+        (2, "two@example.com", "rt-2"),
+    ] {
+        ctx.secrets
+            .set(&slot_key("claude", slot), &login_for(email, token))
+            .unwrap();
+        slots::update(&ctx.home.slots_file(), |file| {
+            let provider = file.providers.entry("claude".to_string()).or_default();
+            provider.insert(slot, slot_row(email));
+            if slot == 1 {
+                provider.active_slot = Some(1);
+            }
+            Ok((true, ()))
+        })
+        .unwrap();
+    }
+    (ctx, probe)
+}
+
+fn both_usable() -> FakeDriver {
+    FakeDriver::new(&login_for("one@example.com", "rt-1"))
+        .usable("rt-1")
+        .usable("rt-2")
 }
 
 /// A `Ctx` over a temp home, an in-memory secret store and a fixed clock.
@@ -449,4 +550,161 @@ fn a_contended_refresh_lock_is_stale_not_a_strike() {
     assert!(row["lastError"].is_null(), "{row}");
     assert!(row["backoffUntil"].is_null(), "{row}");
     assert!(row["claimUntil"].is_null(), "{row}");
+}
+
+#[test]
+fn a_second_execute_uses_the_successor_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+    let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"));
+    let mut prepared = prepare(&ctx, &driver, slots::LOCK_TIMEOUT).unwrap();
+    let forced = || FetchOpts {
+        force_slots: vec![1],
+        ..FetchOpts::default()
+    };
+
+    // Pass 1: rt-1's access token is spent, so the fetch rotates the lineage
+    // and persists rt-next-1 (secret, slot fingerprint and live store).
+    let view = execute(&ctx, &driver, &mut prepared, &forced()).unwrap();
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+    assert_eq!(
+        ctx.secrets.get(&slot_key("claude", 1)).unwrap().unwrap(),
+        login_for("one@example.com", "rt-next-1")
+    );
+
+    // By pass 2 the successor's own access token has expired too, so this pass
+    // refreshes as well — with the successor, never with the generation pass 1
+    // spent. Re-POSTing that one is a `RefreshDenied` and a dead-token strike
+    // on a healthy account.
+    driver.unusable("rt-next-1");
+    let view = execute(&ctx, &driver, &mut prepared, &forced()).unwrap();
+
+    let refreshes = driver.refreshes.lock().unwrap().clone();
+    assert_eq!(refreshes.len(), 2, "{refreshes:?}");
+    assert_eq!(
+        refreshes[1],
+        login_for("one@example.com", "rt-next-1"),
+        "the second pass must POST the successor the first one left behind"
+    );
+    assert_eq!(
+        ctx.secrets.get(&slot_key("claude", 1)).unwrap().unwrap(),
+        login_for("one@example.com", "rt-next-next-1"),
+        "and its own rotation is the one the slot ends on"
+    );
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+    assert_eq!(
+        driver.live_bytes().unwrap(),
+        login_for("one@example.com", "rt-next-next-1")
+    );
+}
+
+#[test]
+fn pass_marks_do_not_leak_between_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_for(dir.path());
+    // The active slot's access token expired long ago.
+    let expired = login_expiring("one@example.com", "rt-1", 1_000_000);
+    ctx.secrets.set(&slot_key("claude", 1), &expired).unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        provider.insert(1, slot_row("one@example.com"));
+        provider.active_slot = Some(1);
+        Ok((true, ()))
+    })
+    .unwrap();
+    let driver = FakeDriver::new(&expired);
+    let mut prepared = prepare(&ctx, &driver, slots::LOCK_TIMEOUT).unwrap();
+
+    // Pass 1 fetches nothing, so the expired active credential surfaces as
+    // expired rather than as a stale `ok`.
+    let view = execute(
+        &ctx,
+        &driver,
+        &mut prepared,
+        &FetchOpts {
+            only: Some(Vec::new()),
+            ..FetchOpts::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::TokenExpired);
+
+    // That mark was about pass 1's fetch gate, not about the slot: pass 2
+    // claims it, refreshes it, and reports what it measured.
+    let view = execute(
+        &ctx,
+        &driver,
+        &mut prepared,
+        &FetchOpts {
+            force_slots: vec![1],
+            ..FetchOpts::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(driver.refreshes.lock().unwrap().len(), 1);
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+}
+
+/// The successor re-read is for a `Prepared` that will be used again. `collect`
+/// drops its own with the view, so paying for it there would be one keychain
+/// read per FETCHED slot for a value nothing reads back — a doubling of
+/// `refresh`'s per-slot secret cost on the path this split exists to cheapen.
+#[test]
+fn a_single_pass_collect_re_reads_no_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, probe) = two_slots(dir.path());
+    let driver = both_usable();
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert!(view
+        .accounts
+        .iter()
+        .all(|a| a.usage_status == UsageStatus::Ok));
+    assert_eq!(
+        probe.gets(),
+        vec![slot_key("claude", 1), slot_key("claude", 2)],
+        "one preamble read per slot, and nothing after the fetches"
+    );
+
+    // The multi-pass path, which does have a reader for them, still pays.
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, probe) = two_slots(dir.path());
+    let driver = both_usable();
+    let mut prepared = prepare(&ctx, &driver, slots::LOCK_TIMEOUT).unwrap();
+    execute(&ctx, &driver, &mut prepared, &FetchOpts::default()).unwrap();
+    assert_eq!(probe.gets().len(), 4, "{:?}", probe.gets());
+}
+
+/// The re-read is a fallible call placed AFTER every row has been written, so a
+/// keychain that goes down mid-pass must not take down a verb whose work is
+/// already done. Only a caller that needs the successors can be failed by one.
+#[test]
+fn a_failing_successor_re_read_cannot_fail_a_single_pass_collect() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, probe) = two_slots(dir.path());
+    let driver = both_usable();
+    // The store goes down after the preamble's two reads.
+    probe.fail_from(3);
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert!(view
+        .accounts
+        .iter()
+        .all(|a| a.usage_status == UsageStatus::Ok));
+
+    // The multi-pass path is where the fault can surface — and it surfaces
+    // after the fetches, which are recorded either way.
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, probe) = two_slots(dir.path());
+    let driver = both_usable();
+    let mut prepared = prepare(&ctx, &driver, slots::LOCK_TIMEOUT).unwrap();
+    probe.fail_from(3);
+    assert!(execute(&ctx, &driver, &mut prepared, &FetchOpts::default()).is_err());
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.home.usage_file()).unwrap()).unwrap();
+    assert!(
+        rows["rows"]["claude:1"]["fetchedAt"].is_number(),
+        "the fetch it failed after was still recorded: {rows}"
+    );
 }

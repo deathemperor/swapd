@@ -35,7 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{AccountView, ProviderView, UsageStatus, Window};
-use crate::core::collect::{collect, CollectOpts};
+use crate::core::collect::{self, collect, CollectOpts, FetchOpts, Prepared};
 use crate::core::events::{pct_label, window_label, Emit, Event};
 use crate::core::history::SlotRef;
 use crate::core::poll_policy::{
@@ -445,6 +445,13 @@ impl<'a> AutoEngine<'a> {
         if trigger == "consume-first" {
             if let Some(target) = ordered.first().copied() {
                 if !snap.fresh(target) {
+                    // A whole pass, preamble included, rather than another
+                    // `execute` over the tick's `Prepared`: this is the
+                    // re-measure that decides a switch, and by the time the
+                    // next tick's phases run the live login may have moved
+                    // under it. Anything that runs after a switch has landed
+                    // must prepare again for the same reason -- a `Prepared`
+                    // from before the switch names the wrong active account.
                     view = collect(
                         &self.ctx,
                         self.driver,
@@ -847,6 +854,30 @@ impl<'a> AutoEngine<'a> {
     ///
     /// Nothing here re-implements fetch policy: the engine nominates, and
     /// `reserve` — under the table's lock — decides who is actually fetched.
+    ///
+    /// All three passes run over ONE `Prepared`: the live login, every slot's
+    /// secret and the adopt/heal are the tick's most expensive half (one
+    /// `/usr/bin/security` spawn per slot on macOS) and nothing this function
+    /// does changes them — it initiates no switch. A switch landing from
+    /// OUTSIDE (a manual `swapd switch`, the CLI's own `/login`) is not
+    /// picked up by a later phase the way a per-phase preamble would have
+    /// picked it up; it is caught instead where it matters, by
+    /// `switch::perform`, which re-reads the live login itself before it
+    /// commits and reports `already-active` rather than landing on a picture
+    /// this tick has stopped describing.
+    ///
+    /// One window widens from one pass to one tick: Claude Code refreshing its
+    /// OWN login mid-tick is outside `core::refresh`'s compare-and-swap, which
+    /// is on the SLOT's stored secret and so only orders swapd's refreshers
+    /// against each other. A later phase can therefore POST the generation the
+    /// CLI has just spent and earn one `invalid_grant` — a dead-strike and
+    /// `relogin-required` on a healthy account. It heals itself: the next
+    /// tick's `prepare` adopts the live generation and `clear_dead`s the row
+    /// it just rewrote. The same race exists per-pass on main; preparing once
+    /// makes its window a tick instead of a pass, and both are seconds wide.
+    ///
+    /// What each pass fetches, and the order the decisions are made in, is
+    /// unchanged.
     fn collect_scheduled(
         &mut self,
         settings: &Settings,
@@ -855,12 +886,14 @@ impl<'a> AutoEngine<'a> {
         // Phase A's baseline picture, fetching nothing: the nomination is
         // computed from the same rows `reserve` will judge, so a slot is
         // nominated and fetched on one view of the table rather than two.
-        let pre = collect(
+        let mut prepared = collect::prepare(&self.ctx, self.driver, slots::LOCK_TIMEOUT)?;
+        let pre = collect::execute(
             &self.ctx,
             self.driver,
-            &CollectOpts {
+            &mut prepared,
+            &FetchOpts {
                 only: Some(Vec::new()),
-                ..CollectOpts::default()
+                ..FetchOpts::default()
             },
         )?;
         let now = self.ctx.now();
@@ -905,7 +938,7 @@ impl<'a> AutoEngine<'a> {
             }
         }
 
-        let mut view = self.fetch_planned(&plan, pre)?;
+        let mut view = self.fetch_planned(&mut prepared, &plan, pre)?;
         // Read once and shared: the escalation gate, the exclusion and the
         // snapshot all describe the same pass, and re-reading `usage.json` for
         // each of them would be three parses of a file this tick just wrote.
@@ -937,7 +970,7 @@ impl<'a> AutoEngine<'a> {
                 !parked_exhausted(entries.get(&self.key_of(*slot)), snap.headroom(*slot), now)
             })
             .collect();
-        view = self.fetch_planned(&escalation, view)?;
+        view = self.fetch_planned(&mut prepared, &escalation, view)?;
         entries = self.entries(&view)?;
         snap = self.snapshot(&view, &entries);
         Ok((view, snap))
@@ -949,17 +982,23 @@ impl<'a> AutoEngine<'a> {
     /// urgent 60 s cadence actually beats the 180 s serve TTL; outside it
     /// nothing is fetched. An empty plan is not a pass at all: the picture
     /// already in hand is the answer.
-    fn fetch_planned(&self, plan: &[u32], served: ProviderView) -> Result<ProviderView> {
+    fn fetch_planned(
+        &self,
+        prepared: &mut Prepared,
+        plan: &[u32],
+        served: ProviderView,
+    ) -> Result<ProviderView> {
         if plan.is_empty() {
             return Ok(served);
         }
-        collect(
+        collect::execute(
             &self.ctx,
             self.driver,
-            &CollectOpts {
+            prepared,
+            &FetchOpts {
                 all_stale: true,
                 only: Some(plan.to_vec()),
-                ..CollectOpts::default()
+                ..FetchOpts::default()
             },
         )
     }

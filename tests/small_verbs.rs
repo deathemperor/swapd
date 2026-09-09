@@ -596,7 +596,11 @@ fn export_falls_back_to_the_stored_copy_when_the_live_login_moved() {
     // credential under another's name.
     fx.write_live("stranger@example.com", "org-x", "rt-stranger");
 
-    let out = fx.cmd().args(["export", "-", "--json"]).output().unwrap();
+    let out = fx
+        .cmd()
+        .args(["export", "-", "--full", "--json"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
     let one = envelope["providers"][0]["accounts"]

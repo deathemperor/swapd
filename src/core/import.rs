@@ -345,9 +345,15 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
         .map(|i| i.trim().to_string())
         .filter(|i| !i.is_empty());
     let plan = Some(text("plan")?).filter(|p| !p.is_empty());
-    let flag = |key: &str| account.get(key).and_then(Value::as_bool).unwrap_or(false);
-    let disabled = flag("disabled");
-    let preferred = flag("preferred");
+    let flag = |key: &str| -> Result<bool> {
+        match account.get(key) {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(invalid(format!("{key} for {email} must be true or false"))),
+        }
+    };
+    let disabled = flag("disabled")?;
+    let preferred = flag("preferred")?;
 
     let login = login_of(provider, account, &email)?;
     Ok(Entry {

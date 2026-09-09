@@ -93,8 +93,8 @@ pub fn run(
     for slot in targets {
         let meta = table.slots.get(&slot).expect("named above");
         let active = table.active_slot == Some(slot);
-        let login = match credential(ctx, driver, slot, meta, active, &mut warnings)? {
-            Some(login) => login,
+        let (login, from_live) = match credential(ctx, driver, slot, meta, active, &mut warnings)? {
+            Some(pair) => pair,
             None => {
                 let reason = format!("slot {slot} ({}) has no stored login", meta.email);
                 if opts.slot.is_some() {
@@ -105,7 +105,12 @@ pub fn run(
             }
         };
         let mut entry = entry(driver, slot, meta, &login)?;
-        if opts.full && active {
+        // Only for a credential that actually came from the live login: the
+        // config on this machine describes whoever is logged in right now, and
+        // pairing it with a credential read from the store would file one
+        // account's identity beside another's token (import splices
+        // `config.oauthAccount` into the login).
+        if opts.full && from_live {
             match driver.live_config_text(&ctx.env) {
                 Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
                     Ok(config) => {
@@ -163,7 +168,8 @@ pub fn run(
     }))
 }
 
-/// The credential to export for one slot.
+/// The credential to export for one slot, and whether it came from the live
+/// login (which is what decides `--full`'s config snapshot).
 ///
 /// The active slot's comes from the live login (`transfer.py:222`) — the CLI
 /// refreshes in place, so that copy is the newest generation. When the live
@@ -178,18 +184,21 @@ fn credential(
     meta: &Slot,
     active: bool,
     warnings: &mut Vec<String>,
-) -> Result<Option<Login>> {
+) -> Result<Option<(Login, bool)>> {
     if active {
         match driver.read_live(&ctx.env) {
             Ok(live) => {
                 if is_same_account(driver, &live, meta) {
-                    return Ok(Some(live));
+                    return Ok(Some((live, true)));
                 }
                 warnings.push(format!(
                     "the live login is not slot {slot} ({}) any more; exporting the stored copy",
                     meta.email
                 ));
             }
+            // cswap fails the whole export here (`transfer.py:222`); swapd
+            // falls back, because one unreadable live store must not cost the
+            // user a backup of the credentials it still holds.
             Err(e) => warnings.push(format!(
                 "slot {slot}'s live login could not be read ({e}); exporting the stored copy"
             )),
@@ -198,7 +207,7 @@ fn credential(
     Ok(ctx
         .secrets
         .get(&slot_key(driver.id(), slot))?
-        .map(|bytes| Login { bytes }))
+        .map(|bytes| (Login { bytes }, false)))
 }
 
 /// Whether a login is the account a slot claims to hold — its own identity

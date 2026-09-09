@@ -30,11 +30,11 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, slot: Option<u32>) -> Result<ListPayl
     let opts = match slot {
         Some(slot) => CollectOpts {
             force_slots: vec![slot],
-            all_stale: false,
+            ..CollectOpts::default()
         },
         None => CollectOpts {
-            force_slots: Vec::new(),
             all_stale: true,
+            ..CollectOpts::default()
         },
     };
     let view = collect(ctx, driver, &opts)?;

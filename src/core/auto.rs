@@ -39,12 +39,13 @@ use crate::core::collect::{collect, CollectOpts};
 use crate::core::events::{window_label, Emit, Event};
 use crate::core::history::SlotRef;
 use crate::core::poll_policy::{
-    self, binding_pct, limiting_reset_ts, parse_reset_ts, RESET_SLACK_S,
+    self, binding_pct, limiting_reset_ts, parse_reset_ts, ESCALATION_MARGIN_PCT, RESET_SLACK_S,
 };
 use crate::core::settings::{self, Settings};
 use crate::core::slots;
 use crate::core::store::{read_json, write_json_atomic, FileLock};
 use crate::core::switch;
+use crate::core::usage_store::{due_candidate, plan_oversleeps_interval, Entry};
 use crate::ctx::Ctx;
 use crate::driver::claude::usage::{format_ts, relevant};
 use crate::driver::{Driver, Login};
@@ -265,21 +266,7 @@ impl<'a> AutoEngine<'a> {
             .filter_map(|slot| slot.parse::<u32>().ok())
             .collect();
 
-        // One collection pass per tick, forcing every stale or due account
-        // rather than only the on-demand set: cswap's two-phase schedule
-        // (baseline + escalation) exists because its collector had no such
-        // mode. Freshness, backoff and claims still gate what is actually
-        // fetched, so a tick costs at most what the stored plans already
-        // wanted.
-        let view = collect(
-            &self.ctx,
-            self.driver,
-            &CollectOpts {
-                force_slots: Vec::new(),
-                all_stale: true,
-            },
-        )?;
-        let snap = self.snapshot(&view)?;
+        let (view, snap) = self.collect_scheduled(&settings, &quarantined)?;
 
         let Some(current) = view.active_slot else {
             self.emit(Event::Poll {
@@ -721,6 +708,149 @@ impl<'a> AutoEngine<'a> {
         TickOutcome::Blocked
     }
 
+    // -- the collection schedule -------------------------------------------
+
+    /// The tick's usage collection: an O(1) baseline, escalated only when a
+    /// switch could be near (`autoswitch.py:2249-2393`).
+    ///
+    /// Phase A fetches the ACTIVE account when its persisted plan says it is
+    /// due, plus the ONE stalest due candidate; everybody else is served from
+    /// the store. Phase B refetches the whole fleet, but only when the decision
+    /// could actually turn on it: the active account is within
+    /// `ESCALATION_MARGIN_PCT` of the threshold, or its usage is unreadable
+    /// (failover must not choose a target from plan-old numbers). Every other
+    /// tick therefore costs at most two usage requests no matter how many
+    /// accounts are in the rotation — fetching all of them every tick would
+    /// spend the endpoint's hourly budget on accounts nothing was going to
+    /// choose between.
+    ///
+    /// Nothing here re-implements fetch policy: the engine nominates, and
+    /// `reserve` — under the table's lock — decides who is actually fetched.
+    fn collect_scheduled(
+        &mut self,
+        settings: &Settings,
+        quarantined: &BTreeSet<u32>,
+    ) -> Result<(ProviderView, Snapshot)> {
+        // Phase A's baseline picture, fetching nothing: the nomination is
+        // computed from the same rows `reserve` will judge, so a slot is
+        // nominated and fetched on one view of the table rather than two.
+        let pre = collect(
+            &self.ctx,
+            self.driver,
+            &CollectOpts {
+                only: Some(Vec::new()),
+                ..CollectOpts::default()
+            },
+        )?;
+        let Some(current) = pre.active_slot else {
+            // No active account is nothing to schedule around: the tick reports
+            // that and stops, so no request is spent on it.
+            let snap = self.snapshot(&pre)?;
+            return Ok((pre, snap));
+        };
+
+        let now = self.ctx.now();
+        let entries = self.entries(&pre)?;
+        // A quarantined account can never be a target, so spending the single
+        // alternate poll slot on one is a wasted request.
+        let candidates: Vec<u32> = pre
+            .accounts
+            .iter()
+            .filter(|a| a.slot != current && !quarantined.contains(&a.slot) && switchable(a))
+            .map(|a| a.slot)
+            .collect();
+
+        let mut plan: Vec<u32> = Vec::new();
+        if active_is_due(entries.get(&self.key_of(current)), now, &settings.models) {
+            plan.push(current);
+        }
+        // No candidate is polled during an idle-hold: the engine is waiting for
+        // a CLI that is not running, and nothing it learns about a candidate
+        // can be acted on until it is.
+        if self.idle_hold_since.is_none() {
+            let keys: Vec<String> = candidates.iter().map(|slot| self.key_of(*slot)).collect();
+            if let Some(pick) = due_candidate(&keys, &entries, now) {
+                if let Some(slot) = candidates.iter().find(|slot| self.key_of(**slot) == pick) {
+                    plan.push(*slot);
+                }
+            }
+        }
+
+        let mut view = self.fetch_planned(&plan, pre)?;
+        let mut snap = self.snapshot(&view)?;
+
+        // Phase B. An owned-and-expired active account is the deliberate
+        // exception: it idle-holds, and a post-hold failover may run on the
+        // baseline rather than paying for a fleet-wide refresh first.
+        let active_headroom = snap.headroom(current);
+        let expired =
+            account_of(&view, current).is_some_and(|a| a.usage_status == UsageStatus::TokenExpired);
+        let escalate = !candidates.is_empty()
+            && match active_headroom {
+                None => !expired,
+                Some(h) => 100.0 - h >= settings.threshold - ESCALATION_MARGIN_PCT,
+            };
+        if !escalate {
+            return Ok((view, snap));
+        }
+        let entries = self.entries(&view)?;
+        // Escalation may beat an ordinary candidate plan, but never a wide one
+        // parked on an exhausted account: that row's measurement is still
+        // decision-trusted, it cannot be a target while it reads spent, and
+        // re-fetching it is exactly the token the post-429 cadence is trying to
+        // rest.
+        let escalation: Vec<u32> = std::iter::once(current)
+            .chain(candidates.iter().copied())
+            .filter(|slot| {
+                !parked_exhausted(entries.get(&self.key_of(*slot)), snap.headroom(*slot), now)
+            })
+            .collect();
+        view = self.fetch_planned(&escalation, view)?;
+        snap = self.snapshot(&view)?;
+        Ok((view, snap))
+    }
+
+    /// One collection pass restricted to `plan`.
+    ///
+    /// Inside the plan the rule is the scheduler's own — due OR stale — so an
+    /// urgent 60 s cadence actually beats the 180 s serve TTL; outside it
+    /// nothing is fetched. An empty plan is not a pass at all: the picture
+    /// already in hand is the answer.
+    fn fetch_planned(&self, plan: &[u32], served: ProviderView) -> Result<ProviderView> {
+        if plan.is_empty() {
+            return Ok(served);
+        }
+        collect(
+            &self.ctx,
+            self.driver,
+            &CollectOpts {
+                all_stale: true,
+                only: Some(plan.to_vec()),
+                ..CollectOpts::default()
+            },
+        )
+    }
+
+    fn key_of(&self, slot: u32) -> String {
+        slot_key(self.driver.id(), slot)
+    }
+
+    /// The usage table's rows for the slots in this view.
+    fn entries(&self, view: &ProviderView) -> Result<BTreeMap<String, Entry>> {
+        let keys: Vec<(String, String, String)> = view
+            .accounts
+            .iter()
+            .map(|a| {
+                (
+                    self.key_of(a.slot),
+                    a.email.clone(),
+                    a.organization_uuid.clone(),
+                )
+            })
+            .collect();
+        self.ctx.store.entries(&keys, &self.ctx.settings.models)
+    }
+
     // -- the snapshot ------------------------------------------------------
 
     /// The decision-grade picture of every account.
@@ -733,20 +863,8 @@ impl<'a> AutoEngine<'a> {
     /// trusting authoritative, and the engine would rank slots `list` reports
     /// as unknown.
     fn snapshot(&self, view: &ProviderView) -> Result<Snapshot> {
-        let id = self.driver.id();
         let now = self.ctx.now();
-        let keys: Vec<(String, String, String)> = view
-            .accounts
-            .iter()
-            .map(|a| {
-                (
-                    slot_key(id, a.slot),
-                    a.email.clone(),
-                    a.organization_uuid.clone(),
-                )
-            })
-            .collect();
-        let entries = self.ctx.store.entries(&keys, &self.ctx.settings.models)?;
+        let entries = self.entries(view)?;
 
         let mut snap = Snapshot {
             headroom: BTreeMap::new(),
@@ -755,7 +873,7 @@ impl<'a> AutoEngine<'a> {
             fresh: BTreeMap::new(),
         };
         for account in &view.accounts {
-            let entry = entries.get(&slot_key(id, account.slot));
+            let entry = entries.get(&self.key_of(account.slot));
             let measurable = matches!(account.usage_status, UsageStatus::Ok | UsageStatus::Stale);
             let windows: Vec<Window> = measurable
                 .then(|| entry.and_then(|e| e.decision_windows()))
@@ -1571,6 +1689,44 @@ fn is_api_key(account: &AccountView) -> bool {
 
 /// Whether the rotation may consider this account at all (cswap
 /// `switchable_account_numbers`): the collector's own rule.
+/// Is the ACTIVE account nominated for this tick's baseline fetch
+/// (`autoswitch.py:2303-2331`)?
+///
+/// Never measured, no plan yet and past the cadence floor, plan due, a
+/// deadline no bounded planner could have written (reset-parking from an older
+/// release), or a candidate-style plan left on the slot by a role change the
+/// engine never saw — a manual `/login` makes the active account inherit the
+/// slower cadence, and without this clause it would keep it forever.
+fn active_is_due(entry: Option<&Entry>, now: f64, models: &[String]) -> bool {
+    let Some(entry) = entry else {
+        return true;
+    };
+    let Some(age) = entry.age_s else {
+        return true;
+    };
+    let stale_candidate_plan = age >= poll_policy::ACTIVE_MAX_INTERVAL_S
+        && entry.interval_s.unwrap_or(0.0) > poll_policy::ACTIVE_MAX_INTERVAL_S
+        && binding_pct(entry.last_good.as_deref().unwrap_or(&[]), models).unwrap_or(0.0) < 100.0;
+    if stale_candidate_plan || plan_oversleeps_interval(entry, now) {
+        return true;
+    }
+    match entry.next_poll_at {
+        Some(next) => now >= next,
+        None => age >= poll_policy::MIN_INTERVAL_S,
+    }
+}
+
+/// A row resting on a plan wider than the exhausted cadence, on an account
+/// that reads spent: escalation leaves it alone (`autoswitch.py:2367-2388`).
+fn parked_exhausted(entry: Option<&Entry>, headroom: Option<f64>, now: f64) -> bool {
+    let Some(entry) = entry else {
+        return false;
+    };
+    entry.next_poll_at.is_some_and(|next| now < next)
+        && entry.interval_s.unwrap_or(0.0) > poll_policy::EXHAUSTED_INTERVAL_S
+        && headroom.is_some_and(|h| h <= 0.0)
+}
+
 fn switchable(account: &AccountView) -> bool {
     !account.disabled
         && !matches!(

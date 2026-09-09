@@ -41,6 +41,9 @@ struct FakeDriver {
     /// Refresh tokens whose lineage is dead: refreshing one is `TokenDead`.
     dead: Mutex<Vec<String>>,
     writes: Mutex<Vec<String>>,
+    /// Every account `usage()` was called for, in order — the endpoint's
+    /// budget is per-request, so the schedule is only testable by counting.
+    usage_calls: Mutex<Vec<String>>,
 }
 
 impl FakeDriver {
@@ -50,6 +53,7 @@ impl FakeDriver {
             usage: Mutex::new(BTreeMap::new()),
             dead: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
+            usage_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -58,6 +62,11 @@ impl FakeDriver {
             .lock()
             .unwrap()
             .insert(email.to_string(), windows);
+    }
+
+    /// The accounts fetched since the last `take_usage_calls`.
+    fn take_usage_calls(&self) -> Vec<String> {
+        std::mem::take(&mut *self.usage_calls.lock().unwrap())
     }
 
     fn email_of(login: &Login) -> String {
@@ -137,6 +146,7 @@ impl Driver for FakeDriver {
     /// engine's own quarantine path, the one these tests are about.
     fn usage(&self, login: &Login) -> std::result::Result<Usage, DriverError> {
         let email = Self::email_of(login);
+        self.usage_calls.lock().unwrap().push(email.clone());
         match self.usage.lock().unwrap().get(&email) {
             Some(windows) => Ok(Usage {
                 windows: windows.clone(),
@@ -419,6 +429,50 @@ fn below_threshold_polls_and_no_switch() {
     // Nothing was written to the live store, and no cooldown was started.
     assert!(board.driver.writes.lock().unwrap().is_empty());
     assert_eq!(board.state(), AutoState::default());
+}
+
+/// The endpoint budgets usage requests per identity over a trailing hour, so
+/// what a tick costs is policy, not an implementation detail: cswap's baseline
+/// fetches the active account plus the ONE stalest due candidate and escalates
+/// to the whole fleet only near the threshold. A five-slot fleet at 50% is
+/// nowhere near it, so it must not cost five requests a minute.
+#[test]
+fn a_quiet_tick_fetches_the_active_account_and_one_candidate() {
+    let board = Board::new();
+    for slot in 3..=5 {
+        let email = format!("slot{slot}@example.com");
+        board.seed(slot, &email, &format!("rt-{slot}"), T0 + 86_400.0);
+        board.driver.set_usage(&email, usage_at(10.0, T0, 3600.0));
+    }
+    // 50% used against a 90% threshold and a 15-point escalation margin: the
+    // band opens at 75%, so this tick stays on the baseline.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    let mut fetched = board.driver.take_usage_calls();
+    fetched.sort();
+    assert_eq!(fetched.len(), 2, "{fetched:?}");
+    assert!(
+        fetched.contains(&"one@example.com".to_string()),
+        "{fetched:?}"
+    );
+
+    // The next tick is inside the active account's learned plan, and the
+    // candidate it just measured is no longer the stalest — so it spends at
+    // most one request, on a different account.
+    board.advance(60.0);
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    let second = board.driver.take_usage_calls();
+    assert!(second.len() <= 1, "{second:?}");
+    assert!(
+        !second.contains(&fetched[0]),
+        "{second:?} repeated {fetched:?}"
+    );
 }
 
 #[test]

@@ -192,8 +192,7 @@ impl Entry {
         self.fetched_at.is_some_and(|f| (now - f) <= SERVE_TTL_S)
     }
 
-    // Same: `reserve` gates on it, the auto engine reports it.
-    #[allow(dead_code)]
+    // Same: `reserve` gates on it, and the scheduler's due set reads it.
     pub fn in_backoff(&self, now: f64) -> bool {
         self.backoff_until.is_some_and(|b| now < b)
     }
@@ -221,13 +220,6 @@ impl Entry {
             }
         }
         now < anchor + RECENT_429_WINDOW_S
-    }
-
-    /// Whether another collector's bounded fetch lease is still live.
-    // Read by the auto engine; the collector's own claims come from `reserve`.
-    #[allow(dead_code)]
-    pub fn claimed(&self, now: f64) -> bool {
-        live_claim(self.claim_until, now)
     }
 
     /// Whether the stored credential's refresh-token lineage is provably dead
@@ -280,8 +272,6 @@ fn live_claim(claim_until: Option<f64>, now: f64) -> bool {
 /// shorter learned interval. Detect that impossible shape structurally,
 /// independent of the current model selection, so changing scoped models cannot
 /// leave an otherwise usable account parked until the old reset.
-// The scheduler (Task 12) passes this to its repair pass.
-#[allow(dead_code)]
 pub fn plan_oversleeps_interval(entry: &Entry, now: f64) -> bool {
     let Some(next_poll_at) = entry.next_poll_at else {
         return false;
@@ -301,8 +291,6 @@ pub fn plan_oversleeps_interval(entry: &Entry, now: f64) -> bool {
 /// quarantined; a perpetually failing account can't monopolize the slot,
 /// because its backoff removes it from the due set between attempts. Shared by
 /// every surface so all pick the same single alternate to poll per pass.
-// The auto engine (Task 12) picks its candidate through this.
-#[allow(dead_code)]
 pub fn due_candidate(
     candidates: &[String],
     entries: &BTreeMap<String, Entry>,
@@ -1008,7 +996,7 @@ mod tests {
             .unwrap();
         assert_eq!(entry(&store).last_good, Some(five(42.0)));
         // And the lease is released by recording.
-        assert!(!entry(&store).claimed(store.now()));
+        assert!(!live_claim(entry(&store).claim_until, store.now()));
     }
 
     #[test]
@@ -1174,7 +1162,7 @@ mod tests {
         assert_eq!(e.dead_fingerprint, None);
         // ...and it must not drop the live holder's claim either, or that
         // holder's own outcome would be rejected in turn.
-        assert!(e.claimed(store.now()));
+        assert!(live_claim(e.claim_until, store.now()));
         store
             .record_success("claude:1", &live, five(10.0), true, 80.0, &[])
             .unwrap();

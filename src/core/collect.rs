@@ -43,6 +43,12 @@ pub struct CollectOpts {
     /// Fetch every account whose plan is due *or* whose data is stale
     /// (`refresh`), rather than the on-demand "stale and due" rule.
     pub all_stale: bool,
+    /// Restrict the fetch to these slots (the auto engine's schedule, cswap's
+    /// `usage_entries_by_account(fetch=…)`). `None` leaves every slot eligible;
+    /// `Some(empty)` fetches nothing at all and serves the whole pass from the
+    /// store. Whether a listed slot is actually fetched is still `reserve`'s
+    /// call — plans, freshness, backoff and claims all apply.
+    pub only: Option<Vec<u32>>,
 }
 
 /// One slot's state for this pass: the credential it would be fetched with, and
@@ -232,6 +238,11 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         .iter()
         .filter(|st| st.sentinel.is_none())
         .filter(|st| !force || opts.force_slots.contains(&st.slot))
+        .filter(|st| {
+            opts.only
+                .as_ref()
+                .is_none_or(|only| only.contains(&st.slot))
+        })
         .map(|st| {
             (
                 st.key.clone(),

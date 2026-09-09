@@ -57,6 +57,12 @@ impl FakeDriver {
         }
     }
 
+    /// Make this account's usage endpoint fail (an account with no row in the
+    /// table answers the way the real one does when it errors).
+    fn fail_usage(&self, email: &str) {
+        self.usage.lock().unwrap().remove(email);
+    }
+
     fn set_usage(&self, email: &str, windows: Vec<Window>) {
         self.usage
             .lock()
@@ -463,24 +469,32 @@ fn a_quiet_tick_fetches_the_active_account_and_one_candidate() {
         .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
 
     assert_eq!(board.tick(), TickOutcome::NoAction);
-    let mut fetched = board.driver.take_usage_calls();
-    fetched.sort();
+    let fetched = board.driver.take_usage_calls();
     assert_eq!(fetched.len(), 2, "{fetched:?}");
     assert!(
         fetched.contains(&"one@example.com".to_string()),
         "{fetched:?}"
     );
+    let first_candidate = fetched
+        .iter()
+        .find(|email| *email != "one@example.com")
+        .cloned()
+        .unwrap();
 
     // The next tick is inside the active account's learned plan, and the
-    // candidate it just measured is no longer the stalest — so it spends at
-    // most one request, on a different account.
+    // candidate it just measured is no longer the stalest — so it spends one
+    // request, on a candidate it has never measured.
     board.advance(60.0);
     assert_eq!(board.tick(), TickOutcome::NoAction);
     let second = board.driver.take_usage_calls();
-    assert!(second.len() <= 1, "{second:?}");
-    assert!(
-        !second.contains(&fetched[0]),
-        "{second:?} repeated {fetched:?}"
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_ne!(
+        second[0], "one@example.com",
+        "the active account is not due"
+    );
+    assert_ne!(
+        second[0], first_candidate,
+        "the candidate poll rotates: {second:?} after {fetched:?}"
     );
 }
 
@@ -722,7 +736,74 @@ fn all_exhausted_emits_earliest_reset() {
     assert_eq!(sleep["until"], format_ts(T0 + MAX_SLEEP_S).unwrap());
 }
 
-/// A managed API-key slot has no usage to fetch, so it never gets a
+/// The two ways a tick can find nobody to watch: a live login no slot owns
+/// (adding it is the fix), and no live login at all. Neither is acted on —
+/// switching would overwrite a credential no slot holds a copy of.
+#[test]
+fn an_unmanaged_or_absent_live_login_is_reported_not_acted_on() {
+    let board = Board::new();
+    *board.driver.live.lock().unwrap() = Some(login("stranger@example.com", "rt-x", T0 + 86_400.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    let poll = board.last("poll").unwrap();
+    assert_eq!(poll["active"], Value::Null);
+    let said = board.last("no-switch").unwrap();
+    assert_eq!(said["reason"], "unmanaged-active-account");
+    assert!(said["detail"].as_str().unwrap().contains("swapd add"));
+    assert!(
+        board.driver.take_usage_calls().is_empty(),
+        "with no account to schedule around, no request is spent"
+    );
+
+    *board.driver.live.lock().unwrap() = None;
+    board.advance(60.0);
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    assert_eq!(
+        board.last("no-switch").unwrap()["reason"],
+        "no-active-account"
+    );
+}
+
+/// Two ways the ranking can come back empty with the active account at its
+/// threshold: nothing readable to compare against, and a candidate that is
+/// readable but does not clear the hysteresis margin. Neither is
+/// `all-exhausted`, so neither may take its long reset-aware sleep.
+#[test]
+fn an_empty_ranking_says_which_kind_of_empty_it_is() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(95.0, T0, 3600.0));
+    // Slot 2's usage endpoint fails, so nothing about it can be read.
+    board.driver.fail_usage("two@example.com");
+
+    let (outcome, delay) = board.tick_and_schedule();
+    assert_eq!(outcome, TickOutcome::Blocked);
+    assert_eq!(board.last("no-switch").unwrap()["reason"], "no-comparison");
+    assert_eq!(delay, 60.0, "an unreadable candidate can become readable");
+
+    // Now it reads — with room, but not enough of it to be worth the move.
+    let board = Board::new();
+    set(&board, "hysteresisPct", Value::from(20.0));
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(95.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(85.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::Blocked);
+    assert_eq!(
+        board.last("no-switch").unwrap()["reason"],
+        "no-qualifying-candidate"
+    );
+    assert!(
+        board.last("all-exhausted").is_none(),
+        "10 points of headroom is not an exhausted fleet"
+    );
+}
+
+/// A managed API-key slot has no usage to fetch/// A managed API-key slot has no usage to fetch, so it never gets a
 /// `fetchedAt` — and a never-fetched account is the stalest thing in the fleet,
 /// which is what the single alternate poll slot goes to. Nominating one would
 /// therefore starve every OAuth peer of measurements for as long as the active
@@ -906,12 +987,81 @@ fn consume_first_holds_on_unknown_resets_later_resets_and_stale_usage() {
         "already-consuming-soonest"
     );
 
-    // And a peer that DOES reset sooner, whose measurement is a little too old
-    // to act on: consume-first decides BELOW the threshold, where a stored
-    // number can be a whole candidate interval stale, so the commit waits for
-    // a fresh one instead of sliding onto a guess. (The ranking still trusts
-    // the measurement — it is inside the store's decision bound — which is
-    // exactly the gap this gate covers.)
+    assert_eq!(board.live_email(), "one@example.com");
+}
+
+/// A consume-first pick can have ridden a measurement a full candidate interval
+/// old — the schedule only guarantees freshness for what it nominated, and
+/// consume-first is the one trigger that decides outside the escalation band.
+/// The commit is therefore two-phase: refetch the pair the decision turns on,
+/// re-rank, and only then move.
+#[test]
+fn consume_first_refetches_a_stale_pick_before_it_commits() {
+    let board = stale_consume_first_pick();
+
+    assert_eq!(board.driver.take_usage_calls().len(), 0);
+    assert_eq!(board.tick(), TickOutcome::Switched, "{:?}", board.kinds());
+
+    let refetched = board.driver.take_usage_calls();
+    assert!(
+        refetched.contains(&"two@example.com".to_string()),
+        "the pick must be measured again before it is landed on: {refetched:?}"
+    );
+    assert_eq!(board.live_email(), "two@example.com");
+    assert_eq!(board.last("switch").unwrap()["trigger"], "consume-first");
+}
+
+/// The other half of the two-phase commit: when the account cannot be measured
+/// after all, the engine holds rather than landing on a number it has stopped
+/// trusting.
+#[test]
+fn consume_first_holds_when_the_refetch_fails() {
+    let board = stale_consume_first_pick();
+    board.driver.fail_usage("two@example.com");
+
+    assert_eq!(board.tick(), TickOutcome::NoAction, "{:?}", board.kinds());
+
+    // The re-measure spends a request on the pick, and none on the active
+    // account: phase A measured it moments ago, and this hold repeats on every
+    // tick for as long as the pick's endpoint is down.
+    let calls = board.driver.take_usage_calls();
+    assert_eq!(
+        calls.iter().filter(|e| *e == "one@example.com").count(),
+        1,
+        "{calls:?}"
+    );
+
+    let held = board.last("no-switch").unwrap();
+    assert_eq!(held["reason"], "stale-usage");
+    assert!(
+        held["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the fetch failed"),
+        "{held}"
+    );
+    assert_eq!(board.live_email(), "one@example.com");
+}
+
+/// A board whose next tick is a consume-first switch onto slot 2, except that
+/// slot 2's measurement is 400 s old (past the 180 s serve TTL) and its own
+/// poll plan is not due — the exact state cswap's two-phase commit exists for.
+fn stale_consume_first_pick() -> Board {
+    let board = Board::new();
+    // Slot 2's weekly window resets sooner, so it is the consume-first pick.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 7200.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+    // Two ticks under the default `best` strategy, which does nothing at 50%,
+    // to give both accounts a learned plan: after them slot 2 is next due at
+    // T0+850, so the tick at T0+800 cannot nominate it and it goes into the
+    // decision 400 s old.
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    board.advance(400.0);
+    assert_eq!(board.tick(), TickOutcome::NoAction);
     board.advance(400.0);
     let now = board.now();
     board
@@ -920,10 +1070,9 @@ fn consume_first_holds_on_unknown_resets_later_resets_and_stale_usage() {
     board
         .driver
         .set_usage("two@example.com", usage_at(10.0, now, 3600.0));
-    assert_eq!(board.tick(), TickOutcome::NoAction);
-    let held = board.last("no-switch").unwrap();
-    assert_eq!(held["reason"], "stale-usage", "{:?}", board.kinds());
-    assert_eq!(board.live_email(), "one@example.com");
+    set(&board, "strategy", Value::from("consume-first"));
+    board.driver.take_usage_calls();
+    board
 }
 
 /// An active token that expired while the CLI was idle is not a failing

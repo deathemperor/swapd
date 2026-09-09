@@ -169,6 +169,12 @@ impl Snapshot {
         self.headroom.get(&slot).copied().flatten()
     }
 
+    /// Whether this slot's measurement is fresh enough to commit on (the
+    /// consume-first gate). An unknown slot is not.
+    fn fresh(&self, slot: u32) -> bool {
+        self.fresh.get(&slot).copied().unwrap_or(false)
+    }
+
     fn windows(&self, slot: u32) -> &[Window] {
         self.windows.get(&slot).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -396,9 +402,9 @@ impl<'a> AutoEngine<'a> {
         }
 
         let consume_first = settings.strategy == "consume-first";
-        let decided_now = self.ctx.now();
+        let mut decided_now = self.ctx.now();
         let preferred = self.preferred_slots(&view, &oauth_candidates);
-        let (ordered, any_known, active_reset_ts) = self.rank(
+        let (mut ordered, mut any_known, mut active_reset_ts) = self.rank(
             &state,
             RankInput {
                 trigger,
@@ -412,6 +418,82 @@ impl<'a> AutoEngine<'a> {
                 now: decided_now,
             },
         );
+
+        // Two-phase commit (`autoswitch.py:1409-1440`). consume-first is the
+        // one trigger that decides OUTSIDE the escalation band, so its pick can
+        // have ridden a snapshot a full candidate interval (10 min) old — the
+        // schedule only guarantees freshness for what it nominated. A switch is
+        // imminent, so spend the fetches now and re-decide on fresh numbers.
+        // Where cswap refetches every candidate, swapd refetches the pair the
+        // decision actually turns on and commits only if the same target still
+        // wins: nothing else was refreshed, so nothing else may be landed on
+        // from this tick's ranking.
+        let mut snap = snap;
+        let mut view = view;
+        let mut active_headroom = active_headroom;
+        if trigger == "consume-first" {
+            if let Some(target) = ordered.first().copied() {
+                if !snap.fresh(target) {
+                    view = collect(
+                        &self.ctx,
+                        self.driver,
+                        &CollectOpts {
+                            // The pair the commit turns on, under the
+                            // scheduler's own rule (due OR stale) — which is
+                            // cswap's phase 2 exactly. The target is stale by
+                            // construction (that is what `fresh` just said), so
+                            // it is fetched; the active, measured moments ago by
+                            // phase A, is served from the store rather than
+                            // spending a second request on every tick of a hold.
+                            // Backoff, live claims and the dead-token
+                            // quarantine still decide, as always, in `reserve`.
+                            all_stale: true,
+                            only: Some(vec![current, target]),
+                            ..CollectOpts::default()
+                        },
+                    )?;
+                    let entries = self.entries(&view)?;
+                    snap = self.snapshot(&view, &entries);
+                    active_headroom = snap.headroom(current);
+                    decided_now = self.ctx.now();
+                    // The trigger is deliberately NOT re-classified: a still
+                    // qualifying sooner target switches anyway, and otherwise
+                    // the next tick escalates normally and escapes.
+                    let reranked = self.rank(
+                        &state,
+                        RankInput {
+                            trigger,
+                            consume_first,
+                            candidates: &oauth_candidates,
+                            snap: &snap,
+                            current,
+                            active_headroom,
+                            settings: &settings,
+                            preferred: &preferred,
+                            now: decided_now,
+                        },
+                    );
+                    (ordered, any_known, active_reset_ts) = reranked;
+                    if ordered.first().is_some_and(|first| *first != target) {
+                        // The fresh numbers moved the pick to an account this
+                        // pass did not refresh. Landing there would be the
+                        // stale commit the gate exists to prevent, and the
+                        // ranking that named it is exactly what the next tick
+                        // redoes once its own poll nominates it. An EMPTY
+                        // re-ranking is not this case: nothing qualifies at all,
+                        // which `nothing_to_take` below already has the right
+                        // words for.
+                        self.emit(Event::NoSwitch {
+                            reason: "stale-usage".to_string(),
+                            detail: format!(
+                                "slot {target}'s fresh usage no longer makes it the                                  pick; deciding again next tick"
+                            ),
+                        });
+                        return Ok(TickOutcome::NoAction);
+                    }
+                }
+            }
+        }
 
         if ordered.is_empty() {
             return Ok(self.nothing_to_take(
@@ -435,16 +517,17 @@ impl<'a> AutoEngine<'a> {
         let mut transient = false;
         let mut unsupported: Option<String> = None;
         for target in ordered {
-            if trigger == "consume-first" && !snap.fresh.get(&target).copied().unwrap_or(false) {
-                // consume-first is opportunistic, not an escape: it decides
-                // below the threshold, where a stored measurement can be a
-                // full candidate interval old. Never act on stale data and
-                // never slide to a worse-ranked target — hold and retry.
+            if trigger == "consume-first" && !snap.fresh(target) {
+                // The two-phase commit above asked for this account and did not
+                // get it: the fetch failed, or the row is in failure backoff,
+                // under another collector's claim, or quarantined. Never act on
+                // stale data and never slide to a worse-ranked target — hold
+                // and retry.
                 self.emit(Event::NoSwitch {
                     reason: "stale-usage".to_string(),
                     detail: format!(
                         "slot {target}'s usage could not be refreshed this tick \
-                         (backoff or a concurrent poller); retrying"
+                         (the fetch failed, or another poller holds it); retrying"
                     ),
                 });
                 return Ok(TickOutcome::NoAction);
@@ -769,15 +852,14 @@ impl<'a> AutoEngine<'a> {
                 ..CollectOpts::default()
             },
         )?;
+        let now = self.ctx.now();
+        let entries = self.entries(&pre)?;
         let Some(current) = pre.active_slot else {
             // No active account is nothing to schedule around: the tick reports
             // that and stops, so no request is spent on it.
-            let snap = self.snapshot(&pre)?;
+            let snap = self.snapshot(&pre, &entries);
             return Ok((pre, snap));
         };
-
-        let now = self.ctx.now();
-        let entries = self.entries(&pre)?;
         // An account that can never be a target is not worth the single
         // alternate poll slot. Quarantined slots are cswap's own exclusion; a
         // managed API key is swapd's — cswap can land on one as a last resort,
@@ -813,7 +895,11 @@ impl<'a> AutoEngine<'a> {
         }
 
         let mut view = self.fetch_planned(&plan, pre)?;
-        let mut snap = self.snapshot(&view)?;
+        // Read once and shared: the escalation gate, the exclusion and the
+        // snapshot all describe the same pass, and re-reading `usage.json` for
+        // each of them would be three parses of a file this tick just wrote.
+        let mut entries = self.entries(&view)?;
+        let mut snap = self.snapshot(&view, &entries);
 
         // Phase B. An owned-and-expired active account is the deliberate
         // exception: it idle-holds, and a post-hold failover may run on the
@@ -829,7 +915,6 @@ impl<'a> AutoEngine<'a> {
         if !escalate {
             return Ok((view, snap));
         }
-        let entries = self.entries(&view)?;
         // Escalation may beat an ordinary candidate plan, but never a wide one
         // parked on an exhausted account: that row's measurement is still
         // decision-trusted, it cannot be a target while it reads spent, and
@@ -842,7 +927,8 @@ impl<'a> AutoEngine<'a> {
             })
             .collect();
         view = self.fetch_planned(&escalation, view)?;
-        snap = self.snapshot(&view)?;
+        entries = self.entries(&view)?;
+        snap = self.snapshot(&view, &entries);
         Ok((view, snap))
     }
 
@@ -898,10 +984,8 @@ impl<'a> AutoEngine<'a> {
     /// `lastGood` instead would call a measurement the store has stopped
     /// trusting authoritative, and the engine would rank slots `list` reports
     /// as unknown.
-    fn snapshot(&self, view: &ProviderView) -> Result<Snapshot> {
+    fn snapshot(&self, view: &ProviderView, entries: &BTreeMap<String, Entry>) -> Snapshot {
         let now = self.ctx.now();
-        let entries = self.entries(view)?;
-
         let mut snap = Snapshot {
             headroom: BTreeMap::new(),
             windows: BTreeMap::new(),
@@ -927,7 +1011,7 @@ impl<'a> AutoEngine<'a> {
             snap.headroom.insert(account.slot, headroom);
             snap.windows.insert(account.slot, windows);
         }
-        Ok(snap)
+        snap
     }
 
     /// The poll event's per-slot window breakdown: the windows the DECISION
@@ -1727,8 +1811,6 @@ fn is_api_key(account: &AccountView) -> bool {
     account.usage_status == UsageStatus::ApiKey
 }
 
-/// Whether the rotation may consider this account at all (cswap
-/// `switchable_account_numbers`): the collector's own rule.
 /// Is the ACTIVE account nominated for this tick's baseline fetch
 /// (`autoswitch.py:2303-2331`)?
 ///
@@ -1767,6 +1849,11 @@ fn parked_exhausted(entry: Option<&Entry>, headroom: Option<f64>, now: f64) -> b
         && headroom.is_some_and(|h| h <= 0.0)
 }
 
+/// Whether the rotation may consider this account at all (cswap
+/// `_account_is_switchable`, `switcher.py:914-930`): a slot the user disabled
+/// is out by their choice, and one whose credential cannot be used is out until
+/// someone logs in again. swapd adds the two statuses cswap has no equivalent
+/// for — a dead lineage and a credential the driver refuses.
 fn switchable(account: &AccountView) -> bool {
     !account.disabled
         && !matches!(

@@ -232,17 +232,21 @@ impl Secrets for StickySecrets {
         if self.degraded.load(Ordering::SeqCst) {
             return self.fallback.delete(key);
         }
-        let primary_result = self.primary.delete(key);
-        if let Err(e) = &primary_result {
-            if e.code == ErrorCode::KeychainUnavailable {
-                self.degraded.store(true, Ordering::SeqCst);
+        match self.primary.delete(key) {
+            Ok(()) => {
+                // Best-effort fan-out: a copy in the fallback shouldn't outlive a
+                // keychain item `primary` just deleted, but its result never
+                // overrides `primary`'s — that's the one the caller asked about.
+                let _ = self.fallback.delete(key);
+                Ok(())
             }
+            Err(e) if e.code == ErrorCode::KeychainUnavailable => {
+                // Same shape as get/set: degrade, then answer from the fallback.
+                self.degraded.store(true, Ordering::SeqCst);
+                self.fallback.delete(key)
+            }
+            Err(e) => Err(e),
         }
-        // Best-effort fan-out: a copy in the fallback shouldn't outlive a keychain
-        // item `primary` just deleted, but its result never overrides `primary`'s —
-        // that's the one the caller asked about.
-        let _ = self.fallback.delete(key);
-        primary_result
     }
 }
 

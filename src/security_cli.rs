@@ -349,6 +349,8 @@ mod tests {
             );
         }
         cli.delete(service, account).unwrap();
+        // Deleting an already-absent item is idempotent (exit 44 → Ok) against the real CLI.
+        cli.delete(service, account).unwrap();
         assert_eq!(cli.find(service, Some(account)).unwrap(), None);
     }
 

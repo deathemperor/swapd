@@ -9,4 +9,5 @@ pub mod settings;
 pub mod slots;
 pub mod store;
 pub mod switch;
+pub mod unclaimed;
 pub mod usage_store;

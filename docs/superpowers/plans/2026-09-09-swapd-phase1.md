@@ -6,7 +6,7 @@
 
 **Architecture:** One binary crate. `src/core` owns slots, the usage store, poll policy, switching and the auto loop; `src/driver/claude.rs` owns everything Claude-specific (keychain item, `~/.claude.json`, Claude Code's locks, OAuth endpoints); every verb prints one JSON object with `--json`. Infinitus gets `Sources/InfinitusCore/Engines/Swapd/` as a second `AccountEngine`.
 
-**Tech Stack:** Rust stable (1.98), clap 4 (derive), serde/serde_json, ureq 3 (rustls), keyring 3, sha2, time 0.3, thiserror, fd-lock; dev: httpmock, assert_cmd, tempfile, insta (snapshots). Swift 6 / SwiftPM for the Infinitus side.
+**Tech Stack:** Rust stable (1.98), clap 4 (derive), serde/serde_json, ureq 3 (rustls), sha2, time 0.3, thiserror, fd-lock; the macOS keychain only through `/usr/bin/security`; dev: httpmock, assert_cmd, tempfile, insta (snapshots). Swift 6 / SwiftPM for the Infinitus side.
 
 **Spec:** `docs/superpowers/specs/2026-09-09-swapd-design.md` (this repo). Read it first; every task below argues from it.
 
@@ -16,6 +16,7 @@
 
 - Every verb accepts `--json`; with it stdout is exactly one JSON object (NDJSON for `auto`), human text goes to stderr. Errors: `{"schemaVersion":1,"error":{"code":"…","message":"…"}}`, exit 1. `schemaVersion` is `1` everywhere.
 - Secrets never appear in argv, logs, error messages or test fixtures. Tokens travel over stdin (`add-token -`) or the keychain.
+- The macOS keychain is touched only through `/usr/bin/security` (generic passwords). Never a native keychain API: an item created by the unsigned dev binary is ACL'd to that build and every rebuild would prompt.
 - Nothing under `~/.claude-swap-backup/` is ever read. cswap's data comes in only through its `export` envelope.
 - Network is never performed while a Claude Code lock is held (`claude_locks.py` docstring).
 - Every commit ends with `Co-Authored-By: Claude Code <noreply@anthropic.com>`.
@@ -50,7 +51,6 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 sha2 = "0.10"
 hex = "0.4"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
@@ -129,7 +129,6 @@ pub fn emit_error(err: &SwapdError, json: bool) {
 
 ```rust
 use assert_cmd::Command;
-use predicates::prelude::*;
 
 #[test]
 fn version_json_has_schema_and_version() {
@@ -221,11 +220,11 @@ impl ProviderSlots {
 
 ---
 
-### Task 3: Secrets — keyring, file fallback, in-memory fake
+### Task 3: Secrets — `security` CLI, file store, in-memory fake
 
 **Files:**
-- Create: `src/secrets.rs`
-- Test: unit tests (fake + file backends; keyring backend is exercised only by an `#[ignore]` test run by hand on macOS)
+- Create: `src/secrets.rs`, `src/security_cli.rs`
+- Test: unit tests (fake + file backends; the real `security` backend is exercised only by an `#[ignore]` test run by hand on macOS)
 
 **Interfaces:**
 - Produces:
@@ -236,19 +235,32 @@ pub trait Secrets: Send + Sync {
     fn set(&self, key: &str, value: &str) -> Result<()>;
     fn delete(&self, key: &str) -> Result<()>;
 }
-pub struct KeyringSecrets;                       // service "swapd", account = key
-pub struct FileSecrets { dir: PathBuf }          // <credentials_dir>/<key with ':' → '_'>, mode 0600
+// security_cli.rs — shared by Task 6's Claude driver (it reads Claude Code's own item through the same trait)
+pub trait SecurityCli: Send + Sync {
+    fn find(&self, service: &str, account: Option<&str>) -> Result<Option<String>>; // `security find-generic-password -s S [-a A] -w`; exit 44 (not found) → Ok(None); other failures → KeychainUnavailable
+    fn add(&self, service: &str, account: &str, value: &str) -> Result<()>;         // `security add-generic-password -U -s S -a A -w VALUE`; the value goes on argv of a child no one else can see mid-flight is NOT acceptable → pass it via `-w` read from stdin is not supported, so use `security -i` (interactive mode reading commands from stdin): write "add-generic-password -U -s S -a A -w VALUE\n" to its stdin
+    fn delete(&self, service: &str, account: &str) -> Result<()>;                   // `security delete-generic-password -s S -a A`
+}
+pub struct RealSecurity;         // /usr/bin/security, 15 s timeout per call
+pub struct FakeSecurity(Mutex<HashMap<(String,String),String>>); // tests
+
+// secrets.rs
+pub struct SecuritySecrets { cli: Arc<dyn SecurityCli> }   // service "swapd", account = key
+pub struct FileSecrets { dir: PathBuf }                     // <credentials_dir>/<key with ':' → '_'>, mode 0600
 pub struct MemorySecrets(Mutex<HashMap<String,String>>);
 pub struct StickySecrets { primary: Box<dyn Secrets>, fallback: Box<dyn Secrets>, degraded: AtomicBool }
-pub fn default_secrets(home: &Home) -> Box<dyn Secrets>; // macOS/Windows: Sticky(Keyring, File); Linux: Sticky(Keyring, File) too
+/// `SWAPD_SECRETS` = `file` | `memory` overrides (tests, CI); else macOS: Sticky(Security, File); Linux/Windows: File.
+pub fn default_secrets(home: &Home) -> Box<dyn Secrets>;
 pub fn slot_key(provider: &str, slot: u32) -> String { format!("{provider}:{slot}") }
 ```
+
+`MemorySecrets` under `SWAPD_SECRETS=memory` must survive across verbs within one test only if the test drives the library directly; assert_cmd tests use `file`.
 
 - `StickySecrets`: after the primary fails once with a backend error, every later call in this process goes to the fallback (port of the sticky per-process fallback, `credentials.py:126-140`). A `None` from the primary is not a failure.
 
 - [ ] **Step 1:** implement; `KeyringSecrets` maps `keyring::Error::NoEntry` → `Ok(None)`, other errors → `ErrorCode::KeychainUnavailable`.
-- [ ] **Step 2: tests** — `memory_roundtrip`, `file_backend_writes_0600` (unix), `sticky_falls_back_after_primary_error` (a `FailingSecrets` fake that errors on every call), `sticky_stays_on_fallback_for_process_lifetime`.
-- [ ] **Step 3:** green, fmt, clippy. **Commit** `secrets: keyring + 0600 file fallback, sticky degrade`.
+- [ ] **Step 2: tests** — `memory_roundtrip`, `file_backend_writes_0600` (unix), `security_secrets_roundtrip_through_fake_cli`, `security_not_found_is_none`, `sticky_falls_back_after_primary_error` (a `FailingSecrets` fake that errors on every call), `sticky_stays_on_fallback_for_process_lifetime`, `env_override_selects_file_backend`.
+- [ ] **Step 3:** green, fmt, clippy. **Commit** `secrets: security CLI + 0600 file store, sticky degrade`.
 
 ---
 
@@ -344,7 +356,7 @@ Add `unicode-normalization = "0.1"` to Cargo.toml for `.nfc()`.
 - [ ] **Step 2: locks.rs** — port `claude_locks.py`: `proper_lockfile(dir, staleness_s, timeout_s)` = mkdir mutex on `<path>.lock` directory with an mtime toucher thread every 3 s, steal only when mtime older than staleness; `CREDENTIALS_STALENESS_S = 60.0`, `CONFIG_STALENESS_S = 10.0`, `TOUCH_INTERVAL_S = 3.0`, per-lock wait budget 9 s with 1–2 s jittered sleeps; `credentials_lock(env)` takes `<config_home>/.oauth_refresh.lock` then `<config_home>.lock` in that order and releases in reverse; `config_lock(env)` takes `<config_json>.lock`. Return a guard whose `Drop` stops the toucher and removes the directory. Timeout → `DriverError::Locked("claude code holds <path>")`.
   Tests: `acquire_creates_dir_and_drop_removes_it`, `fresh_lock_is_not_stolen` (pre-create dir with mtime now → acquire with 300 ms timeout fails Locked), `stale_lock_is_stolen` (pre-create dir, set mtime 120 s ago → acquire succeeds).
 
-- [ ] **Step 3: live.rs** — the `security` CLI behind `trait SecurityCli { fn find(&self, service: &str) -> Result<Option<String>, DriverError>; fn add(&self, service: &str, account: &str, value: &str) -> …; fn delete(…) }` with `RealSecurity` (`/usr/bin/security find-generic-password -s <service> -w`, `add-generic-password -U -s <service> -a <user> -w <value>`) and `FakeSecurity` for tests. On non-macOS the live store is `credentials_file` (0600). `read_live(env)`: services in order, first hit wins, 2 attempts 300 ms apart on backend error (`_ACTIVE_READ_ATTEMPTS`), then `NoLogin`. `write_live(env, login)`: compose with `prepare_for_activation(target, live)` (shared keys from the live credential win, absence included — port `SHARED_CREDENTIAL_KEYS`), take `credentials_lock` and `config_lock`, write the keychain item (or file), splice `oauthAccount` into `~/.claude.json` (only that key; everything else preserved), release. `read_config_identity(env) -> Option<Identity>` from `~/.claude.json` `oauthAccount` (`emailAddress`, `organizationUuid`, `organizationName`; plan label from `switcher.py:5239` `_plan_label`).
+- [ ] **Step 3: live.rs** — reuse Task 3's `SecurityCli` trait (`RealSecurity` / `FakeSecurity`); Claude Code's item is `find(service, None)` and written with `add(service, <current OS user name from $USER, else "claude">, value)` — Claude Code stores the item under the OS username as the account. On non-macOS the live store is `credentials_file` (0600). `read_live(env)`: services in order, first hit wins, 2 attempts 300 ms apart on backend error (`_ACTIVE_READ_ATTEMPTS`), then `NoLogin`. `write_live(env, login)`: compose with `prepare_for_activation(target, live)` (shared keys from the live credential win, absence included — port `SHARED_CREDENTIAL_KEYS`), take `credentials_lock` and `config_lock`, write the keychain item (or file), splice `oauthAccount` into `~/.claude.json` (only that key; everything else preserved), release. `read_config_identity(env) -> Option<Identity>` from `~/.claude.json` `oauthAccount` (`emailAddress`, `organizationUuid`, `organizationName`; plan label from `switcher.py:5239` `_plan_label`).
   Tests: `read_live_tries_services_in_order`, `write_live_preserves_mcp_oauth_from_live`, `write_live_splices_only_oauth_account_into_config`, `write_live_refuses_when_lock_held`.
 
 - [ ] **Step 4: Commit** `claude driver: keychain item, config splice, Claude Code lock handshake`.
@@ -376,7 +388,7 @@ pub fn profile(access_token: &str) -> Option<Identity>;      // None on any fail
 
 - [ ] **Step 2: usage.rs** — `pub fn fetch(access_token) -> Result<serde_json::Value, DriverError>` (429 → `Throttled{retry_after}` parsing `Retry-After` seconds; timeout 5 s) and `pub fn windows(raw: &Value) -> Vec<Window>`: `five_hour.utilization` → `5h`, `seven_day` → `7d`, `extra_usage` (only when `is_enabled` and all three of `used_credits`, `monthly_limit`, `utilization` non-null; used/limit ÷ 100) → `spend`, each `limits[]` entry with `scope.model.display_name` and numeric `percent` → `scoped` with `name`. `resets_at` copied verbatim. `pub fn headroom(windows, models: &[String]) -> Option<f64>` and `pub fn relevant(windows, models) -> Vec<&Window>` (5h, 7d, plus scoped whose name matches case-insensitively, or all when models contains `"all"`; spend excluded). Pace: port `pace.py` (`expected_pct`, `ahead`, `exhausts_at`, `lasts_to_reset`) onto 7d and scoped windows when the week is ≥ 1 day old.
 
-- [ ] **Step 3: run.rs** — `run_profile(env, slot, login) -> RunProfile`: dir `profiles/claude/<slot>` under `Home`; write the login to keychain service `keychain_service_name(dir)` (macOS) or `<dir>/.credentials.json`; copy `settings.json`, `CLAUDE.md`, `keybindings.json` and the `skills/ commands/ agents/` dirs from the real config home if present (cswap's default share set, `session.py` — read it); env = `CLAUDE_CONFIG_DIR=<dir>`; no cleanup (profiles persist). `ignite(env, slot, login)`: spawn `claude -p . --max-turns 1` with that env, PATH widened with the four candidate dirs from Task 1, stdout/stderr discarded, 120 s timeout; non-zero exit → `DriverError::Http(format!("igniter exited {code}"))`.
+- [ ] **Step 3: run.rs** — `run_profile(env, slot, login) -> RunProfile`: dir `profiles/claude/<slot>` under `Home`; write the login to keychain service `keychain_service_name(dir)` with account = the current OS username (`$USER`; that is how Claude Code looks its item up) through `SecurityCli` (macOS) or `<dir>/.credentials.json` 0600; copy `settings.json`, `CLAUDE.md`, `keybindings.json` and the `skills/ commands/ agents/` dirs from the real config home if present (cswap's default share set, `session.py` — read it); env = `CLAUDE_CONFIG_DIR=<dir>`; no cleanup (profiles persist). `ignite(env, slot, login)`: spawn `claude -p . --max-turns 1` with that env, PATH widened with the four candidate dirs from Task 1, stdout/stderr discarded, 120 s timeout; non-zero exit → `DriverError::Http(format!("igniter exited {code}"))`.
 
 - [ ] **Step 4: mod.rs** — `impl Driver for Claude` wiring the above; `identity()` = config identity, else `profile()`; `usage()` = refresh first when `is_expired`, then fetch → windows; `capabilities()` all true.
 

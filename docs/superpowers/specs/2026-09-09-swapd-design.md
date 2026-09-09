@@ -23,9 +23,12 @@ calls; a terminal user drives it the same way without `--json`.
 ## 2. Givens
 
 - **Rust, one static binary per OS.** No runtime, a few ms startup,
-  ~3 MB. Keychain through the `keyring` crate (macOS Security
-  framework, Windows Credential Manager, Linux secret-service with a
-  0600-file fallback when no daemon runs). Networking `ureq` with
+  ~3 MB. Secrets on macOS go through `/usr/bin/security` (generic
+  passwords, service `swapd`), never a native keychain API: an item
+  made by the binary itself is ACL'd to its code signature, and every
+  unsigned `cargo build` would then prompt on each read (the trap
+  Infinitus documented). Elsewhere 0600 files under the data dir;
+  Windows Credential Manager is a later phase. Networking `ureq` with
   rustls (no OpenSSL to ship). SQLite via `rusqlite` bundled (Kiro).
   Edition 2021, MSRV = current stable; `cargo install --path .` and
   release binaries from a GitHub Actions matrix (macos-arm64,
@@ -68,14 +71,14 @@ src/core/             slots, aliases, settings, history, usage store,
 src/driver/mod.rs     the Driver trait + registry
 src/driver/claude.rs  src/driver/codex.rs  src/driver/kiro.rs
 src/driver/gemini.rs  src/driver/grok.rs
-src/secrets.rs        keyring wrapper + 0600-file fallback
+src/secrets.rs        `security` CLI (macOS) + 0600-file store, sticky fallback
 src/locks.rs          cross-process locks (dir-mkdir mutex, per CLI)
 tests/                integration tests: temp HOME, fake keychain, httpmock
 ```
 
 Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
-`keyring`, `rusqlite` (bundled), `sha2`, `time`, `thiserror`,
-`fd-lock`; dev: `httpmock`, `assert_cmd`, `tempfile`.
+`rusqlite` (bundled, Kiro only), `sha2`, `time`, `thiserror`,
+`fd-lock`; dev: `httpmock`, `assert_cmd`, `tempfile`, `insta`.
 
 ## 4. Contract v1
 
@@ -284,8 +287,11 @@ that driver's sub-spec is written.
   swapd.log
 ```
 
-macOS credentials: keychain service `swapd`, account
-`<provider>:<slot>`. Export envelope: `{"format":"swapd/1",
+macOS credentials: keychain generic passwords written and read
+through `/usr/bin/security`, service `swapd`, account
+`<provider>:<slot>` (so the item's ACL names `security`, not each
+rebuilt binary). `SWAPD_SECRETS=file|memory` overrides the backend
+(tests, CI). Export envelope: `{"format":"swapd/1",
 "exportedAt", "providers":[{provider, activeSlot, accounts:[{slot,
 email, org…, alias, icon, credentials, config?}]}]}`; import also
 accepts cswap's `{"version":…, "accounts":[…]}` as provider `claude`.

@@ -51,6 +51,13 @@ pub struct FileLock {
     _file: fs::File,
 }
 
+/// What `FileLock::probe` found about a `<path>.lock` sibling, without taking
+/// or creating it.
+pub struct LockProbe {
+    pub held: bool,
+    pub note: Option<String>,
+}
+
 impl FileLock {
     /// Acquire an exclusive lock on `<path>.lock`, waiting up to `timeout`.
     /// Returns `ErrorCode::Locked` if the timeout elapses first.
@@ -112,6 +119,53 @@ impl FileLock {
         let _ = file.seek(SeekFrom::Start(0));
         let _ = file.write_all(text.as_bytes());
         let _ = file.flush();
+    }
+
+    /// Read `<path>.lock`'s held/free state and any breadcrumb it holds,
+    /// without creating the file and without blocking on the lock itself.
+    ///
+    /// `doctor` is a read verb: it must never create a lock file, so this
+    /// opens without `create` — a missing file answers `held: false, note:
+    /// None` outright. Otherwise it tries the same `try_write` `acquire`
+    /// does; success means nobody holds it, and the guard is dropped
+    /// immediately rather than kept. `note` is read independently of that
+    /// result (the flock, not the file's content, is the authority), so a
+    /// stale breadcrumb from a since-released lock is still reported.
+    pub fn probe(path: &Path) -> Result<LockProbe> {
+        let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
+        lock_name.push(".lock");
+        let lock_path: PathBuf = path.with_file_name(lock_name);
+
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true);
+        let file = match opts.open(&lock_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(LockProbe {
+                    held: false,
+                    note: None,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let note = fs::read(&lock_path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let mut rw = fd_lock::RwLock::new(file);
+        let held = match rw.try_write() {
+            Ok(guard) => {
+                drop(guard);
+                false
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(LockProbe { held, note })
     }
 }
 
@@ -196,5 +250,34 @@ mod tests {
             let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn probe_missing_file_is_not_held_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine");
+
+        let probe = FileLock::probe(&path).unwrap();
+        assert!(!probe.held);
+        assert_eq!(probe.note, None);
+        assert!(!dir.path().join("engine.lock").exists());
+    }
+
+    #[test]
+    fn probe_reports_a_held_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto");
+
+        let lock = FileLock::acquire(&path, Duration::from_secs(1)).unwrap();
+        lock.note("held-by-test");
+
+        let probe = FileLock::probe(&path).unwrap();
+        assert!(probe.held);
+        assert_eq!(probe.note.as_deref(), Some("held-by-test"));
+
+        drop(lock);
+        let probe = FileLock::probe(&path).unwrap();
+        assert!(!probe.held);
+        assert_eq!(probe.note.as_deref(), Some("held-by-test"));
     }
 }

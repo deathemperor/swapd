@@ -181,7 +181,33 @@ struct DoctorOutput {
     #[serde(rename = "schemaVersion")]
     schema_version: u32,
     home: String,
+    #[serde(rename = "liveStore")]
+    live_store: &'static str,
+    secrets: &'static str,
+    locks: LocksOutput,
+    profiles: Vec<ProfileEntry>,
     providers: Vec<ProviderStatus>,
+}
+
+#[derive(Serialize)]
+struct LocksOutput {
+    engine: LockStatus,
+    auto: LockStatus,
+}
+
+#[derive(Serialize)]
+struct LockStatus {
+    held: bool,
+    note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ProfileEntry {
+    provider: String,
+    slot: u32,
+    path: String,
 }
 
 #[derive(Serialize)]
@@ -189,6 +215,7 @@ struct ProviderStatus {
     provider: String,
     installed: bool,
     path: Option<String>,
+    version: Option<String>,
 }
 
 fn main() {
@@ -473,29 +500,188 @@ fn version(json: bool) -> Result<()> {
 
 fn doctor(json: bool) -> Result<()> {
     let home = Home::resolve()?;
+    let env = driver::Env::current(&home);
+
+    let live_store = driver::claude::live::live_store_name(&env);
+    let secrets =
+        secrets::secrets_for(&home, std::env::var("SWAPD_SECRETS").ok().as_deref())?.name();
+
+    let engine = lock_status(&home.engine_lock_base(), false)?;
+    let auto = lock_status(&home.auto_lock_base(), true)?;
+
+    let profiles = list_profiles(&home);
+
     let (installed, path) = locate_claude(&home);
+    let version = path.as_deref().and_then(cli_version);
     let providers = vec![ProviderStatus {
         provider: "claude".to_string(),
         installed,
         path,
+        version,
     }];
+
     let out = DoctorOutput {
         schema_version: output::SCHEMA_VERSION,
         home: home.root.to_string_lossy().into_owned(),
+        live_store,
+        secrets,
+        locks: LocksOutput { engine, auto },
+        profiles,
         providers,
     };
     if json {
         output::emit_json(&out);
     } else {
         println!("home: {}", out.home);
+        println!("live store: {}", out.live_store);
+        println!("secrets: {}", out.secrets);
+        println!("engine.lock: {}", lock_line(&out.locks.engine));
+        println!("auto.lock: {}", lock_line(&out.locks.auto));
+        if out.profiles.is_empty() {
+            println!("profiles: none");
+        } else {
+            let list = out
+                .profiles
+                .iter()
+                .map(|p| format!("{}/{}", p.provider, p.slot))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("profiles: {list}");
+        }
         for p in &out.providers {
-            match &p.path {
-                Some(path) => println!("{}: installed ({})", p.provider, path),
-                None => println!("{}: not installed", p.provider),
+            match (&p.path, &p.version) {
+                (Some(path), Some(version)) => {
+                    println!("{}: installed ({}) {}", p.provider, path, version)
+                }
+                (Some(path), None) => println!("{}: installed ({})", p.provider, path),
+                (None, _) => println!("{}: not installed", p.provider),
             }
         }
     }
     Ok(())
+}
+
+/// `held`/`note` for a lock's `.lock` sibling. `want_pid` is only true for
+/// `auto.lock`: `engine.lock` has no pid concept, so it never even tries to
+/// parse one out of its note.
+fn lock_status(base: &std::path::Path, want_pid: bool) -> Result<LockStatus> {
+    let probe = core::store::FileLock::probe(base)?;
+    let pid = if want_pid {
+        probe.note.as_deref().and_then(parse_pid)
+    } else {
+        None
+    };
+    Ok(LockStatus {
+        held: probe.held,
+        note: probe.note,
+        pid,
+    })
+}
+
+/// The daemon's breadcrumb is `{"pid":N}` (`FileLock::note`, `cmd/auto.rs`);
+/// anything else — no note, malformed JSON, a non-u32 value — reports no pid
+/// rather than failing doctor over it.
+fn parse_pid(note: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(note).ok()?;
+    value
+        .get("pid")?
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+fn lock_line(status: &LockStatus) -> String {
+    if !status.held {
+        "free".to_string()
+    } else if let Some(pid) = status.pid {
+        format!("held by pid {pid}")
+    } else {
+        "held".to_string()
+    }
+}
+
+/// Every `profiles/<provider>/<slot>` directory that exists, sorted by
+/// (provider, slot). A missing `profiles/` dir or a slot name that doesn't
+/// parse as `u32` is skipped, not an error.
+fn list_profiles(home: &Home) -> Vec<ProfileEntry> {
+    let mut entries = Vec::new();
+    let Ok(provider_dirs) = std::fs::read_dir(home.profiles_dir()) else {
+        return entries;
+    };
+    for provider_entry in provider_dirs.flatten() {
+        if !provider_entry.path().is_dir() {
+            continue;
+        }
+        let Some(provider) = provider_entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(slot_dirs) = std::fs::read_dir(provider_entry.path()) else {
+            continue;
+        };
+        for slot_entry in slot_dirs.flatten() {
+            let slot_path = slot_entry.path();
+            if !slot_path.is_dir() {
+                continue;
+            }
+            let Some(slot) = slot_entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            entries.push(ProfileEntry {
+                provider: provider.clone(),
+                slot,
+                path: slot_path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    entries.sort_by(|a, b| (&a.provider, a.slot).cmp(&(&b.provider, b.slot)));
+    entries
+}
+
+/// The CLI's own version, from `<path> --version`'s first stdout line,
+/// trimmed. `None` on anything short of a clean, prompt exit — not installed,
+/// a timeout, a non-zero exit, empty output — so a broken binary never fails
+/// `doctor` itself.
+fn cli_version(path: &str) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() >= VERSION_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+
+    let mut stdout = child.stdout.take()?;
+    let mut buf = String::new();
+    stdout.read_to_string(&mut buf).ok()?;
+    let first_line = buf.lines().next()?.trim();
+    (!first_line.is_empty()).then(|| first_line.to_string())
 }
 
 /// Find the `claude` binary this environment would run.

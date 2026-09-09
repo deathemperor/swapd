@@ -25,7 +25,7 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | verb | effect |
 |---|---|
 | `version` | print the swapd version |
-| `doctor` | check the local environment for problems |
+| `doctor` | check the local environment: stores, locks, profiles, CLI version |
 | `list` | list every account, its usage and the rotation |
 | `refresh [--slot n]` | fetch usage now, then list |
 | `add [--slot n] [--alias name] [--force]` | capture the CLI's current live login into a slot |

@@ -10,3 +10,4 @@
 - `ignite`/`run`: start a usage window, or run the CLI as one account without touching the live login.
 - Secrets backends: macOS keychain via `security`, a file store, an in-memory store for tests.
 - Platforms: macOS, Linux, Windows.
+- `doctor` reports the live store, secrets backend, engine/auto lock state (with the daemon pid), profile dirs and the CLI version (#7).

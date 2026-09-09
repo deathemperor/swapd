@@ -23,6 +23,9 @@ pub trait Secrets: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>>;
     fn set(&self, key: &str, value: &str) -> Result<()>;
     fn delete(&self, key: &str) -> Result<()>;
+    /// `"keychain"`, `"file"` or `"memory"` — what `doctor` reports. A
+    /// chained/fallback store reports its primary's name, not its own.
+    fn name(&self) -> &'static str;
 }
 
 #[cfg(target_os = "macos")]
@@ -53,6 +56,9 @@ impl Secrets for SecuritySecrets {
     }
     fn delete(&self, key: &str) -> Result<()> {
         self.cli.delete(SERVICE, key)
+    }
+    fn name(&self) -> &'static str {
+        "keychain"
     }
 }
 
@@ -148,6 +154,10 @@ impl Secrets for FileSecrets {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn name(&self) -> &'static str {
+        "file"
+    }
 }
 
 pub struct MemorySecrets(Mutex<HashMap<String, String>>);
@@ -178,6 +188,9 @@ impl Secrets for MemorySecrets {
     fn delete(&self, key: &str) -> Result<()> {
         self.0.lock().unwrap().remove(key);
         Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "memory"
     }
 }
 
@@ -269,6 +282,12 @@ impl Secrets for StickySecrets {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The primary's name, degraded or not: `doctor` reports what the store
+    /// is configured to prefer, not which one a past failure fell back to.
+    fn name(&self) -> &'static str {
+        self.primary.name()
     }
 }
 
@@ -391,6 +410,9 @@ mod tests {
         fn delete(&self, _key: &str) -> Result<()> {
             Err(SwapdError::new(ErrorCode::KeychainUnavailable, "fail"))
         }
+        fn name(&self) -> &'static str {
+            "failing"
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -413,6 +435,9 @@ mod tests {
         }
         fn delete(&self, _key: &str) -> Result<()> {
             Err(SwapdError::new(ErrorCode::InvalidInput, "bad"))
+        }
+        fn name(&self) -> &'static str {
+            "invalid"
         }
     }
 
@@ -454,6 +479,9 @@ mod tests {
         fn delete(&self, _key: &str) -> Result<()> {
             *self.0.lock().unwrap() += 1;
             Err(SwapdError::new(ErrorCode::KeychainUnavailable, "fail"))
+        }
+        fn name(&self) -> &'static str {
+            "counting-failing"
         }
     }
 
@@ -560,6 +588,9 @@ mod tests {
         }
         fn delete(&self, key: &str) -> Result<()> {
             self.0.delete(key)
+        }
+        fn name(&self) -> &'static str {
+            self.0.name()
         }
     }
 

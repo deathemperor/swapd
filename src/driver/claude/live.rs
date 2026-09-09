@@ -353,6 +353,24 @@ fn live_store_from_env(env: &Env) -> LiveStore {
     }
 }
 
+/// The name of what `live_store_from_env` would pick, without building it:
+/// `doctor` only needs the name, so this must not construct a `RealSecurity`
+/// just to throw it away.
+pub fn live_store_name(env: &Env) -> &'static str {
+    let mode = env.vars.get("SWAPD_LIVE_STORE");
+    if mode.map(String::as_str) == Some("file") {
+        return "file";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "keychain"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "file"
+    }
+}
+
 /// Rewrite an already-present `.credentials.json` after a keychain write
 /// (`credentials.py:1012-1038` `_refresh_stale_credentials_file`).
 ///

@@ -26,6 +26,7 @@ use serde_json::{json, Map, Value};
 
 use crate::core::slots::{self, Slot};
 use crate::core::store::{write_json_atomic, FileLock};
+use crate::core::unclaimed;
 use crate::ctx::Ctx;
 use crate::driver::{Driver, DriverError, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
@@ -46,6 +47,7 @@ pub struct ExportOutput {
     pub schema_version: u32,
     pub path: String,
     pub accounts: usize,
+    pub unclaimed: usize,
     pub warnings: Vec<String>,
 }
 
@@ -145,6 +147,37 @@ pub fn run(
         .collect();
     let active_slot = table.active_slot.filter(|n| exported.contains(n));
 
+    // Export is the backup path, so the unclaimed stash rides along beside the
+    // slot credentials it sits next to in `<home>/credentials`: a machine
+    // restored from an export alone would otherwise lose every login a switch
+    // stashed rather than placed, silently. An entry whose secret cannot be
+    // read is still listed — the row itself is evidence the stash happened —
+    // but without `credential`, and with a warning naming which one.
+    let unclaimed_entries = unclaimed::list(ctx)?;
+    let mut unclaimed_out: Vec<Value> = Vec::with_capacity(unclaimed_entries.len());
+    for (entry_id, entry) in unclaimed_entries {
+        let mut row = Map::new();
+        row.insert("id".to_string(), json!(entry_id));
+        row.insert("provider".to_string(), json!(entry.provider));
+        row.insert(
+            "stashedAt".to_string(),
+            json!(unclaimed::format_stashed_at(entry.stashed_at)),
+        );
+        row.insert("email".to_string(), json!(entry.email));
+        row.insert("reason".to_string(), json!(entry.reason));
+        match ctx.secrets.get(&entry.secret_key) {
+            Ok(Some(bytes)) => {
+                row.insert("credential".to_string(), json!(bytes));
+            }
+            Ok(None) | Err(_) => {
+                warnings.push(format!(
+                    "unclaimed entry {entry_id}'s secret could not be read; exported without it"
+                ));
+            }
+        }
+        unclaimed_out.push(Value::Object(row));
+    }
+
     let envelope = json!({
         "format": "swapd/1",
         "exportedAt": crate::driver::claude::usage::format_ts(ctx.now()),
@@ -153,6 +186,7 @@ pub fn run(
             "activeSlot": active_slot,
             "accounts": accounts,
         }],
+        "unclaimed": unclaimed_out,
     });
 
     for warning in &warnings {
@@ -169,6 +203,7 @@ pub fn run(
         schema_version: output::SCHEMA_VERSION,
         path: path.to_string_lossy().into_owned(),
         accounts: exported.len(),
+        unclaimed: unclaimed_out.len(),
         warnings,
     }))
 }
@@ -273,6 +308,9 @@ fn entry(driver: &dyn Driver, slot: u32, meta: &Slot, login: &Login) -> Result<M
 
 pub fn print_human(out: &ExportOutput) {
     println!("exported {} account(s) to {}", out.accounts, out.path);
+    if out.unclaimed > 0 {
+        println!("unclaimed: {}", out.unclaimed);
+    }
 }
 
 fn invalid(message: impl Into<String>) -> SwapdError {

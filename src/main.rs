@@ -2,6 +2,8 @@ mod core;
 mod errors;
 mod output;
 mod paths;
+mod secrets;
+mod security_cli;
 
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};

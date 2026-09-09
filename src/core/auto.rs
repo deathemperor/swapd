@@ -857,9 +857,15 @@ impl<'a> AutoEngine<'a> {
     ///
     /// All three passes run over ONE `Prepared`: the live login, every slot's
     /// secret and the adopt/heal are the tick's most expensive half (one
-    /// `/usr/bin/security` spawn per slot on macOS) and nothing between the
-    /// phases changes them — no switch lands inside this function. What each
-    /// pass fetches, and the order the decisions are made in, is unchanged.
+    /// `/usr/bin/security` spawn per slot on macOS) and nothing this function
+    /// does changes them — it initiates no switch. A switch landing from
+    /// OUTSIDE (a manual `swapd switch`, the CLI's own `/login`) is not
+    /// picked up by a later phase the way a per-phase preamble would have
+    /// picked it up; it is caught instead where it matters, by
+    /// `switch::perform`, which re-reads the live login itself before it
+    /// commits and reports `already-active` rather than landing on a picture
+    /// this tick has stopped describing. What each pass fetches, and the order
+    /// the decisions are made in, is unchanged.
     fn collect_scheduled(
         &mut self,
         settings: &Settings,

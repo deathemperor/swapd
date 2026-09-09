@@ -175,6 +175,9 @@ pub struct Prepared {
     /// `reserve`, and nothing a view is built from — `account_view`,
     /// `next_candidate`, `next_recovery`, `Entry::token_dead` — reads a claim.
     entries: BTreeMap<String, Entry>,
+    /// The slot whose credential this pass cannot see (an unreadable keychain,
+    /// a switch in flight, a busy CLI), if any.
+    unreadable_active: Option<u32>,
     /// The reason `active_unreadable` reports to `list --json`.
     active_unreadable: Option<String>,
     keychain_down: bool,
@@ -353,12 +356,7 @@ pub fn prepare(
             (stored, stored_fingerprint)
         };
 
-        let sentinel = match &login {
-            _ if unreadable_active == Some(*slot) => Some(UsageStatus::Stale),
-            None => Some(UsageStatus::NoCredentials),
-            Some(login) if provider.is_api_key(login) => Some(UsageStatus::ApiKey),
-            Some(_) => None,
-        };
+        let sentinel = credential_sentinel(provider, *slot, login.as_ref(), unreadable_active);
 
         states.push(SlotState {
             slot: *slot,
@@ -419,6 +417,7 @@ pub fn prepare(
         states,
         keys,
         entries,
+        unreadable_active,
         active_unreadable,
         keychain_down,
     })
@@ -488,8 +487,10 @@ pub fn execute(
             .enumerate()
             .filter_map(|(i, st)| claims.get(&st.key).map(|claim| (i, claim.as_str())))
             .collect();
-        for (i, sentinel) in fetch_all(ctx, provider, &states, &jobs, prepared.keychain_down)? {
-            states[i].sentinel = states[i].sentinel.or(sentinel);
+        let mut fetched = Vec::new();
+        for (i, done) in fetch_all(ctx, provider, &states, &jobs, prepared.keychain_down)? {
+            states[i].sentinel = states[i].sentinel.or(done.sentinel);
+            fetched.push((i, done.live_synced));
         }
 
         // 6. What the fetches wrote, plus the quarantine they may have just
@@ -502,6 +503,26 @@ pub fn execute(
             if entry_of(&prepared.entries, &st.key).token_dead(st.fingerprint.as_deref()) {
                 st.sentinel = Some(UsageStatus::ReloginRequired);
             }
+        }
+
+        // 7. The successors, for the slots this pass claimed — see
+        //    `adopt_successor`. Strictly after the marking above, which is
+        //    about the generation that was just SPENT.
+        let Prepared {
+            states: base,
+            entries,
+            unreadable_active,
+            ..
+        } = &mut *prepared;
+        for (i, live_synced) in fetched {
+            adopt_successor(
+                ctx,
+                provider,
+                &mut base[i],
+                entries,
+                *unreadable_active,
+                live_synced,
+            )?;
         }
     }
 
@@ -519,6 +540,69 @@ pub fn execute(
         next_recovery: next_recovery(ctx, &states, &prepared.entries),
         accounts,
     })
+}
+
+/// Re-read one claimed slot's credential into the `Prepared`, so a second fetch
+/// pass over it uses the generation the first one left behind.
+///
+/// A fetch can rotate the slot's token — `refresh_then_usage` persists the
+/// successor through `core::refresh` before anything downstream can fail — and
+/// it can heal the live store. A `Prepared` that still described the spent
+/// generation would hand the next pass a token the endpoint has already
+/// consumed: at best a wasted round trip through `refresh_slot`'s
+/// compare-and-swap, at worst a `TokenExpired` sentinel on an account that was
+/// refreshed moments ago (the expiry is read off the login this struct holds),
+/// which is what the auto engine idle-holds on. So the slots this pass CLAIMED
+/// are re-read here — a handful of secret reads, not the fleet, which is the
+/// whole point of preparing once — and everything derived from the credential
+/// is recomputed with them. Slots this pass did not claim cannot have moved,
+/// and are left alone.
+fn adopt_successor(
+    ctx: &Ctx,
+    provider: &dyn Driver,
+    st: &mut SlotState,
+    entries: &BTreeMap<String, Entry>,
+    unreadable_active: Option<u32>,
+    live_synced: bool,
+) -> Result<()> {
+    let stored = ctx
+        .secrets
+        .get(&st.key)?
+        .filter(|bytes| !bytes.trim().is_empty())
+        .map(|bytes| Login { bytes });
+    st.fingerprint = stored.as_ref().map(Login::fingerprint);
+    st.login = stored;
+    // The live store holds this slot's current credential: there is nothing
+    // left to heal, and the generation a later guarded write must succeed is
+    // the one that is live now. Without the write, what this pass measured is
+    // still what is live, so both stand.
+    if live_synced {
+        st.heal_live = false;
+        st.live_fingerprint = st.fingerprint.clone();
+    }
+    st.sentinel = credential_sentinel(provider, st.slot, st.login.as_ref(), unreadable_active)
+        .or_else(|| {
+            entry_of(entries, &st.key)
+                .token_dead(st.fingerprint.as_deref())
+                .then_some(UsageStatus::ReloginRequired)
+        });
+    Ok(())
+}
+
+/// The sentinel a slot carries before the usage table has been consulted:
+/// everything the credential alone (or the absence of one) decides.
+fn credential_sentinel(
+    provider: &dyn Driver,
+    slot: u32,
+    login: Option<&Login>,
+    unreadable_active: Option<u32>,
+) -> Option<UsageStatus> {
+    match login {
+        _ if unreadable_active == Some(slot) => Some(UsageStatus::Stale),
+        None => Some(UsageStatus::NoCredentials),
+        Some(login) if provider.is_api_key(login) => Some(UsageStatus::ApiKey),
+        Some(_) => None,
+    }
 }
 
 /// Every slot once, rotation order first (a slot missing from `order` is a
@@ -576,8 +660,8 @@ pub fn record_slot_fingerprint(
     })
 }
 
-/// Run the claimed fetches on at most `MAX_FETCH_THREADS` threads, returning the
-/// sentinel each one earned (if any).
+/// Run the claimed fetches on at most `MAX_FETCH_THREADS` threads, returning
+/// what each one left behind.
 ///
 /// Nothing is shared but the usage table and the secret store, both of which
 /// serialize their own writes; every thread owns its claims outright.
@@ -587,7 +671,7 @@ fn fetch_all(
     states: &[SlotState],
     jobs: &[(usize, &str)],
     keychain_down: bool,
-) -> Result<Vec<(usize, Option<UsageStatus>)>> {
+) -> Result<Vec<(usize, Fetched)>> {
     let chunk = jobs.len().div_ceil(MAX_FETCH_THREADS).max(1);
     std::thread::scope(|scope| {
         let handles: Vec<_> = jobs
@@ -615,6 +699,16 @@ fn fetch_all(
     })
 }
 
+/// What one slot's fetch left behind.
+struct Fetched {
+    /// The sentinel it earned, if any.
+    sentinel: Option<UsageStatus>,
+    /// The live store ends the fetch holding this slot's current credential —
+    /// a heal or a refresh's guarded write landed. What tells the next pass
+    /// there is nothing left to heal (`adopt_successor`).
+    live_synced: bool,
+}
+
 /// One account's fetch: `usage`, and on `NeedsRefresh` the refresh the driver
 /// deliberately refuses to do on its own.
 fn fetch_one(
@@ -623,7 +717,7 @@ fn fetch_one(
     st: &SlotState,
     claim: &str,
     keychain_down: bool,
-) -> Result<Option<UsageStatus>> {
+) -> Result<Fetched> {
     let login = st
         .login
         .as_ref()
@@ -631,18 +725,27 @@ fn fetch_one(
 
     // The live store holds an older generation than this slot's copy: heal it
     // before the credential is used, while the claim still fences a failure.
+    let mut live_synced = false;
     if st.heal_live {
-        if let LiveWrite::Failed(e) =
-            write_live_guarded(ctx, provider, st, login, st.live_fingerprint.as_deref())?
-        {
-            return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
+        match write_live_guarded(ctx, provider, st, login, st.live_fingerprint.as_deref())? {
+            LiveWrite::Done => live_synced = true,
+            LiveWrite::Moved => {}
+            LiveWrite::Failed(e) => {
+                return Ok(Fetched {
+                    sentinel: Some(degrade_write_live(ctx, st, claim, &e)?),
+                    live_synced: false,
+                })
+            }
         }
     }
 
     match provider.usage(login) {
         Ok(usage) => {
             record_success(ctx, st, claim, usage.windows)?;
-            Ok(None)
+            Ok(Fetched {
+                sentinel: None,
+                live_synced,
+            })
         }
         Err(DriverError::NeedsRefresh) if keychain_down => {
             // No pass may spend a refresh token it cannot write back: with the
@@ -650,12 +753,20 @@ fn fetch_one(
             // credential in hand is still the one Claude Code holds.
             ctx.store
                 .record_failure(&st.key, claim, "keychain-unavailable", None, None)?;
-            Ok(Some(UsageStatus::Stale))
+            Ok(Fetched {
+                sentinel: Some(UsageStatus::Stale),
+                live_synced,
+            })
         }
-        Err(DriverError::NeedsRefresh) => refresh_then_usage(ctx, provider, st, claim, login),
+        Err(DriverError::NeedsRefresh) => {
+            refresh_then_usage(ctx, provider, st, claim, login, live_synced)
+        }
         Err(e) => {
             record_failure(ctx, st, claim, &e)?;
-            Ok(None)
+            Ok(Fetched {
+                sentinel: None,
+                live_synced,
+            })
         }
     }
 }
@@ -784,7 +895,8 @@ fn refresh_then_usage(
     st: &SlotState,
     claim: &str,
     login: &Login,
-) -> Result<Option<UsageStatus>> {
+    healed: bool,
+) -> Result<Fetched> {
     // Under the slot's own refresh lock (`core::refresh`), so a `switch` or a
     // `run` racing this pass cannot POST the same single-use token: the loser
     // of that race gets `invalid_grant` and would quarantine an account whose
@@ -803,7 +915,10 @@ fn refresh_then_usage(
                 None,
                 Some(&login.fingerprint()),
             )?;
-            return Ok(Some(UsageStatus::ReloginRequired));
+            return Ok(Fetched {
+                sentinel: Some(UsageStatus::ReloginRequired),
+                live_synced: healed,
+            });
         }
         // Another process is spending this slot's token right now. That is not
         // a failed fetch: no strike, no backoff, and not `token-expired` — the
@@ -811,7 +926,10 @@ fn refresh_then_usage(
         // next pass (the winner will be done by then) fetches it.
         Refreshed::Failed(DriverError::Locked(_)) => {
             ctx.store.release(&st.key, claim)?;
-            return Ok(Some(UsageStatus::Stale));
+            return Ok(Fetched {
+                sentinel: Some(UsageStatus::Stale),
+                live_synced: healed,
+            });
         }
         Refreshed::Failed(_) => {
             ctx.store
@@ -819,7 +937,10 @@ fn refresh_then_usage(
             // An expired ACTIVE credential nothing could refresh this pass is
             // the state the auto engine must idle-hold on, not a failed fetch
             // (`switcher.py:4810-4830`).
-            return Ok(st.active.then_some(UsageStatus::TokenExpired));
+            return Ok(Fetched {
+                sentinel: st.active.then_some(UsageStatus::TokenExpired),
+                live_synced: healed,
+            });
         }
     };
 
@@ -831,11 +952,19 @@ fn refresh_then_usage(
     // The generation this refresh succeeds — which after a heal is the login
     // the heal itself wrote live, NOT the one the pass first measured.
     let spent = login.fingerprint();
+    // The rotation supersedes whatever the heal put live, so this write — not
+    // the heal's — is what says the live store holds the slot's credential.
+    let mut live_synced = false;
     if st.active {
-        if let LiveWrite::Failed(e) =
-            write_live_guarded(ctx, provider, st, &refreshed, Some(spent.as_str()))?
-        {
-            return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
+        match write_live_guarded(ctx, provider, st, &refreshed, Some(spent.as_str()))? {
+            LiveWrite::Done => live_synced = true,
+            LiveWrite::Moved => {}
+            LiveWrite::Failed(e) => {
+                return Ok(Fetched {
+                    sentinel: Some(degrade_write_live(ctx, st, claim, &e)?),
+                    live_synced: false,
+                })
+            }
         }
     }
 
@@ -844,11 +973,17 @@ fn refresh_then_usage(
     match provider.usage(&refreshed) {
         Ok(usage) => {
             record_success(ctx, st, claim, usage.windows)?;
-            Ok(None)
+            Ok(Fetched {
+                sentinel: None,
+                live_synced,
+            })
         }
         Err(e) => {
             record_failure(ctx, st, claim, &e)?;
-            Ok(None)
+            Ok(Fetched {
+                sentinel: None,
+                live_synced,
+            })
         }
     }
 }

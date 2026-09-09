@@ -49,6 +49,13 @@ impl FakeDriver {
         self
     }
 
+    /// Retire this refresh token's access token — the ordinary way a
+    /// credential a pass measured needs refreshing by the time the next one
+    /// uses it.
+    pub fn unusable(&self, token: &str) {
+        self.usable.lock().unwrap().remove(token);
+    }
+
     pub fn slow_refresh(mut self, delay: Duration) -> Self {
         self.refresh_delay = delay;
         self
@@ -449,4 +456,97 @@ fn a_contended_refresh_lock_is_stale_not_a_strike() {
     assert!(row["lastError"].is_null(), "{row}");
     assert!(row["backoffUntil"].is_null(), "{row}");
     assert!(row["claimUntil"].is_null(), "{row}");
+}
+
+#[test]
+fn a_second_execute_uses_the_successor_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+    let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"));
+    let mut prepared = prepare(&ctx, &driver, slots::LOCK_TIMEOUT).unwrap();
+    let forced = || FetchOpts {
+        force_slots: vec![1],
+        ..FetchOpts::default()
+    };
+
+    // Pass 1: rt-1's access token is spent, so the fetch rotates the lineage
+    // and persists rt-next-1 (secret, slot fingerprint and live store).
+    let view = execute(&ctx, &driver, &mut prepared, &forced()).unwrap();
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+    assert_eq!(
+        ctx.secrets.get(&slot_key("claude", 1)).unwrap().unwrap(),
+        login_for("one@example.com", "rt-next-1")
+    );
+
+    // By pass 2 the successor's own access token has expired too, so this pass
+    // refreshes as well — with the successor, never with the generation pass 1
+    // spent. Re-POSTing that one is a `RefreshDenied` and a dead-token strike
+    // on a healthy account.
+    driver.unusable("rt-next-1");
+    let view = execute(&ctx, &driver, &mut prepared, &forced()).unwrap();
+
+    let refreshes = driver.refreshes.lock().unwrap().clone();
+    assert_eq!(refreshes.len(), 2, "{refreshes:?}");
+    assert_eq!(
+        refreshes[1],
+        login_for("one@example.com", "rt-next-1"),
+        "the second pass must POST the successor the first one left behind"
+    );
+    assert_eq!(
+        ctx.secrets.get(&slot_key("claude", 1)).unwrap().unwrap(),
+        login_for("one@example.com", "rt-next-next-1"),
+        "and its own rotation is the one the slot ends on"
+    );
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+    assert_eq!(
+        driver.live_bytes().unwrap(),
+        login_for("one@example.com", "rt-next-next-1")
+    );
+}
+
+#[test]
+fn pass_marks_do_not_leak_between_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_for(dir.path());
+    // The active slot's access token expired long ago.
+    let expired = login_expiring("one@example.com", "rt-1", 1_000_000);
+    ctx.secrets.set(&slot_key("claude", 1), &expired).unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        provider.insert(1, slot_row("one@example.com"));
+        provider.active_slot = Some(1);
+        Ok((true, ()))
+    })
+    .unwrap();
+    let driver = FakeDriver::new(&expired);
+    let mut prepared = prepare(&ctx, &driver, slots::LOCK_TIMEOUT).unwrap();
+
+    // Pass 1 fetches nothing, so the expired active credential surfaces as
+    // expired rather than as a stale `ok`.
+    let view = execute(
+        &ctx,
+        &driver,
+        &mut prepared,
+        &FetchOpts {
+            only: Some(Vec::new()),
+            ..FetchOpts::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::TokenExpired);
+
+    // That mark was about pass 1's fetch gate, not about the slot: pass 2
+    // claims it, refreshes it, and reports what it measured.
+    let view = execute(
+        &ctx,
+        &driver,
+        &mut prepared,
+        &FetchOpts {
+            force_slots: vec![1],
+            ..FetchOpts::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(driver.refreshes.lock().unwrap().len(), 1);
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
 }

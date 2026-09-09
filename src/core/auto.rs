@@ -1563,39 +1563,83 @@ impl<'a> AutoEngine<'a> {
     }
 
     /// Drop quarantine entries whose credential has been replaced since
-    /// (`autoswitch.py:838-870`).
+    /// (`autoswitch.py:838-870`) — or, since `add --slot` can move an account
+    /// with its secret (#3), RE-KEY an entry onto the slot its credential
+    /// moved to instead of dropping it (#14).
     ///
     /// A changed fingerprint means the user logged in again and re-captured
     /// the account: the dead lineage is gone, so the slot re-enters rotation.
     /// A slot that no longer has a stored login at all (removed, or removed
-    /// and re-added) reads the same way, which is the answer we want.
+    /// and re-added) reads the same way, which is the answer we want — UNLESS
+    /// some other slot in this provider's table now holds that very
+    /// fingerprint, which means the account was moved rather than replaced:
+    /// the same dead credential would otherwise re-enter rotation on its new
+    /// slot with no quarantine at all, costing one wasted switch and one
+    /// `invalid_grant` before it earns fresh strikes. The record just moves
+    /// with it — no `Unquarantined` event, since nothing was cured.
     fn release_recovered_quarantines(&mut self, state: &mut AutoState) -> Result<()> {
         if state.quarantine.is_empty() {
             return Ok(());
         }
         let slots = slots::load(&self.ctx.home, self.driver.id())?;
         let mut released: Vec<(u32, String)> = Vec::new();
+        let mut moved: Vec<(u32, u32, Quarantine)> = Vec::new();
         for (key, entry) in &state.quarantine {
             let Ok(slot) = key.parse::<u32>() else {
                 continue;
             };
-            if self.stored_fingerprint(slot)? != entry.fingerprint {
-                let email = slots
-                    .slots
-                    .get(&slot)
-                    .map(|s| s.email.clone())
-                    .unwrap_or_default();
-                released.push((slot, email));
+            if self.stored_fingerprint(slot)? == entry.fingerprint {
+                continue;
             }
+            // The scan below only runs here, on the rare mismatch path — the
+            // common tick still reads one secret per quarantined slot, as it
+            // always has. `slots.slots` is a `BTreeMap`, so the first match
+            // is already the lowest slot number (the tie-break the brief
+            // asks for when a hand-edited file holds one credential twice).
+            if entry.fingerprint.is_some() {
+                let mut new_slot = None;
+                for &other in slots.slots.keys() {
+                    if other != slot && self.stored_fingerprint(other)? == entry.fingerprint {
+                        new_slot = Some(other);
+                        break;
+                    }
+                }
+                if let Some(new_slot) = new_slot {
+                    moved.push((slot, new_slot, entry.clone()));
+                    continue;
+                }
+            }
+            let email = slots
+                .slots
+                .get(&slot)
+                .map(|s| s.email.clone())
+                .unwrap_or_default();
+            released.push((slot, email));
         }
-        if released.is_empty() {
+        if released.is_empty() && moved.is_empty() {
             return Ok(());
         }
         *state = self.mutate_state(|state| {
+            // Removals before insertions: a release and a move can name the
+            // same slot number (the entry sitting there today mismatches and
+            // is released, while the entry moving IN takes that same key), so
+            // inserting first would have the release below delete the entry
+            // that just moved onto it.
             for (slot, _) in &released {
                 state.quarantine.remove(&slot.to_string());
             }
+            for (old, _, _) in &moved {
+                state.quarantine.remove(&old.to_string());
+            }
+            for (_, new_slot, entry) in &moved {
+                state.quarantine.insert(new_slot.to_string(), entry.clone());
+            }
         })?;
+        for (old, new_slot, _) in &moved {
+            eprintln!(
+                "warning: quarantine for slot {old} followed its credential to slot {new_slot}"
+            );
+        }
         for (slot, email) in released {
             self.emit(Event::Unquarantined {
                 account: SlotRef::numbered(slot, email),

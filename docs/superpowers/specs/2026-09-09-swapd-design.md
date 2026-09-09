@@ -8,7 +8,9 @@ other cli providers."
 
 Answers that fixed the shape: macOS + Linux + Windows; the CLI stays
 usable standalone beside other pollers; clean protocol (not a cswap
-twin); repo and binary `swapd`; Grok targets xAI's official CLI.
+twin); repo and binary `swapd`; Grok targets xAI's official CLI; Rust
+(user's call over Go, 2026-09-09: smaller binary, native keychain
+crate, bundled SQLite for Kiro).
 
 ## 1. Goal
 
@@ -20,8 +22,14 @@ calls; a terminal user drives it the same way without `--json`.
 
 ## 2. Givens
 
-- **Go, one static binary per OS.** No runtime, a few ms startup, the
-  `security` CLI for the macOS keychain, 0600 files elsewhere.
+- **Rust, one static binary per OS.** No runtime, a few ms startup,
+  ~3 MB. Keychain through the `keyring` crate (macOS Security
+  framework, Windows Credential Manager, Linux secret-service with a
+  0600-file fallback when no daemon runs). Networking `ureq` with
+  rustls (no OpenSSL to ship). SQLite via `rusqlite` bundled (Kiro).
+  Edition 2021, MSRV = current stable; `cargo install --path .` and
+  release binaries from a GitHub Actions matrix (macos-arm64,
+  macos-x86_64, linux-x86_64, linux-arm64, windows-x86_64).
 - **Still one `AccountEngine` adapter in Infinitus.** The app gates on
   capabilities, never on engine identity; nothing in the app may depend
   on swapd existing (the same rule that governs cswap). The subprocess
@@ -52,18 +60,22 @@ swapd <verb> [args] [--provider claude|codex|kiro|gemini|grok] [--json]
 ### Layout
 
 ```
-cmd/swapd/            main, verb dispatch, output
-internal/core/        slots, aliases, settings, history, usage store,
+Cargo.toml            one binary crate `swapd` (workspace later if a driver grows)
+src/main.rs           clap verb dispatch, --json/--provider, exit codes
+src/output.rs         JSON envelope, error codes, stderr human view
+src/core/             slots, aliases, settings, history, usage store,
                       poll policy, auto loop, events, export/import
-internal/driver/      the Driver interface + registry
-internal/driver/claude
-internal/driver/codex
-internal/driver/kiro
-internal/driver/gemini
-internal/driver/grok
-internal/keychain/    macOS `security` shell-out, file store elsewhere
-internal/locks/       cross-process locks (dir-mkdir mutex, per CLI)
+src/driver/mod.rs     the Driver trait + registry
+src/driver/claude.rs  src/driver/codex.rs  src/driver/kiro.rs
+src/driver/gemini.rs  src/driver/grok.rs
+src/secrets.rs        keyring wrapper + 0600-file fallback
+src/locks.rs          cross-process locks (dir-mkdir mutex, per CLI)
+tests/                integration tests: temp HOME, fake keychain, httpmock
 ```
+
+Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
+`keyring`, `rusqlite` (bundled), `sha2`, `time`, `thiserror`,
+`fd-lock`; dev: `httpmock`, `assert_cmd`, `tempfile`.
 
 ## 4. Contract v1
 
@@ -155,23 +167,27 @@ strategy, preferred, model, unhealthyTicks`.
 
 ## 5. Driver interface
 
-```go
-type Driver interface {
-    ID() string                              // "claude"
-    Installed() (path string, ok bool)       // the CLI on this machine
-    // The CLI's live login for the current environment.
-    ReadLive(env Env) (Login, error)
-    // Replace it, under the CLI's own locks; preserve state the login
-    // does not own (Claude: MCP OAuth tokens, non-account config).
-    WriteLive(env Env, l Login) error
-    Identity(l Login) (Identity, error)      // email, org, plan, from the bytes or one profile call
-    Refresh(l Login) (Login, error)          // token refresh; ErrTokenDead on invalid_grant
-    Usage(l Login) (Usage, error)            // windows[]; ErrThrottled{RetryAfter} on 429
-    Ignite(l Login) error                    // one minimal request as this login
-    RunEnv(l Login) (env []string, cleanup func()) // per-process profile for `run`
-    Capabilities() Caps                      // ignite, addToken, prefer, refresh…
+```rust
+pub trait Driver: Send + Sync {
+    fn id(&self) -> &'static str;                       // "claude"
+    fn installed(&self) -> Option<PathBuf>;             // the CLI on this machine
+    /// The CLI's live login for the current environment.
+    fn read_live(&self, env: &Env) -> Result<Login, DriverError>;
+    /// Replace it, under the CLI's own locks; preserve state the login
+    /// does not own (Claude: MCP OAuth tokens, non-account config).
+    fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError>;
+    fn identity(&self, login: &Login) -> Result<Identity, DriverError>; // email, org, plan
+    fn refresh(&self, login: &Login) -> Result<Login, DriverError>;     // TokenDead on invalid_grant
+    fn usage(&self, login: &Login) -> Result<Usage, DriverError>;       // windows[]; Throttled{retry_after}
+    fn ignite(&self, login: &Login) -> Result<(), DriverError>;         // one minimal request
+    fn run_env(&self, login: &Login) -> Result<RunProfile, DriverError>; // per-process profile; Drop cleans up
+    fn capabilities(&self) -> Caps;                                     // ignite, add_token, prefer, refresh…
 }
 ```
+
+`DriverError` is an enum (`NotInstalled`, `NoLogin`, `TokenDead`,
+`Throttled { retry_after: Option<Duration> }`, `Locked`, `Io`, `Http`,
+`Unsupported`) mapped one-to-one onto the JSON error codes.
 
 `Login` is opaque bytes plus a fingerprint (refresh-token hash when one
 exists, else content hash) — the core never parses provider tokens.
@@ -276,10 +292,11 @@ accepts cswap's `{"version":…, "accounts":[…]}` as provider `claude`.
 
 ## 10. Testing
 
-- Go: table tests per package; recorded HTTP fixtures per driver
-  (usage, refresh, profile), never live tokens; a fake keychain and a
-  temp home for every store test; a lock-contention test with two
-  processes.
+- Rust: unit tests beside each module; `httpmock` fixtures per driver
+  (usage, refresh, profile) recorded once with values scrubbed, never
+  live tokens; a `Secrets` trait with an in-memory fake and a temp
+  `HOME` for every store test; `assert_cmd` end-to-end runs of the
+  binary; a lock-contention test with two processes.
 - Golden parity: `swapd list --json --provider claude` mapped back to
   cswap's shape must equal `cswap list --json` on this Mac's seven
   accounts (a one-off script during the transition, not CI).

@@ -170,30 +170,45 @@ strategy, preferred, model, unhealthyTicks`.
 
 ## 5. Driver interface
 
+As landed in phase 1 (the plan's original sketch is superseded by the
+rulings in §13):
+
 ```rust
 pub trait Driver: Send + Sync {
-    fn id(&self) -> &'static str;                       // "claude"
-    fn installed(&self) -> Option<PathBuf>;             // the CLI on this machine
-    /// The CLI's live login for the current environment.
+    fn id(&self) -> &'static str;                        // "claude"
+    fn installed(&self, env: &Env) -> Option<PathBuf>;   // the CLI, resolved from `env` (SWAPD_CLAUDE_CLI, PATH)
     fn read_live(&self, env: &Env) -> Result<Login, DriverError>;
-    /// Replace it, under the CLI's own locks; preserve state the login
-    /// does not own (Claude: MCP OAuth tokens, non-account config).
     fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError>;
-    fn identity(&self, login: &Login) -> Result<Identity, DriverError>; // email, org, plan
+    fn identity(&self, login: &Login) -> Result<Identity, DriverError>;  // may call the profile endpoint
+    fn identity_offline(&self, login: &Login) -> Option<Identity>;      // envelope only, never the network
+    fn expires_at(&self, login: &Login) -> Option<f64>;                 // unix seconds; the generation oracle
     fn refresh(&self, login: &Login) -> Result<Login, DriverError>;     // TokenDead on invalid_grant
-    fn usage(&self, login: &Login) -> Result<Usage, DriverError>;       // windows[]; Throttled{retry_after}
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError>;      // one minimal request as this login
-    fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
-    fn capabilities(&self) -> Caps;                                     // ignite, add_token, prefer, refresh…
+    fn usage(&self, login: &Login) -> Result<Usage, DriverError>;       // NEVER refreshes: NeedsRefresh on expiry / 401
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
+    fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>;
+    fn commit_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError>; // advance the seed marker AFTER persist
+    fn forget_profile(&self, env: &Env, slot: u32) -> Result<(), DriverError>;  // drop the profile's keychain item (remove)
+    fn live_config_text(&self, env: &Env) -> Result<Option<String>, DriverError>; // export --full
+    fn capabilities(&self) -> Caps;                       // ignite, add_token, prefer, refresh, run
+    fn can_activate(&self, login: &Login) -> Result<(), DriverError>; // Claude: OAuth only (API keys phase 2)
+    fn is_api_key(&self, login: &Login) -> bool;          // the single API-key predicate
 }
+
+pub struct IgniteOutcome { pub exit_code: i32, pub rotated: Option<Login> }
+pub struct RunProfile { pub env: Vec<(String, String)>, pub unset: Vec<String>,
+                        pub dir: PathBuf, pub read_back: Option<ReadBack>, /* cleanup */ }
 ```
 
-`DriverError` is an enum (`NotInstalled`, `NoLogin`, `TokenDead`,
-`Throttled { retry_after: Option<Duration> }`, `Locked`, `Io`, `Http`,
-`Unsupported`) mapped one-to-one onto the JSON error codes.
+`DriverError` is `NotInstalled`, `NoLogin`, `KeychainUnavailable`,
+`TokenDead`, `NeedsRefresh`, `Throttled { retry_after }`, `Locked`, `Io`,
+`Http`, `Unsupported`, `Invalid`, mapped onto the JSON error codes
+(`NeedsRefresh` → `refresh-denied`, `KeychainUnavailable` → `keychain-unavailable`).
 
 `Login` is opaque bytes plus a fingerprint (refresh-token hash when one
-exists, else content hash) — the core never parses provider tokens.
+exists, else content hash) — the core never parses provider tokens. For
+Claude the bytes are an envelope: the keychain blob's JSON plus an
+optional top-level `oauthAccount` copied from `~/.claude.json`, so
+`identity_offline` needs no network.
 
 ### Driver facts to verify per provider (each becomes its own sub-spec)
 
@@ -324,3 +339,18 @@ accepts cswap's `{"version":…, "accounts":[…]}` as provider `claude`.
 
 TUI, directory mappings, session resume, cmux, Slack/Telegram sending
 (status only), encryption of exports, a resident daemon beyond `auto`.
+
+## 13. Rulings applied during phase 1 (supersede earlier sections where they differ)
+
+- `usage()` never refreshes. The collector refreshes once on `NeedsRefresh`, persists the rotated login (secret + slot fingerprint, and `write_live` for the active slot) BEFORE retrying; a rotated refresh token is never lost.
+- Active slot = identity match (email, organizationUuid) from the live envelope, fingerprint as fallback; the active fetch always uses the live login. Adopting the live login into a slot's secret is generational (`expires_at`): a spent generation never overwrites its successor, in the collector and in `switch`.
+- `write_live` failure after a refresh is per-account (`token-expired`), never fatal for `list`; keychain-down passes refresh nothing.
+- Sentinel statuses (`relogin-required`, `token-expired`, keychain hold-back) never populate `windows`; the measurement goes to `lastGood`.
+- Every slots.json write is a read-modify-write under `<slots.json>.lock`; `switch` also holds `home/engine.lock` per switch; the daemon mutex is `home/auto.lock` for its lifetime. Network before locks.
+- `switch::perform(ctx, driver, target, trigger, Freshen { buffer_s, required })`: manual `{0, false}`, auto `{600, true}` (cswap FRESHEN_BUFFER_MS). Once `write_live` succeeds the switch has landed; later bookkeeping failures are warnings.
+- API-key slots cannot be activated in phase 1 (`can_activate`); `includeApiKeyAccounts` is stored only.
+- Settings defaults are cswap's `AutoSwitchSettings` (threshold 90.0, interval 60, cooldown 300, hysteresis 10, strategy best, unhealthyTicks 3, model/preferred empty); a plain `rotate` uses `settings.strategy`.
+- The auto tick nominates fetches like cswap `_collect_scheduled_usage` (active if due + one due candidate + escalation band) via `CollectOpts.only`; consume-first re-measures `{current, target}` before committing.
+- `ignite`/`run`: refresh-if-expired first; `rotated` persisted before a non-zero exit is reported; `run` on the active slot execs directly (same-account fast path); the profile seed marker advances only after the rotation is persisted (`commit_profile`); `remove` calls `forget_profile`.
+- Tests never touch the real keychain, `~/.claude*`, `~/.swapd`, the real `claude` or the network: `SWAPD_SECRETS=file|memory`, `SWAPD_LIVE_STORE=file|keychain`, `SWAPD_HOME`, `SWAPD_URL_*`, `SWAPD_CLAUDE_CLI`, all via `Command::env`.
+

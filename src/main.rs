@@ -152,6 +152,13 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// List logins a switch stashed because they matched no slot.
+    Unclaimed {
+        /// Delete one entry's bytes for good — recovery is a fresh login +
+        /// `swapd add`.
+        #[arg(long)]
+        purge: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -441,6 +448,19 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             let out = cmd::history::run(&ctx, *limit)?;
             emit(&out, cli.json, || cmd::history::print_human(&out))
+        }
+        Command::Unclaimed { purge } => {
+            let ctx = ctx::Ctx::from_env()?;
+            match purge {
+                Some(id) => {
+                    let out = cmd::unclaimed::purge(&ctx, id)?;
+                    emit(&out, cli.json, || cmd::unclaimed::print_purged(&out))
+                }
+                None => {
+                    let out = cmd::unclaimed::list(&ctx)?;
+                    emit(&out, cli.json, || cmd::unclaimed::print_human(&out))
+                }
+            }
         }
     }
 }

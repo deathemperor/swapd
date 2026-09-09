@@ -21,6 +21,7 @@ pub mod reorder;
 pub mod rotate;
 pub mod run;
 pub mod switch;
+pub mod unclaimed;
 
 use crate::contract::ListPayload;
 use crate::core::collect::{collect, record_slot_fingerprint, CollectOpts};

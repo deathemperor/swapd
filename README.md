@@ -45,6 +45,7 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | `remove <ident> --yes` | forget an account: its login, run profile and slot |
 | `config list\|get\|set\|unset` | read or change the `settings.json` knobs |
 | `history [--limit n]` | the switch log, newest last |
+| `unclaimed [--purge id]` | list, or drop, logins a switch stashed because they matched no slot |
 | `notify` | which push channels are configured, masked |
 
 `ident` is a slot number, alias or email. Every verb accepts `--json` for

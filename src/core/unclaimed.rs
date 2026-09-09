@@ -16,6 +16,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::core::slots::LOCK_TIMEOUT;
 use crate::core::store::{read_json, write_json_atomic, FileLock};
@@ -82,6 +84,18 @@ pub fn purge(ctx: &Ctx, id: &str) -> Result<Entry> {
     file.entries.remove(id);
     write_json_atomic(&path, &file)?;
     Ok(entry)
+}
+
+/// `stashed_at` as RFC 3339 UTC with a `Z` offset rather than `+00:00` — the
+/// same shape `driver::claude::usage::format_ts` writes. Shared rather than
+/// duplicated: `swapd unclaimed` and `export` both render this field, and
+/// both must render it identically.
+pub fn format_stashed_at(seconds: u64) -> String {
+    OffsetDateTime::from_unix_timestamp(seconds as i64)
+        .ok()
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .map(|s| s.replace("+00:00", "Z"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 
 ## 0.1.0 — unreleased
 
+- Windows: a lock taken over as stale is no longer removed when its previous holder exits (#15).
 - auto: one tick reads the live login and each slot's secret once, not once per pass (#1)
 - add --slot n moves an account that already has a slot instead of duplicating it (#3)
 - auto: a quarantine follows its credential when `add --slot` moves the account, instead of being dropped (#14)

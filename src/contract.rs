@@ -1,5 +1,8 @@
 //! JSON contract types for `list --json`, consumed by the Infinitus app and
 //! other external readers. Field order mirrors the emitted JSON.
+//!
+//! `ProviderView.active_unreadable` was added additively (issue #8);
+//! `schemaVersion` stays 1.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +20,12 @@ pub struct ProviderView {
     pub installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_slot: Option<u32>,
+    /// Why `active_slot` is absent although the store may hold an active account:
+    /// `switch-in-progress` (engine.lock held by a switch), `keychain-unavailable`,
+    /// `cli-busy` (the CLI is mid-write of its own login). Absent when `active_slot`
+    /// is present or when there is genuinely no live login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_unreadable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_candidate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +140,7 @@ mod tests {
                 provider: "claude".to_string(),
                 installed: true,
                 active_slot: Some(2),
+                active_unreadable: None,
                 next_candidate: Some(1),
                 next_recovery: Some(NextRecovery {
                     slot: 8,

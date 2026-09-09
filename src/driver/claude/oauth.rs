@@ -11,7 +11,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::driver::{DriverError, Identity, Login};
+use crate::driver::{DriverError, Env, Identity, Login};
 use crate::http;
 
 /// The `anthropic-beta` value Claude Code's OAuth endpoints require
@@ -45,12 +45,13 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    /// The production endpoints, honouring the `SWAPD_URL_*` overrides. The one
-    /// place `http::base_url` is called.
-    pub fn from_env() -> Self {
+    /// The production endpoints, honouring the `SWAPD_URL_*` overrides — read
+    /// from the driver's own `Env`, never the process environment, so the
+    /// driver stays built from values instead of a hidden global.
+    pub fn from_env(env: &Env) -> Self {
         Self {
-            api: http::base_url("anthropic-api"),
-            platform: http::base_url("platform"),
+            api: http::base_url_from("anthropic-api", |k| env.vars.get(k).cloned()),
+            platform: http::base_url_from("platform", |k| env.vars.get(k).cloned()),
         }
     }
 }
@@ -357,6 +358,23 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected an error"),
         }
+    }
+
+    /// `Endpoints::from_env` reads the override out of the driver's own
+    /// `Env`, never `std::env` — so this never touches the real process
+    /// environment (racy/unsound under parallel test threads) and still
+    /// proves the override reaches `Endpoints`.
+    #[test]
+    fn endpoints_from_env_reads_the_overrides_from_env_not_the_process() {
+        let env = crate::driver::Env {
+            home: std::path::PathBuf::new(),
+            vars: std::collections::HashMap::from([(
+                "SWAPD_URL_PLATFORM".to_string(),
+                "http://127.0.0.1:1".to_string(),
+            )]),
+        };
+        assert_eq!(Endpoints::from_env(&env).platform, "http://127.0.0.1:1");
+        assert!(std::env::var("SWAPD_URL_PLATFORM").is_err());
     }
 
     #[test]

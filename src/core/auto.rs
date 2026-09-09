@@ -282,6 +282,17 @@ impl<'a> AutoEngine<'a> {
                 fetch_errors: BTreeMap::new(),
                 windows: BTreeMap::new(),
             });
+            // The live store is fenced (a switch in flight, an unreadable
+            // keychain, a busy CLI): the account IS active, we just cannot see
+            // it, so this is not "no active account" and `has_live_login()`
+            // must not run — it would itself read the same fenced store.
+            if let Some(reason) = view.active_unreadable.clone() {
+                self.emit(Event::NoSwitch {
+                    reason,
+                    detail: "the live store is fenced; the tick takes no action".to_string(),
+                });
+                return Ok(TickOutcome::NoAction);
+            }
             // A live login nothing manages is never acted on: switching would
             // overwrite a credential no slot holds a copy of.
             let (reason, detail) = if self.has_live_login() {

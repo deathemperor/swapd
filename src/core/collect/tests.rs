@@ -333,6 +333,31 @@ fn a_torn_live_login_is_not_adopted_while_a_switch_holds_the_lock() {
 }
 
 #[test]
+fn active_unreadable_reports_switch_in_progress_and_is_absent_on_a_normal_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+    let driver = FakeDriver::new(&login_for("one@example.com", "rt-1")).usable("rt-1");
+
+    let held =
+        crate::core::store::FileLock::acquire(&ctx.home.engine_lock_base(), Duration::from_secs(5))
+            .unwrap();
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert_eq!(
+        view.active_unreadable,
+        Some("switch-in-progress".to_string())
+    );
+    drop(held);
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert_eq!(view.active_unreadable, None);
+    let json = serde_json::to_string(&view).unwrap();
+    assert!(
+        !json.contains("activeUnreadable"),
+        "an absent reason must not be serialised: {json}"
+    );
+}
+
+#[test]
 fn a_heal_then_a_refresh_leaves_the_successor_live() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx_for(dir.path());

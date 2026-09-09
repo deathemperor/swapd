@@ -108,7 +108,7 @@ impl ClaudeDriver {
     /// The one place either variable is read: a constructed driver holds
     /// values, never an environment.
     pub fn default_for_platform(env: &Env) -> Self {
-        Self::new(live_store_from_env(env), Endpoints::from_env())
+        Self::new(live_store_from_env(env), Endpoints::from_env(env))
     }
 
     /// Claude Code's live login for this environment, as an envelope (see the

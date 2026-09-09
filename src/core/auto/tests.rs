@@ -777,6 +777,37 @@ fn an_unmanaged_or_absent_live_login_is_reported_not_acted_on() {
     );
 }
 
+/// A switch in flight fences the live store, but the account IS active — the
+/// tick must say so (`no-switch{switch-in-progress}`), not claim there is no
+/// active account, and it must not touch anything.
+#[test]
+fn a_switch_in_flight_is_reported_as_switch_in_progress() {
+    let board = Board::new();
+    slots::update(&board.home().slots_file(), |file| {
+        file.providers
+            .entry("claude".to_string())
+            .or_default()
+            .active_slot = Some(1);
+        Ok((true, ()))
+    })
+    .unwrap();
+
+    let _held = crate::core::store::FileLock::acquire(
+        &board.home().engine_lock_base(),
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    let said = board.last("no-switch").unwrap();
+    assert_eq!(said["reason"], "switch-in-progress");
+    assert!(board.driver.writes.lock().unwrap().is_empty());
+    assert!(
+        board.driver.take_usage_calls().is_empty(),
+        "a fenced store is served from the table, not fetched"
+    );
+}
+
 /// Two ways the ranking can come back empty with the active account at its
 /// threshold: nothing readable to compare against, and a candidate that is
 /// readable but does not clear the hysteresis margin. Neither is

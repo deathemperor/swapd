@@ -2,8 +2,6 @@
 
 use std::time::Duration;
 
-// Nothing calls this yet; Task 6's Claude driver makes requests through it.
-#[allow(dead_code)]
 pub fn agent(timeout_s: u64) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .user_agent("swapd/0.1")
@@ -14,8 +12,6 @@ pub fn agent(timeout_s: u64) -> ureq::Agent {
 
 /// Base URL for a named upstream, overridable via `SWAPD_URL_<NAME>` (with
 /// `-` folded to `_`) for tests to point at a local mock server.
-// Nothing calls this yet; Task 6's Claude driver looks up "anthropic-api" / "platform".
-#[allow(dead_code)]
 pub fn base_url(name: &str) -> String {
     base_url_from(name, |k| std::env::var(k).ok())
 }

@@ -145,12 +145,24 @@ pub fn run_profile(
     copy_share_set(env, &dir)?;
 
     // The environment the profile *is*: same process env, but pointed at the
-    // profile. `CLAUDE_SECURESTORAGE_CONFIG_DIR` is dropped — if it survived, it
-    // would keep naming the live secure store and the credential below would
-    // land where Claude Code will not look for this profile.
+    // profile — on BOTH axes.
+    //
+    // `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set rather than merely unset:
+    // `RunProfile.env` is a list of overrides a caller layers over the process
+    // environment, and such a list can add a variable but never remove one. A
+    // user whose shell exports that variable would otherwise have the child
+    // resolve secure storage to the *live* item while `CLAUDE_CONFIG_DIR` named
+    // the profile — succeeding as the wrong account. Pointed at the profile dir
+    // it names exactly the item written below (`paths::live_services`), so the
+    // two axes cannot disagree.
+    let overrides = [
+        ("CLAUDE_CONFIG_DIR".to_string(), dir_str.clone()),
+        ("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), dir_str),
+    ];
     let mut vars = env.vars.clone();
-    vars.insert("CLAUDE_CONFIG_DIR".to_string(), dir_str.clone());
-    vars.remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+    for (key, value) in &overrides {
+        vars.insert(key.clone(), value.clone());
+    }
     let profile_env = Env {
         home: env.home.clone(),
         vars,
@@ -163,10 +175,7 @@ pub fn run_profile(
         live::splice_oauth_account(&profile_env, config, oauth_account)?;
     }
 
-    Ok(RunProfile::new(
-        vec![("CLAUDE_CONFIG_DIR".to_string(), dir_str)],
-        dir,
-    ))
+    Ok(RunProfile::new(overrides.to_vec(), dir))
 }
 
 /// Mirror the share set from the real config home into the profile
@@ -264,6 +273,7 @@ mod tests {
     use super::*;
     use crate::driver::claude::live::LiveStore;
     use crate::driver::claude::tests::{endpoints, env_with, temp_home};
+    use crate::security_cli::SecurityCli as _;
 
     fn login() -> Login {
         Login {
@@ -335,12 +345,21 @@ mod tests {
         let profile = run_profile(&driver, &env, 3, &login()).unwrap();
         let dir = env.home.join("profiles/claude/3");
         assert_eq!(profile.dir, dir);
+        // Both axes point at the profile: a caller layering these over its
+        // environment cannot leave an exported securestorage var naming the
+        // live item.
         assert_eq!(
             profile.env,
-            vec![(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                dir.to_str().unwrap().to_string()
-            )]
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    dir.to_str().unwrap().to_string()
+                ),
+                (
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+                    dir.to_str().unwrap().to_string()
+                ),
+            ]
         );
 
         // The share set followed the account in; nothing else did.
@@ -367,6 +386,40 @@ mod tests {
         assert!(!config_home.join(".credentials.json").exists());
     }
 
+    #[test]
+    fn run_profile_writes_the_keychain_item_the_profile_dir_derives() {
+        let home = temp_home();
+        // An exported securestorage var pointed at the LIVE store: the profile
+        // must not inherit it.
+        let env = env_with(
+            &home,
+            [
+                ("USER", "tester"),
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/live/secure"),
+            ],
+        );
+        let fake = std::sync::Arc::new(crate::security_cli::FakeSecurity::default());
+        let driver = ClaudeDriver::new(LiveStore::Keychain(fake.clone()), endpoints());
+
+        let profile = run_profile(&driver, &env, 5, &login()).unwrap();
+        let dir_str = profile.dir.to_str().unwrap();
+
+        // The item Claude Code itself would derive for this config dir, under
+        // the account name it looks the item up by.
+        let service = paths::keychain_service_name(dir_str);
+        let stored = fake.find(&service, Some("tester")).unwrap().unwrap();
+        assert!(stored.contains("rt-1"));
+        // The envelope key never reaches the credential store.
+        assert!(!stored.contains("oauthAccount"));
+        // ...and nothing was written to the live store's item.
+        assert_eq!(
+            fake.find(&paths::keychain_service_name("/live/secure"), None)
+                .unwrap(),
+            None
+        );
+        assert_eq!(fake.find(paths::DEFAULT_SERVICE, None).unwrap(), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn ignite_runs_claude_in_the_profile_and_reports_a_non_zero_exit() {
@@ -379,7 +432,8 @@ mod tests {
 
         let write_fake = |exit: u32| {
             let script = format!(
-                "#!/bin/sh\nprintf '%s' \"$CLAUDE_CONFIG_DIR\" > {}\nexit {}\n",
+                "#!/bin/sh\nprintf '%s %s' \"$CLAUDE_CONFIG_DIR\" \
+                 \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" > {}\nexit {}\n",
                 witness.display(),
                 exit
             );
@@ -392,10 +446,16 @@ mod tests {
 
         write_fake(0);
         assert!(ignite(&driver, &env, 2, &login()).is_ok());
-        // The child ran under the slot's profile, not the live config home.
+        // The child ran under the slot's profile, not the live config home —
+        // on both axes.
+        let profile_dir = env.home.join("profiles/claude/2");
         assert_eq!(
             fs::read_to_string(&witness).unwrap(),
-            env.home.join("profiles/claude/2").to_str().unwrap()
+            format!(
+                "{} {}",
+                profile_dir.to_str().unwrap(),
+                profile_dir.to_str().unwrap()
+            )
         );
 
         write_fake(3);

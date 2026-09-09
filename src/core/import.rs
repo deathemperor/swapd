@@ -14,7 +14,9 @@
 //! Claude Code advertises for it (see `driver::claude::live`). So the imported
 //! `config.oauthAccount` is spliced into the login rather than stored beside
 //! it — without it the slot would have no offline identity, and switching to it
-//! would leave `~/.claude.json` naming the previous account.
+//! would leave `~/.claude.json` naming the previous account. Only that member is
+//! kept: the rest of a per-account `config` is dropped, so an `export` must not
+//! put anything else there expecting it to survive a round trip.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -85,15 +87,19 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
         entries.push(entry);
     }
 
-    // Pass 2: writes — all of them in ONE `slots.json` lock cycle, so an
-    // import either lands as a table or does not land at all, and the occupancy
-    // decisions are made against the same copy of the file they are written to.
+    // Pass 2: decide every account's fate against the table as it stands under
+    // the lock, and refuse the whole import before anything is written. A
+    // refusal is a fact about the file and the table, so it is knowable without
+    // writing — and discovering it half way would leave the accounts before it
+    // with credentials on disk that nothing refers to.
+    //
+    // Pass 3: write, in the same lock cycle. All the rows go in one
+    // `slots::update`, so an import lands as a table rather than as N separate
+    // ones.
     let (imported, skipped, failure) = slots::update(&ctx.home.slots_file(), |file| {
         let existing = file.providers.entry(id.to_string()).or_default();
-        let mut imported: Vec<u32> = Vec::new();
         let mut skipped: Vec<Skipped> = Vec::new();
-        let mut rows: Vec<(u32, Slot)> = Vec::new();
-        let mut failure = None;
+        let mut writing: Vec<Entry> = Vec::new();
 
         for entry in entries {
             if let Some(occupant) = existing.slots.get(&entry.slot) {
@@ -128,7 +134,13 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                     )));
                 }
             }
+            writing.push(entry);
+        }
 
+        let mut imported: Vec<u32> = Vec::new();
+        let mut rows: Vec<(u32, Slot)> = Vec::new();
+        let mut failure = None;
+        for entry in writing {
             // Secrets first, rows after: bytes without a row are unreferenced,
             // a row without bytes is a slot that cannot authenticate. A keychain
             // that fails part way therefore stops the import here and reports
@@ -159,7 +171,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 ));
                 break;
             }
-            let mut meta = Slot {
+            let meta = Slot {
                 email: entry.email.clone(),
                 organization_uuid: entry.organization_uuid.clone(),
                 organization_name: entry.organization_name.clone(),
@@ -169,9 +181,8 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 disabled: false,
                 preferred: false,
                 added: entry.added.clone(),
-                fingerprint: None,
+                fingerprint: Some(entry.login.fingerprint()),
             };
-            meta.fingerprint = Some(entry.login.fingerprint());
             rows.push((entry.slot, meta));
             imported.push(entry.slot);
         }

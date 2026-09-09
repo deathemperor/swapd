@@ -291,6 +291,32 @@ fn a_malformed_account_imports_nothing_at_all() {
     assert!(!fx.home.path().join("slots.json").exists());
 }
 
+/// A refusal is decided before anything is written: an occupied slot late in
+/// the file must not leave the accounts before it with credentials on disk that
+/// no row refers to.
+#[test]
+fn a_refused_import_writes_no_credential_for_the_accounts_before_it() {
+    let fx = Fixture::new();
+    fx.write_slots(&[(2, "resident@example.com", "org-9")]);
+
+    let envelope = cswap_envelope(vec![
+        account(1, "one@example.com", "org-1"),
+        account(2, "two@example.com", "org-2"),
+    ]);
+    let err = fx.import_err(&envelope, &[]);
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("--force"));
+
+    assert!(
+        !fx.home.path().join("credentials/claude_1").exists(),
+        "slot 1's credential must not be written for an import that is refused"
+    );
+    assert!(slot_of(&fx.slots(), 1).is_null(), "and it has no row");
+    assert_eq!(slot_of(&fx.slots(), 2)["email"], "resident@example.com");
+}
+
 /// A credential that cannot be stored stops the import, and the error says
 /// which accounts did land — the rows for those are written, so the import is
 /// resumable rather than a table half of whose slots have no credential.

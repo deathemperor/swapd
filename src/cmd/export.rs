@@ -25,9 +25,9 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::core::slots::{self, Slot};
-use crate::core::store::write_json_atomic;
+use crate::core::store::{write_json_atomic, FileLock};
 use crate::ctx::Ctx;
-use crate::driver::{Driver, Login};
+use crate::driver::{Driver, DriverError, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
 use crate::secrets::slot_key;
@@ -191,7 +191,11 @@ fn credential(
     warnings: &mut Vec<String>,
 ) -> Result<Option<(Login, bool)>> {
     if active {
-        match driver.read_live(&ctx.env) {
+        // Under the same fence a switch takes: an unfenced read can pair one
+        // account's credential with another's identity mid-swap, and an export
+        // is a file the user restores from. A switch in flight is not a reason
+        // to fail the backup — the stored copy is exported instead.
+        match live_under_lock(ctx, driver) {
             Ok(live) => {
                 if is_same_account(driver, &live, meta) {
                     return Ok(Some((live, true)));
@@ -213,6 +217,13 @@ fn credential(
         .secrets
         .get(&slot_key(driver.id(), slot))?
         .map(|bytes| (Login { bytes }, false)))
+}
+
+/// The live login, read while `engine.lock` is held.
+fn live_under_lock(ctx: &Ctx, driver: &dyn Driver) -> std::result::Result<Login, DriverError> {
+    let _engine = FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT)
+        .map_err(|e| DriverError::Locked(e.message))?;
+    driver.read_live(&ctx.env)
 }
 
 /// Whether a login is the account a slot claims to hold — its own identity

@@ -21,6 +21,7 @@ use crate::contract::{AccountView, ProviderView, UsageStatus};
 use crate::core::collect::{healthy_slots, record_slot_fingerprint};
 use crate::core::history::{self, SlotRef, SwitchRecord};
 use crate::core::poll_policy::{binding_pct, parse_reset_ts};
+use crate::core::refresh::{refresh_slot, Refreshed};
 use crate::core::slots::{self, ProviderSlots};
 use crate::core::store::FileLock;
 use crate::ctx::Ctx;
@@ -211,15 +212,8 @@ pub fn perform(
     // anyway, and the refresh writes a single-use rotation that must be
     // persisted before it can be spent.
     let mut warnings = Vec::new();
-    let target_login = refresh_if_stale(
-        ctx,
-        provider,
-        target,
-        &key,
-        target_login,
-        freshen,
-        &mut warnings,
-    )?;
+    let target_login =
+        refresh_if_stale(ctx, provider, target, target_login, freshen, &mut warnings)?;
 
     let _engine = FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT)?;
 
@@ -326,7 +320,6 @@ fn refresh_if_stale(
     ctx: &Ctx,
     provider: &dyn Driver,
     slot: u32,
-    key: &str,
     login: Login,
     freshen: Freshen,
     warnings: &mut Vec<String>,
@@ -341,20 +334,26 @@ fn refresh_if_stale(
     if !stale {
         return Ok(login);
     }
-    match provider.refresh(&login) {
-        Ok(refreshed) => {
-            // Persisted before it can be spent: the token that produced it is
-            // single-use, so a rotation we drop is a generation nothing can
-            // ever get back.
-            ctx.secrets.set(key, &refreshed.bytes)?;
-            record_slot_fingerprint(ctx, provider.id(), slot, Some(&refreshed.fingerprint()))?;
-            Ok(refreshed)
-        }
-        Err(DriverError::TokenDead) => Err(SwapdError::new(
+    // Under the slot's refresh lock, which also persists the rotation before it
+    // can be spent: the token that produced it is single-use, so a rotation we
+    // drop is a generation nothing can ever get back.
+    match refresh_slot(ctx, provider, slot, &login)? {
+        // Another refresher rotated this slot while we waited. Its successor is
+        // the generation to land, and no token was spent to learn that.
+        Refreshed::Rotated(refreshed) | Refreshed::Adopted(refreshed) => Ok(refreshed),
+        Refreshed::Failed(DriverError::TokenDead) => Err(SwapdError::new(
             ErrorCode::TokenDead,
             format!("slot {slot}'s login is expired and its refresh token was rejected; log in again and run `swapd add`"),
         )),
-        Err(e) if freshen.required => Err(SwapdError::new(
+        // Another process is mid-rotation of this very slot: landing the
+        // generation it is spending would strand the successor it is about to
+        // persist. Refused whoever asked — waiting is the answer here, and the
+        // daemon's next tick is a wait.
+        Refreshed::Failed(DriverError::Locked(e)) => Err(SwapdError::new(
+            ErrorCode::Locked,
+            format!("slot {slot}'s login is being refreshed by another process ({e})"),
+        )),
+        Refreshed::Failed(e) if freshen.required => Err(SwapdError::new(
             ErrorCode::RefreshDenied,
             format!(
                 "slot {slot}'s login expires within {:.0} minutes and could not be \
@@ -362,7 +361,7 @@ fn refresh_if_stale(
                 freshen.buffer_s / 60.0
             ),
         )),
-        Err(e) => {
+        Refreshed::Failed(e) => {
             warnings.push(format!(
                 "slot {slot}'s login is expired and could not be refreshed ({e}); \
                  switching to it anyway"

@@ -75,6 +75,15 @@ impl Home {
         self.root.join("engine")
     }
 
+    /// The base path whose `.lock` sibling — `refresh-<provider>-<slot>.lock`
+    /// — fences ONE slot's token refresh: the read of its stored credential,
+    /// the POST that spends it, and the persist of the successor. Per slot on
+    /// purpose: nothing else orders against it, so the network call inside it
+    /// blocks no other verb (see `core::refresh`).
+    pub fn refresh_lock_base(&self, provider: &str, slot: u32) -> PathBuf {
+        self.root.join(format!("refresh-{provider}-{slot}"))
+    }
+
     pub fn auto_state_file(&self) -> PathBuf {
         self.root.join("auto-state.json")
     }

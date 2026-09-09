@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 
 use crate::contract::{AccountView, LastGood, NextRecovery, ProviderView, UsageStatus, Window};
 use crate::core::poll_policy::{binding_pct, limiting_reset_ts};
+use crate::core::refresh::{refresh_slot, Refreshed};
 use crate::core::slots::{self, ProviderSlots, Slot, SlotsFile};
-use crate::core::store::read_json;
+use crate::core::store::{read_json, FileLock};
 use crate::core::usage_store::{Entry, STALE_OK_S};
 use crate::ctx::Ctx;
 use crate::driver::claude::usage::format_ts;
@@ -63,6 +64,11 @@ struct SlotState {
     login: Option<Login>,
     fingerprint: Option<String>,
     active: bool,
+    /// The live login's fingerprint as this pass read it, for the active slot
+    /// only. Every write back into the live store is guarded on it: the pass
+    /// may only replace the generation it measured, never one a switch or
+    /// Claude Code's own refresh put there in the meantime.
+    live_fingerprint: Option<String>,
     /// The live store holds an OLDER generation than this slot's stored copy:
     /// the fetch heals the divergence before it uses the credential.
     heal_live: bool,
@@ -75,29 +81,57 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     let slots = slots_file.providers.get(id).cloned().unwrap_or_default();
     let order = rotation_order(&slots);
 
-    // 1. The live login, read once for the whole pass.
+    // 1. The live login, read once for the whole pass — under `engine.lock`,
+    //    together with the adopt in step 2.
     //
+    // The read is two unrelated reads (the credential, then the identity its
+    // config advertises) and a switch's write is the same two in the same
+    // order, so an unfenced pass can see account B's token beside account A's
+    // identity and adopt B's credential into slot A — losing A's only unspent
+    // generation. The lock is the fence; a switch in flight is a normal state
+    // for a status verb, so failing to take it degrades the pass instead of
+    // failing it.
+    let engine = match FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT) {
+        Ok(lock) => Some(lock),
+        Err(e) if e.code == ErrorCode::Locked => None,
+        Err(e) => return Err(e),
+    };
+    let switch_in_flight = engine.is_none();
+
     // A keychain that cannot be read is not an empty login: it says nothing
     // about the accounts, so the pass continues without an active slot rather
     // than failing every slot's usage with it (the one slot that *is* affected
     // is held back below). Any other error is a real fault and propagates.
     let mut keychain_down = false;
-    let mut live = match provider.read_live(&ctx.env) {
-        Ok(login) => Some(login),
-        Err(DriverError::NoLogin) => None,
-        Err(DriverError::KeychainUnavailable) => {
-            eprintln!("warning: {id}: the live login is unreadable (keychain unavailable)");
-            keychain_down = true;
-            None
+    // A switch owns the live store right now: whatever is in it is a
+    // half-written pair, and no answer derived from it is worth having. Not
+    // read at all, rather than read and distrusted.
+    let mut live = if switch_in_flight {
+        eprintln!(
+            "warning: {id}: a switch is in flight; the active account is served from the store"
+        );
+        None
+    } else {
+        match provider.read_live(&ctx.env) {
+            Ok(login) => Some(login),
+            Err(DriverError::NoLogin) => None,
+            Err(DriverError::KeychainUnavailable) => {
+                eprintln!("warning: {id}: the live login is unreadable (keychain unavailable)");
+                keychain_down = true;
+                None
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => return Err(e.into()),
     };
     let live_fingerprint = live.as_ref().map(Login::fingerprint);
-    // With the live store down, the slot `slots.json` calls active is the one
-    // whose credential we cannot see: it is served from the table and not
-    // fetched, instead of being fetched with a stored copy the CLI may have
-    // rotated past. Every other slot is unaffected and fetches normally.
-    let unreadable_active = keychain_down.then_some(slots.active_slot).flatten();
+    // With the live store down — unreadable, or fenced off by a switch — the
+    // slot `slots.json` calls active is the one whose credential we cannot see:
+    // it is served from the table and not fetched, instead of being fetched
+    // with a stored copy the CLI may have rotated past. Every other slot is
+    // unaffected and fetches normally.
+    let unreadable_active = (keychain_down || switch_in_flight)
+        .then_some(slots.active_slot)
+        .flatten();
 
     // The active slot is an IDENTITY match against the live login (cswap
     // `_build_accounts_info`): the same refresh-token lineage can be rotated by
@@ -191,10 +225,17 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
             login,
             fingerprint,
             active,
+            live_fingerprint: active.then(|| live_fingerprint.clone()).flatten(),
             heal_live,
             sentinel,
         });
     }
+
+    // The fence covers exactly the live read and the adopt it feeds. Released
+    // before the usage table is touched: everything below is per-account
+    // bookkeeping and network, and holding a switch off for the length of a
+    // fetch pass would make `swapd switch` wait on `swapd list`.
+    drop(engine);
 
     // 3. The stored table, then the dead-token quarantine: a struck refresh
     //    lineage is never fetched again until a credential rewrite heals it.
@@ -423,7 +464,9 @@ fn fetch_one(
     // The live store holds an older generation than this slot's copy: heal it
     // before the credential is used, while the claim still fences a failure.
     if st.heal_live {
-        if let Err(e) = provider.write_live(&ctx.env, login) {
+        if let LiveWrite::Failed(e) =
+            write_live_guarded(ctx, provider, st, login, st.live_fingerprint.as_deref())?
+        {
             return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
         }
     }
@@ -447,6 +490,96 @@ fn fetch_one(
             Ok(None)
         }
     }
+}
+
+/// What a guarded live write did.
+enum LiveWrite {
+    /// The live store holds `login`.
+    Done,
+    /// The live login is no longer the one this pass measured — a switch
+    /// landed, or the user ran `/login` — so there was nothing here to replace.
+    /// The credential itself is safe in the slot's secret; the next pass adopts
+    /// whatever is live now.
+    Moved,
+    /// The write was attempted and the driver refused it.
+    Failed(DriverError),
+}
+
+/// Replace the live login with `login`, but only if the live store still holds
+/// `expected` — the generation this write is the successor of.
+///
+/// `expected` is the CALLER's, not the pass's: a heal writes the stored login
+/// over the older live one, so a refresh that follows a heal in the same fetch
+/// succeeds the login the heal left there, not the one the pass first read.
+/// Reading the pass's snapshot here would refuse that write and leave a spent
+/// generation live.
+///
+/// The fetch path decides "slot X is active" before it goes to the network, and
+/// a switch to Y that completes while the POST is in flight would otherwise be
+/// silently reverted: the user asked for Y, `~/.claude` would say X, and the
+/// history would say Y. So the write re-reads the live login under
+/// `engine.lock` and goes ahead only when it is still the same account AND the
+/// same generation the refresh consumed.
+///
+/// Only ever reached for the ACTIVE slot (the refresh's live write, and the
+/// heal that precedes a fetch), and a pass has at most one of those — which is
+/// why taking `engine.lock` here cannot make two fetch threads of the same pass
+/// wait on each other.
+fn write_live_guarded(
+    ctx: &Ctx,
+    provider: &dyn Driver,
+    st: &SlotState,
+    login: &Login,
+    expected: Option<&str>,
+) -> Result<LiveWrite> {
+    let _engine = match FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT) {
+        Ok(lock) => lock,
+        // A switch is landing right now: it is the newer intent by definition.
+        Err(e) if e.code == ErrorCode::Locked => {
+            return Ok(moved(st, "a switch holds the engine lock"))
+        }
+        Err(e) => return Err(e),
+    };
+
+    let live = match provider.read_live(&ctx.env) {
+        Ok(live) => live,
+        // Nothing readable to compare against is nothing we may overwrite: a
+        // logged-out CLI must not be logged back in by a status pass.
+        Err(e) => {
+            return Ok(moved(
+                st,
+                &format!("the live login could not be re-read ({e})"),
+            ))
+        }
+    };
+    let live_fingerprint = live.fingerprint();
+    if live_fingerprint == login.fingerprint() {
+        return Ok(LiveWrite::Done); // already there (another refresher wrote it)
+    }
+    let same_account = provider.identity_offline(&live).is_some_and(|identity| {
+        identity.email.to_lowercase() == st.meta.email.to_lowercase()
+            && (identity.organization_uuid.is_empty()
+                || identity.organization_uuid == st.meta.organization_uuid)
+    });
+    if !same_account || expected != Some(live_fingerprint.as_str()) {
+        return Ok(moved(
+            st,
+            "the live login is not the one this pass measured",
+        ));
+    }
+
+    match provider.write_live(&ctx.env, login) {
+        Ok(()) => Ok(LiveWrite::Done),
+        Err(e) => Ok(LiveWrite::Failed(e)),
+    }
+}
+
+fn moved(st: &SlotState, why: &str) -> LiveWrite {
+    eprintln!(
+        "warning: slot {}: the live login was left alone ({why})",
+        st.slot
+    );
+    LiveWrite::Moved
 }
 
 /// A live-store write that failed is one account's problem, never the verb's:
@@ -480,9 +613,15 @@ fn refresh_then_usage(
     claim: &str,
     login: &Login,
 ) -> Result<Option<UsageStatus>> {
-    let refreshed = match provider.refresh(login) {
-        Ok(refreshed) => refreshed,
-        Err(DriverError::TokenDead) => {
+    // Under the slot's own refresh lock (`core::refresh`), so a `switch` or a
+    // `run` racing this pass cannot POST the same single-use token: the loser
+    // of that race gets `invalid_grant` and would quarantine an account whose
+    // successor the winner had just persisted.
+    let refreshed = match refresh_slot(ctx, provider, st.slot, login)? {
+        // The rotation is already persisted (secret + fingerprint), by us or by
+        // whoever held the lock first.
+        Refreshed::Rotated(refreshed) | Refreshed::Adopted(refreshed) => refreshed,
+        Refreshed::Failed(DriverError::TokenDead) => {
             // Strikes condemn the credential generation that was POSTed, not
             // the slot: a re-login writing a new one heals the quarantine.
             ctx.store.record_failure(
@@ -494,7 +633,7 @@ fn refresh_then_usage(
             )?;
             return Ok(Some(UsageStatus::ReloginRequired));
         }
-        Err(_) => {
+        Refreshed::Failed(_) => {
             ctx.store
                 .record_failure(&st.key, claim, "refresh", None, None)?;
             // An expired ACTIVE credential nothing could refresh this pass is
@@ -504,19 +643,20 @@ fn refresh_then_usage(
         }
     };
 
-    ctx.secrets.set(&st.key, &refreshed.bytes)?;
-    let live_write = if st.active {
-        provider.write_live(&ctx.env, &refreshed)
-    } else {
-        Ok(())
-    };
-    // Every persisted rotation is stamped, active or not: `slots.json`'s
-    // fingerprint is the stored login's, and a stale one both hides a
-    // quarantine and refuses to heal. Stamped even when the live write failed —
-    // the secret store already holds this generation.
-    record_slot_fingerprint(ctx, provider.id(), st.slot, Some(&refreshed.fingerprint()))?;
-    if let Err(e) = live_write {
-        return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
+    // The secret and the slot's fingerprint are already written — `refresh_slot`
+    // persists before it returns, because the token that produced this
+    // generation is spent whether or not anything downstream succeeds. What is
+    // left is the ACTIVE slot's live store, and that write is guarded: the pass
+    // may only replace the generation it measured.
+    // The generation this refresh succeeds — which after a heal is the login
+    // the heal itself wrote live, NOT the one the pass first measured.
+    let spent = login.fingerprint();
+    if st.active {
+        if let LiveWrite::Failed(e) =
+            write_live_guarded(ctx, provider, st, &refreshed, Some(spent.as_str()))?
+        {
+            return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
+        }
     }
 
     // Once per pass: a second `NeedsRefresh` is recorded as the 401 it is
@@ -745,3 +885,6 @@ fn next_recovery(
             })
         })
 }
+
+#[cfg(test)]
+pub mod tests;

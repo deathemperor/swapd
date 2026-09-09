@@ -24,6 +24,7 @@ pub mod switch;
 
 use crate::contract::ListPayload;
 use crate::core::collect::{collect, record_slot_fingerprint, CollectOpts};
+use crate::core::refresh::{refresh_slot, Refreshed};
 use crate::core::slots::{self, ProviderSlots};
 use crate::ctx::Ctx;
 use crate::driver::{Driver, DriverError, Login};
@@ -88,19 +89,21 @@ pub fn login_to_run(ctx: &Ctx, driver: &dyn Driver, slot: u32) -> Result<Login> 
     {
         return Ok(login);
     }
-    match driver.refresh(&login) {
-        Ok(refreshed) => {
-            persist_login(ctx, id, slot, &refreshed)?;
-            Ok(refreshed)
-        }
-        Err(DriverError::TokenDead) => Err(SwapdError::new(
+    // Under the slot's refresh lock: a `run` and a collector pass that both
+    // find the same expired login would otherwise POST the same single-use
+    // token, and the loser would read its own `invalid_grant` as a dead account.
+    match refresh_slot(ctx, driver, slot, &login)? {
+        // Another refresher spent this generation first; its successor is the
+        // login to run with.
+        Refreshed::Rotated(refreshed) | Refreshed::Adopted(refreshed) => Ok(refreshed),
+        Refreshed::Failed(DriverError::TokenDead) => Err(SwapdError::new(
             ErrorCode::TokenDead,
             format!(
                 "slot {slot}'s login is expired and its refresh token was rejected; \
                  log in again and run `swapd add`"
             ),
         )),
-        Err(e) => Err(e.into()),
+        Refreshed::Failed(e) => Err(e.into()),
     }
 }
 

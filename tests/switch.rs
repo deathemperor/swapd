@@ -310,6 +310,42 @@ fn add_refreshes_existing_slot_in_place() {
 }
 
 #[test]
+fn add_refuses_to_capture_a_login_older_than_the_stored_one() {
+    let fx = Fixture::new();
+    fx.write_slots(&[(1, "one@example.com", "org-1")]);
+    // The collector persisted a rotation whose `write_live` then failed: the
+    // slot holds the only unspent generation and the live copy is the spent
+    // one. Capturing over it would strand the account.
+    fx.write_stored(
+        1,
+        &fx.login("one@example.com", "org-1", "rt-new", NOT_EXPIRED_MS),
+    );
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-spent",
+        NOT_EXPIRED_MS - 60_000,
+        json!({}),
+    );
+
+    let err = fx.run_err(&["add", "--json"]);
+    assert_eq!(err["error"]["code"], "invalid-input");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("slot 1"),
+        "the message names the slot: {message}"
+    );
+    assert!(
+        message.contains("swapd list"),
+        "the message names the verb that heals it: {message}"
+    );
+
+    // And the newer generation is still there.
+    let stored: Value = serde_json::from_str(&fx.stored(1)).unwrap();
+    assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-new");
+}
+
+#[test]
 fn add_token_api_key_gets_token_local_email() {
     let fx = Fixture::new();
 

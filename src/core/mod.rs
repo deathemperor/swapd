@@ -4,6 +4,7 @@ pub mod events;
 pub mod history;
 pub mod import;
 pub mod poll_policy;
+pub mod refresh;
 pub mod settings;
 pub mod slots;
 pub mod store;

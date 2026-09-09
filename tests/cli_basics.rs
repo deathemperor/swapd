@@ -69,6 +69,8 @@ fn doctor_without_home_or_swapd_home_is_a_json_error_not_a_panic() {
     let out = Command::cargo_bin("swapd")
         .unwrap()
         .env_remove("HOME")
+        // Windows resolves the home from USERPROFILE, not HOME.
+        .env_remove("USERPROFILE")
         .env_remove("SWAPD_HOME")
         .args(["doctor", "--json"])
         .output()
@@ -166,6 +168,9 @@ fn doctor_reports_a_held_auto_lock_with_its_pid() {
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["locks"]["auto"]["held"], true);
+    // Windows locks are mandatory: the holder's breadcrumb is unreadable from
+    // another handle until the lock is released, so the pid arrives late there.
+    #[cfg(unix)]
     assert_eq!(v["locks"]["auto"]["pid"], 12345);
 
     drop(guard);

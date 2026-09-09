@@ -145,6 +145,20 @@ pub fn perform(
             )
         })?;
 
+    // Refused here, before the engine lock and before the outgoing login is
+    // touched: `write_live` rejects a managed key anyway (Claude Code holds it
+    // on a different axis), and failing there would mean saying so only after
+    // the previous login had already been backed up or stashed.
+    if target_login.bytes.trim().starts_with("sk-ant-api") {
+        return Err(SwapdError::new(
+            ErrorCode::Unsupported,
+            format!(
+                "slot {target} holds a managed API key; activating Claude Code's \
+                 API-key axis is not implemented"
+            ),
+        ));
+    }
+
     // Already there? Asked of the LIVE login, not of `slots.json`'s record of
     // it: the record can lag (Claude Code's own `/login`, another tool), and a
     // switch that reports "already-active" against a stale record would leave
@@ -311,7 +325,7 @@ fn preserve_outgoing(
         .unwrap_or_default();
 
     let Some(slot) = match_slot(provider, slots, live) else {
-        let stash_key = stash_key(id, ctx.now());
+        let stash_key = stash_key(id, ctx.now(), live);
         ctx.secrets.set(&stash_key, &live.bytes)?;
         warnings.push(format!(
             "the live login does not match a managed account; it was preserved as \
@@ -341,10 +355,23 @@ fn preserve_outgoing(
 }
 
 /// `FileSecrets` folds `:` to `_` and rejects `/`, so the stash lives under
-/// `<provider>:unclaimed-<unix-ts>` rather than the `unclaimed/<ts>` the design
-/// note wrote.
-fn stash_key(provider: &str, now: f64) -> String {
-    format!("{provider}:unclaimed-{}", now as u64)
+/// `<provider>:unclaimed-<unix-ts>-<fp>` rather than the `unclaimed/<ts>` the
+/// design note wrote.
+///
+/// The fingerprint tail is not decoration: the timestamp is whole seconds, and
+/// `set` truncates, so two switches inside one second would otherwise have the
+/// second stash overwrite the first — discarding a login that exists nowhere
+/// else, which is the one thing this path must never do.
+fn stash_key(provider: &str, now: f64, login: &Login) -> String {
+    let fp = login.fingerprint();
+    let short: String = fp
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(8)
+        .collect();
+    format!("{provider}:unclaimed-{}-{}", now as u64, short)
 }
 
 /// The slot a login belongs to: identity (email + org) first, fingerprint
@@ -548,9 +575,19 @@ mod tests {
 
     #[test]
     fn stash_key_avoids_the_slash_file_secrets_rejects() {
-        let key = stash_key("claude", 1_757_000_000.7);
-        assert_eq!(key, "claude:unclaimed-1757000000");
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-a"}}"#.to_string(),
+        };
+        let key = stash_key("claude", 1_757_000_000.7, &login);
+        assert!(key.starts_with("claude:unclaimed-1757000000-"), "{key}");
         assert!(!key.contains('/'));
+
+        // Same second, different login: the keys must not collide, or the
+        // second stash would overwrite the first.
+        let other = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-b"}}"#.to_string(),
+        };
+        assert_ne!(key, stash_key("claude", 1_757_000_000.7, &other));
     }
 
     /// A driver whose live store is a `Mutex<String>` and whose `write_live`
@@ -762,6 +799,31 @@ mod tests {
             crate::core::history::read(&ctx.home, None).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn switching_to_a_managed_key_slot_is_refused_before_any_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        ctx.secrets
+            .set(&slot_key("claude", 2), "sk-ant-api03-managed")
+            .unwrap();
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false);
+
+        match perform(&ctx, &driver, 2, "manual") {
+            Err(e) => assert_eq!(e.code, ErrorCode::Unsupported),
+            Ok(_) => panic!("the managed-key axis is not implemented; the switch must fail"),
+        }
+
+        // Refused early: nothing was written, and the outgoing login was
+        // neither backed up nor stashed.
+        assert!(driver.writes.lock().unwrap().is_empty());
+        assert_eq!(
+            ctx.secrets.get(&slot_key("claude", 1)).unwrap().unwrap(),
+            login_for("one@example.com", "rt-1")
+        );
+        let file: SlotsFile = read_json(&ctx.home.slots_file()).unwrap();
+        assert_eq!(file.providers["claude"].active_slot, None);
     }
 
     #[test]

@@ -279,10 +279,20 @@ mod tests {
         let lock = home.path().join("touched.lock");
         let _guard = proper_lockfile(&lock, CONFIG_STALENESS, Duration::from_millis(300)).unwrap();
         // Backdate it as a stalled holder would, then let the toucher run.
+        // Polled rather than slept once: a loaded runner can overshoot a fixed
+        // margin on the 3s timer.
         set_mtime(&lock, Duration::from_secs(600));
         let backdated = fs::metadata(&lock).unwrap().modified().unwrap();
-        std::thread::sleep(TOUCH_INTERVAL + Duration::from_millis(500));
-        let now = fs::metadata(&lock).unwrap().modified().unwrap();
-        assert!(now > backdated, "the toucher should have bumped the mtime");
+        let deadline = Instant::now() + TOUCH_INTERVAL * 3;
+        let touched = loop {
+            if fs::metadata(&lock).unwrap().modified().unwrap() > backdated {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(touched, "the toucher should have bumped the mtime");
     }
 }

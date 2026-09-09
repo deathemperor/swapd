@@ -145,9 +145,18 @@ impl ClaudeDriver {
         // as cswap's `_prepare_credentials_for_activation` does.
         let live = self.read_live_raw(env).unwrap_or(None);
         let composed = prepare_for_activation(&credential, live.as_deref())?;
+
+        // Read (and validate) the config BEFORE the credential store is
+        // touched: a torn `~/.claude.json` must fail the whole write, not leave
+        // the keychain holding the new account while the config names the old.
+        let config = match oauth_account {
+            Some(_) => Some(read_config(env)?),
+            None => None,
+        };
+
         self.write_credential(env, &composed)?;
-        if let Some(oauth_account) = oauth_account {
-            splice_oauth_account(env, oauth_account)?;
+        if let (Some(oauth_account), Some(config)) = (oauth_account, config) {
+            splice_oauth_account(env, config, oauth_account)?;
         }
         Ok(())
     }
@@ -235,15 +244,26 @@ fn read_credentials_file(env: &Env) -> Result<Option<String>, DriverError> {
     }
 }
 
+/// Write the plaintext credential file atomically, 0600 (port of
+/// `credentials.py:751-772` `_write_active_credentials_file`). On Linux this is
+/// *the* live store and Claude Code reads it without taking any lock, so a
+/// truncate-then-write would give it a window to read a torn credential.
 fn write_credentials_file(env: &Env, value: &str) -> Result<(), DriverError> {
     let path = paths::credentials_file(env)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+
+    let tmp = dir.join(format!(".credentials.json.tmp.{}", rand::random::<u64>()));
+    match write_private(&tmp, value).and_then(|()| Ok(fs::rename(&tmp, &path)?)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    write_private(&path, value)
 }
 
-/// Write `value` to `path` with 0600, truncating any existing file.
+/// Create `path` with 0600 and write `value` to it.
 fn write_private(path: &Path, value: &str) -> Result<(), DriverError> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -312,9 +332,13 @@ fn config_oauth_account(env: &Env) -> Option<Value> {
 
 /// Replace only `oauthAccount` in `~/.claude.json`, preserving every other key
 /// (`switcher.py:7102-7126`). The file is created when absent.
-fn splice_oauth_account(env: &Env, oauth_account: Value) -> Result<(), DriverError> {
+fn splice_oauth_account(
+    env: &Env,
+    config: Option<Value>,
+    oauth_account: Value,
+) -> Result<(), DriverError> {
     let path = paths::config_json(env)?;
-    let mut config = match read_config(env)? {
+    let mut config = match config {
         Some(Value::Object(map)) => map,
         _ => Map::new(),
     };
@@ -459,12 +483,13 @@ fn plan_label(oauth: &Map<String, Value>) -> Option<String> {
     let words: Vec<String> = raw
         .split('_')
         .map(|word| {
-            // "20x" stays as it is; every other word is capitalized.
-            let stem = &word[..word.len().saturating_sub(1)];
-            if word.ends_with('x') && !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()) {
-                word.to_string()
-            } else {
-                capitalize(word)
+            // "20x" stays as it is; every other word is capitalized. Sliced by
+            // char, never by byte: this runs on a user-written file.
+            match word.strip_suffix('x') {
+                Some(stem) if !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()) => {
+                    word.to_string()
+                }
+                _ => capitalize(word),
             }
         })
         .collect();
@@ -843,17 +868,24 @@ mod tests {
             Some("Pro".to_string())
         );
         assert_eq!(label(r#"{"organizationType":""}"#), None);
+        // Slicing a word by byte to test for the "20x" shape would panic here.
+        assert_eq!(
+            label(r#"{"organizationType":"claud\u00e9"}"#),
+            Some("Claudé".to_string())
+        );
         assert_eq!(label("{}"), None);
     }
 
     #[test]
     fn write_live_refuses_to_clobber_a_torn_config() {
         let home = temp_home();
-        let (env, _services) = default_profile_env(&home);
-        let (driver, _fake) = fake_driver();
+        let (env, services) = default_profile_env(&home);
+        let (driver, fake) = fake_driver();
 
         let config_path = paths::config_json(&env).unwrap();
         fs::write(&config_path, "{\"numStartups\": 7,").unwrap();
+        let before = r#"{"claudeAiOauth":{"refreshToken":"live"}}"#;
+        fake.add(&services[0], "tester", before).unwrap();
 
         let login = Login {
             bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-7"},"oauthAccount":{"emailAddress":"new@example.com"}}"#
@@ -867,6 +899,13 @@ mod tests {
             fs::read_to_string(&config_path).unwrap(),
             "{\"numStartups\": 7,",
             "the user's torn config must be left as it was"
+        );
+        // And the swap must not have half-landed: the credential store still
+        // holds the account the (unwritable) config still names.
+        assert_eq!(
+            fake.find(&services[0], None).unwrap().as_deref(),
+            Some(before),
+            "the credential must not be written when the config splice cannot be"
         );
     }
 }

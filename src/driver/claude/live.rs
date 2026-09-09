@@ -62,8 +62,13 @@ const SHARED_CREDENTIAL_KEYS: [&str; 5] = [
 /// Where Claude Code's live credential lives on this machine.
 ///
 /// A value, not a `cfg`: tests build `Keychain(FakeSecurity)` on every OS so
-/// Linux CI covers the keychain logic too.
+/// Linux CI covers the keychain logic too — real construction is
+/// `default_for_platform`'s `RealSecurity` on macOS, `FakeSecurity` (and its
+/// variants) in the `live.rs`/`run.rs` test suites on every OS. `dead_code`
+/// only sees the former, so it's suppressed off macOS alone; on macOS the
+/// lint stays live.
 pub enum LiveStore {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Keychain(Arc<dyn SecurityCli>),
     File,
 }
@@ -1061,6 +1066,9 @@ mod tests {
     /// threads and no timing window.
     struct BreakDirOnFirstWrite {
         inner: FakeSecurity,
+        // Only the `#[cfg(unix)]` branch of `add` below reads this — chmod'ing
+        // a directory unwritable has no Windows equivalent here.
+        #[cfg(unix)]
         dir: std::path::PathBuf,
         broken: Mutex<bool>,
     }

@@ -103,11 +103,13 @@ jobs:
           merge-multiple: true
       - name: Extract release notes from CHANGELOG.md
         run: awk '/^## /{c++} c==1' CHANGELOG.md > body.md
-      - name: Create release
+      - name: Create or update the release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file body.md \
-            dist/*
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file body.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

@@ -1,15 +1,22 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::paths::Home;
 #[cfg(target_os = "macos")]
 use crate::security_cli::RealSecurity;
+#[cfg(target_os = "macos")]
 use crate::security_cli::SecurityCli;
 
+// Only `SecuritySecrets` reads this, and it's macOS-only: the `security` CLI
+// backend is never built on another platform.
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "swapd";
 
 pub trait Secrets: Send + Sync {
@@ -18,16 +25,19 @@ pub trait Secrets: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
 }
 
+#[cfg(target_os = "macos")]
 pub struct SecuritySecrets {
     cli: Arc<dyn SecurityCli>,
 }
 
+#[cfg(target_os = "macos")]
 impl SecuritySecrets {
     pub fn new(cli: Arc<dyn SecurityCli>) -> Self {
         Self { cli }
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Secrets for SecuritySecrets {
     fn get(&self, key: &str) -> Result<Option<String>> {
         self.cli.find(SERVICE, Some(key))
@@ -161,12 +171,18 @@ impl Secrets for MemorySecrets {
 /// reports `primary`'s result while not degraded, `fallback`'s once degraded. A
 /// successful `set` on `primary` also clears any stale copy in `fallback` left by an
 /// earlier degraded run, ignoring that delete's result.
+///
+/// Only `platform_default` (macOS) ever wires this up — `primary` is always
+/// `SecuritySecrets` there — so it is `#[cfg(target_os = "macos")]` along
+/// with them, even though the fallback logic itself is backend-agnostic.
+#[cfg(target_os = "macos")]
 pub struct StickySecrets {
     primary: Box<dyn Secrets>,
     fallback: Box<dyn Secrets>,
     degraded: AtomicBool,
 }
 
+#[cfg(target_os = "macos")]
 impl StickySecrets {
     pub fn new(primary: Box<dyn Secrets>, fallback: Box<dyn Secrets>) -> Self {
         Self {
@@ -177,6 +193,7 @@ impl StickySecrets {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Secrets for StickySecrets {
     fn get(&self, key: &str) -> Result<Option<String>> {
         if self.degraded.load(Ordering::SeqCst) {
@@ -276,6 +293,7 @@ pub fn slot_key(provider: &str, slot: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::security_cli::FakeSecurity;
 
     #[test]
@@ -315,6 +333,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn security_secrets_roundtrip_through_fake_cli() {
         let secrets = SecuritySecrets::new(Arc::new(FakeSecurity::new()));
@@ -325,13 +344,16 @@ mod tests {
         assert_eq!(secrets.get("claude:1").unwrap(), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn security_not_found_is_none() {
         let secrets = SecuritySecrets::new(Arc::new(FakeSecurity::new()));
         assert_eq!(secrets.get("no-such-key").unwrap(), None);
     }
 
+    #[cfg(target_os = "macos")]
     struct FailingSecrets;
+    #[cfg(target_os = "macos")]
     impl Secrets for FailingSecrets {
         fn get(&self, _key: &str) -> Result<Option<String>> {
             Err(SwapdError::new(ErrorCode::KeychainUnavailable, "fail"))
@@ -344,6 +366,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sticky_falls_back_after_primary_error() {
         let sticky = StickySecrets::new(Box::new(FailingSecrets), Box::new(MemorySecrets::new()));
@@ -351,7 +374,9 @@ mod tests {
         assert_eq!(sticky.get("k").unwrap(), Some("tok-1".to_string()));
     }
 
+    #[cfg(target_os = "macos")]
     struct InvalidInputSecrets;
+    #[cfg(target_os = "macos")]
     impl Secrets for InvalidInputSecrets {
         fn get(&self, _key: &str) -> Result<Option<String>> {
             Err(SwapdError::new(ErrorCode::InvalidInput, "bad"))
@@ -364,6 +389,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sticky_does_not_degrade_on_invalid_input() {
         let fallback_mem = Arc::new(MemorySecrets::new());
@@ -386,7 +412,9 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
+    #[cfg(target_os = "macos")]
     struct CountingFailingSecrets(Arc<Mutex<u32>>);
+    #[cfg(target_os = "macos")]
     impl Secrets for CountingFailingSecrets {
         fn get(&self, _key: &str) -> Result<Option<String>> {
             *self.0.lock().unwrap() += 1;
@@ -402,6 +430,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sticky_stays_on_fallback_for_process_lifetime() {
         let calls = Arc::new(Mutex::new(0u32));
@@ -449,6 +478,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "tok-1");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn security_secrets_rejects_empty_value() {
         let secrets = SecuritySecrets::new(Arc::new(FakeSecurity::new()));
@@ -456,7 +486,9 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
+    #[cfg(target_os = "macos")]
     struct SharedSecrets(Arc<MemorySecrets>);
+    #[cfg(target_os = "macos")]
     impl Secrets for SharedSecrets {
         fn get(&self, key: &str) -> Result<Option<String>> {
             self.0.get(key)
@@ -469,6 +501,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sticky_delete_reaches_both_backends() {
         let primary_mem = Arc::new(MemorySecrets::new());
@@ -489,6 +522,7 @@ mod tests {
         assert_eq!(fallback_mem.get("k").unwrap(), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sticky_set_on_primary_clears_fallback_copy() {
         let primary_mem = Arc::new(MemorySecrets::new());

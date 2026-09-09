@@ -88,12 +88,19 @@ impl Fixture {
 
     /// Claude Code's own live login, as the file store keeps it, plus the
     /// `~/.claude.json` identity it advertises for it.
-    fn write_live_login(&self, email: &str, org: &str, access: &str, refresh: &str) {
+    fn write_live_login(
+        &self,
+        email: &str,
+        org: &str,
+        access: &str,
+        refresh: &str,
+        expires_at: i64,
+    ) {
         let login = json!({
             "claudeAiOauth": {
                 "accessToken": access,
                 "refreshToken": refresh,
-                "expiresAt": NOT_EXPIRED_MS,
+                "expiresAt": expires_at,
                 "scopes": ["user:inference"],
             }
         });
@@ -308,7 +315,13 @@ fn active_slot_matches_the_live_login_by_identity() {
     let fx = Fixture::new();
     // Claude Code holds slot 2's account, on a lineage it rotated itself since
     // the slot's copy was stored.
-    fx.write_live_login("two@example.com", "org-2", "tok-2", "rt-2-rotated");
+    fx.write_live_login(
+        "two@example.com",
+        "org-2",
+        "tok-2",
+        "rt-2-rotated",
+        NOT_EXPIRED_MS,
+    );
     fx.usage_mock(1, 200, usage_body(12.0, 34.0));
     fx.usage_mock(2, 200, usage_body(56.0, 7.0));
 
@@ -322,6 +335,57 @@ fn active_slot_matches_the_live_login_by_identity() {
     let stored =
         std::fs::read_to_string(fx.home.path().join("credentials").join("claude_2")).unwrap();
     assert!(stored.contains("rt-2-rotated"), "{stored}");
+    let slots: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.home.path().join("slots.json")).unwrap())
+            .unwrap();
+    assert!(slots["providers"]["claude"]["slots"]["2"]["fingerprint"]
+        .as_str()
+        .is_some_and(|fp| fp.starts_with("sha256:")));
+}
+
+#[test]
+fn refreshed_rotation_is_persisted_before_the_retry() {
+    let fx = Fixture::new();
+    // The active account's live credential is expired: the pass has to refresh
+    // it, persist the successor everywhere, and only then fetch usage.
+    fx.write_live_login("two@example.com", "org-2", "tok-2", "rt-2", EXPIRED_MS);
+    fx.usage_mock(1, 200, usage_body(12.0, 34.0));
+    let spent = fx.usage_mock(2, 200, usage_body(56.0, 7.0));
+    let rotated = fx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/usage")
+            .header("Authorization", "Bearer tok-2b");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(usage_body(56.0, 7.0));
+    });
+    let token = fx.server.mock(|when, then| {
+        when.method(POST).path("/v1/oauth/token");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "access_token": "tok-2b",
+                "refresh_token": "rt-2b",
+                "expires_in": 3600,
+            }));
+    });
+
+    let payload = fx.list();
+    assert_eq!(account(&payload, 2)["usageStatus"], "ok");
+    assert_eq!(account(&payload, 2)["active"], true);
+    // Exactly one refresh, and usage is only ever asked with the successor.
+    token.assert_hits(1);
+    spent.assert_hits(0);
+    rotated.assert_hits(1);
+
+    // The rotation reached both stores before the retry could fail, and the
+    // slot records the generation it now holds.
+    let stored =
+        std::fs::read_to_string(fx.home.path().join("credentials").join("claude_2")).unwrap();
+    assert!(stored.contains("rt-2b"), "{stored}");
+    let live =
+        std::fs::read_to_string(fx.claude_home.path().join(".claude/.credentials.json")).unwrap();
+    assert!(live.contains("rt-2b"), "{live}");
     let slots: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fx.home.path().join("slots.json")).unwrap())
             .unwrap();

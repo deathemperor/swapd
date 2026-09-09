@@ -413,8 +413,11 @@ fn refresh_then_usage(
     ctx.secrets.set(&st.key, &refreshed.bytes)?;
     if st.active {
         provider.write_live(&ctx.env, &refreshed)?;
-        record_slot_fingerprint(ctx, provider.id(), st.slot, Some(&refreshed.fingerprint()))?;
     }
+    // Every persisted rotation is stamped, active or not: `slots.json`'s
+    // fingerprint is the stored login's, and a stale one both hides a
+    // quarantine and refuses to heal.
+    record_slot_fingerprint(ctx, provider.id(), st.slot, Some(&refreshed.fingerprint()))?;
 
     // Once per pass: a second `NeedsRefresh` is recorded as the 401 it is
     // rather than spending another refresh token on it.

@@ -127,13 +127,26 @@ impl ClaudeDriver {
     /// into `~/.claude.json`. The live credential is read *under* the lock: that
     /// is the whole point of holding it, so a refresh landing mid-swap cannot
     /// hand us a superseded generation.
+    ///
+    /// **OAuth logins only.** A managed `sk-ant-api…` key lives on Claude
+    /// Code's other auth axis (keychain service "Claude Code" /
+    /// `primaryApiKey`, with the OAuth item cleared — cswap
+    /// `_write_managed_credentials`); writing one into the OAuth item would
+    /// replace the live login with something Claude Code will not read there.
+    /// Task 10 owns that axis; until then a non-OAuth blob is rejected before
+    /// any lock is taken.
     pub fn write_live_with_timeout(
         &self,
         env: &Env,
         login: &Login,
         timeout: Duration,
     ) -> Result<(), DriverError> {
-        let (credential, oauth_account) = split_envelope(&login.bytes);
+        let (credential, oauth_account) = split_envelope(&login.bytes)?;
+        // Checked on the target rather than on the composed result: composition
+        // only swaps `SHARED_CREDENTIAL_KEYS`, so it can neither add nor remove
+        // `claudeAiOauth`. Doing it here keeps a bad input from ever taking a
+        // lock Claude Code may be waiting on.
+        require_oauth_login(&credential)?;
 
         // Dropped in reverse declaration order: config lock first, then the
         // credential pair (legacy before primary).
@@ -156,7 +169,25 @@ impl ClaudeDriver {
 
         self.write_credential(env, &composed)?;
         if let (Some(oauth_account), Some(config)) = (oauth_account, config) {
-            splice_oauth_account(env, config, oauth_account)?;
+            if let Err(splice_error) = splice_oauth_account(env, config, oauth_account) {
+                // The credential landed but the config could not follow. Put
+                // the previous login back so the two halves agree; the kinds of
+                // both failures go in the message, never any credential bytes.
+                let rolled_back = live
+                    .as_deref()
+                    .map(|previous| self.write_credential(env, previous).is_ok())
+                    .unwrap_or(false);
+                return Err(DriverError::Invalid(format!(
+                    "write_live: credential written but the config splice failed ({}); \
+                     credential store {}",
+                    error_kind(&splice_error),
+                    if rolled_back {
+                        "rolled back"
+                    } else {
+                        "left on the new login"
+                    },
+                )));
+            }
         }
         Ok(())
     }
@@ -187,16 +218,48 @@ impl ClaudeDriver {
     }
 }
 
+/// Reject anything that is not an OAuth login object before it can reach
+/// Claude Code's OAuth item (see `write_live_with_timeout`).
+fn require_oauth_login(credential: &str) -> Result<(), DriverError> {
+    let is_oauth = credential_object(Some(credential))
+        .and_then(|map| map.get("claudeAiOauth").cloned())
+        .map(|value| value.is_object())
+        .unwrap_or(false);
+    if is_oauth {
+        Ok(())
+    } else {
+        Err(DriverError::Invalid(
+            "write_live: oauth login required".to_string(),
+        ))
+    }
+}
+
+/// A one-word kind for an error, so a failure can be reported without echoing
+/// anything the error's own message may carry.
+fn error_kind(err: &DriverError) -> &'static str {
+    match err {
+        DriverError::Io(_) => "io",
+        DriverError::Locked(_) => "locked",
+        DriverError::Invalid(_) => "invalid",
+        DriverError::KeychainUnavailable => "keychain unavailable",
+        _ => "error",
+    }
+}
+
 /// Account name for the live-credential keychain item, mirroring Claude Code's
 /// `getUsername()` (`macos_keychain.py:76-93`): `$USER`, else a stable
 /// fallback. Matching it exactly matters on headless/launchd hosts where
 /// `$USER` is unset — a divergent default would key a *different* item than
 /// Claude Code's.
 fn keychain_account(env: &Env) -> String {
-    match env.vars.get("USER") {
-        Some(user) if !user.is_empty() => user.clone(),
-        _ => "claude".to_string(),
+    for name in ["USER", "LOGNAME"] {
+        if let Some(user) = env.vars.get(name) {
+            if !user.is_empty() {
+                return user.clone();
+            }
+        }
     }
+    "claude-code-user".to_string()
 }
 
 fn map_security_error(err: crate::errors::SwapdError) -> DriverError {
@@ -274,6 +337,8 @@ fn write_private(path: &Path, value: &str) -> Result<(), DriverError> {
     }
     let mut file = opts.open(path)?;
     file.write_all(value.as_bytes())?;
+    // Durable before the rename, as `core::store::write_json_atomic` does.
+    file.sync_all()?;
     Ok(())
 }
 
@@ -292,16 +357,21 @@ fn embed_oauth_account(env: &Env, raw: String) -> String {
 }
 
 /// The reverse: the credential without `oauthAccount`, plus that value.
-fn split_envelope(bytes: &str) -> (String, Option<Value>) {
-    match serde_json::from_str::<Value>(bytes) {
-        Ok(Value::Object(mut map)) => match map.remove("oauthAccount") {
-            Some(oauth_account) => (
-                serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| bytes.to_string()),
-                Some(oauth_account),
-            ),
-            None => (bytes.to_string(), None),
-        },
-        _ => (bytes.to_string(), None),
+fn split_envelope(bytes: &str) -> Result<(String, Option<Value>), DriverError> {
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(bytes) else {
+        return Ok((bytes.to_string(), None));
+    };
+    match map.remove("oauthAccount") {
+        // Present but not an object: splicing it would put a `null` or a string
+        // where Claude Code expects the account profile.
+        Some(oauth_account) if !oauth_account.is_object() => Err(DriverError::Invalid(
+            "invalid oauthAccount in login".to_string(),
+        )),
+        Some(oauth_account) => Ok((
+            serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| bytes.to_string()),
+            Some(oauth_account),
+        )),
+        None => Ok((bytes.to_string(), None)),
     }
 }
 
@@ -802,6 +872,164 @@ mod tests {
     }
 
     #[test]
+    fn write_live_rejects_a_non_oauth_login() {
+        let home = temp_home();
+        let (env, services) = default_profile_env(&home);
+        let (driver, fake) = fake_driver();
+        let live = r#"{"claudeAiOauth":{"refreshToken":"live"}}"#;
+        fake.add(&services[0], "tester", live).unwrap();
+
+        for bytes in [
+            "sk-ant-api03-fake-key",           // the managed-key axis (Task 10)
+            "",                                // an empty write would log the user out
+            r#"{"trustedDeviceToken":"tdt"}"#, // JSON, but not a login
+            r#"{"claudeAiOauth":"not-an-object"}"#,
+        ] {
+            let login = Login {
+                bytes: bytes.to_string(),
+            };
+            let err = driver
+                .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+                .unwrap_err();
+            assert!(
+                matches!(&err, DriverError::Invalid(m) if m == "write_live: oauth login required"),
+                "{bytes:?} -> {err:?}"
+            );
+        }
+        // The live login is untouched by every rejection.
+        assert_eq!(
+            fake.find(&services[0], None).unwrap().as_deref(),
+            Some(live)
+        );
+        // And no lock was even taken.
+        assert!(!home.path().join(".claude/.oauth_refresh.lock").exists());
+    }
+
+    #[test]
+    fn write_live_rejects_a_non_object_oauth_account() {
+        let home = temp_home();
+        let (env, _services) = default_profile_env(&home);
+        let (driver, _fake) = fake_driver();
+
+        for oauth_account in ["null", r#""a@example.com""#, "42"] {
+            let login = Login {
+                bytes: format!(
+                    r#"{{"claudeAiOauth":{{"refreshToken":"rt"}},"oauthAccount":{oauth_account}}}"#
+                ),
+            };
+            let err = driver
+                .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+                .unwrap_err();
+            assert!(
+                matches!(&err, DriverError::Invalid(m) if m == "invalid oauthAccount in login"),
+                "{oauth_account} -> {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keychain_account_follows_claude_codes_chain() {
+        let home = temp_home();
+        assert_eq!(
+            keychain_account(&env_with(&home, [("USER", "alice"), ("LOGNAME", "bob")])),
+            "alice"
+        );
+        // $USER unset or empty on a launchd/cron host: LOGNAME is next.
+        assert_eq!(
+            keychain_account(&env_with(&home, [("USER", ""), ("LOGNAME", "bob")])),
+            "bob"
+        );
+        // Neither: Claude Code's own final fallback, so both name one item.
+        assert_eq!(keychain_account(&env_with(&home, [])), "claude-code-user");
+    }
+
+    /// Wraps `FakeSecurity` and, on its first `add`, makes `dir` unwritable —
+    /// so the config splice that follows the credential write fails, with no
+    /// threads and no timing window.
+    struct BreakDirOnFirstWrite {
+        inner: FakeSecurity,
+        dir: std::path::PathBuf,
+        broken: Mutex<bool>,
+    }
+
+    impl SecurityCli for BreakDirOnFirstWrite {
+        fn find(
+            &self,
+            service: &str,
+            account: Option<&str>,
+        ) -> crate::errors::Result<Option<String>> {
+            self.inner.find(service, account)
+        }
+        fn add(&self, service: &str, account: &str, value: &str) -> crate::errors::Result<()> {
+            let mut broken = self.broken.lock().unwrap();
+            if !*broken {
+                *broken = true;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o500)).unwrap();
+                }
+            }
+            drop(broken);
+            self.inner.add(service, account, value)
+        }
+        fn delete(&self, service: &str, account: &str) -> crate::errors::Result<()> {
+            self.inner.delete(service, account)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_live_rolls_the_credential_back_when_the_config_splice_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let (env, services) = default_profile_env(&home);
+        let config_path = paths::config_json(&env).unwrap();
+        let config_before = r#"{"oauthAccount":{"emailAddress":"old@example.com"}}"#;
+        fs::write(&config_path, config_before).unwrap();
+
+        let live = r#"{"claudeAiOauth":{"refreshToken":"live"}}"#;
+        let breaker = Arc::new(BreakDirOnFirstWrite {
+            inner: FakeSecurity::default(),
+            dir: config_path.parent().unwrap().to_path_buf(),
+            broken: Mutex::new(false),
+        });
+        breaker.inner.add(&services[0], "tester", live).unwrap();
+        let driver = ClaudeDriver::new(LiveStore::Keychain(breaker.clone()));
+
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"new"},"oauthAccount":{"emailAddress":"new@example.com"}}"#
+                .to_string(),
+        };
+        let err = driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+            .unwrap_err();
+
+        // Restore write permission first, so the temp dir can be cleaned up
+        // even if an assertion below panics.
+        fs::set_permissions(
+            config_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        match &err {
+            DriverError::Invalid(msg) => {
+                assert!(msg.contains("config splice failed (io)"), "{msg}");
+                assert!(msg.contains("rolled back"), "{msg}");
+                assert!(!msg.contains("refreshToken"), "no credential bytes: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(
+            breaker.find(&services[0], None).unwrap().as_deref(),
+            Some(live),
+            "the credential must be rolled back when the config cannot follow"
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config_before);
+    }
+
+    #[test]
     fn prepare_for_activation_passes_api_keys_and_missing_live_through() {
         let target = r#"{"claudeAiOauth":{"refreshToken":"rt"},"mcpOAuth":{"srv":"slot"}}"#;
         // No live credential at all: the slot's blob activates unchanged.
@@ -811,7 +1039,10 @@ mod tests {
             prepare_for_activation(target, Some("sk-ant-api03-fake")).unwrap(),
             target
         );
-        // A managed API key as the *target* stays activatable verbatim.
+        // A managed API key as the *target* stays activatable verbatim here —
+        // composition is the OAuth-agnostic step. `write_live` is the one that
+        // refuses it (see `write_live_rejects_a_non_oauth_login`), because the
+        // managed key belongs on Claude Code's other auth axis.
         assert_eq!(
             prepare_for_activation("sk-ant-api03-fake", Some(target)).unwrap(),
             "sk-ant-api03-fake"

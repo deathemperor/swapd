@@ -82,7 +82,11 @@ pub fn keychain_service_name(config_dir: &str) -> String {
 /// credential.
 fn active_profile_is_default(env: &Env) -> bool {
     fn resolved(path: Result<PathBuf, DriverError>) -> Option<PathBuf> {
-        path.ok().and_then(|p| p.canonicalize().ok())
+        // Non-strict, like Python's `Path.resolve()`: `canonicalize` fails on a
+        // directory that does not exist yet, and a first run whose `~/.claude`
+        // is not created would otherwise lose the unsuffixed fallback.
+        path.ok()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
     }
     let active = resolved(config_home(env));
     let default = resolved(home(env).map(|h| h.join(".claude")));
@@ -230,6 +234,22 @@ mod tests {
         let home = temp_home();
         let default = home.path().join(".claude");
         std::fs::create_dir_all(&default).unwrap();
+        let env = env_with(&home, [("CLAUDE_CONFIG_DIR", default.to_str().unwrap())]);
+        assert_eq!(
+            live_services(&env),
+            vec![
+                keychain_service_name(default.to_str().unwrap()),
+                DEFAULT_SERVICE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_services_fallback_survives_a_not_yet_created_config_dir() {
+        let home = temp_home();
+        // Deliberately NOT created: a first run before Claude Code has ever
+        // written its config home still names the default profile.
+        let default = home.path().join(".claude");
         let env = env_with(&home, [("CLAUDE_CONFIG_DIR", default.to_str().unwrap())]);
         assert_eq!(
             live_services(&env),

@@ -58,10 +58,12 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        // Signalled, then DETACHED rather than joined: the toucher exits at its
+        // next wake on its own, and joining it would block the release (and the
+        // whole swap) behind a stuck filesystem for as long as the `utime`
+        // hangs. Python joined with a 1s timeout; Rust's `join` has none.
         drop(self.stop.take());
-        if let Some(toucher) = self.toucher.take() {
-            let _ = toucher.join();
-        }
+        drop(self.toucher.take());
         // A vanished lock means someone took it over as stale; nothing to undo.
         let _ = fs::remove_dir(&self.dir);
     }

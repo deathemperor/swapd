@@ -1,5 +1,8 @@
-//! Provider `Driver` trait and its supporting types. Phase 1 has no driver
-//! implementations yet — Task 6 adds `driver/claude/` and registers it here.
+//! Provider `Driver` trait and its supporting types. Task 6 adds the Claude
+//! driver's paths/locks/live layer; Task 7 implements `Driver` for it and
+//! registers it in `registry()`.
+
+pub mod claude;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -70,6 +73,8 @@ pub enum DriverError {
     NotInstalled,
     #[error("no login")]
     NoLogin,
+    #[error("keychain unavailable")]
+    KeychainUnavailable,
     #[error("token dead")]
     TokenDead,
     #[error("throttled")]
@@ -93,6 +98,9 @@ impl From<DriverError> for SwapdError {
                 SwapdError::new(ErrorCode::ProviderNotInstalled, "provider not installed")
             }
             DriverError::NoLogin => SwapdError::new(ErrorCode::NoSuchSlot, "no login"),
+            DriverError::KeychainUnavailable => {
+                SwapdError::new(ErrorCode::KeychainUnavailable, "keychain unavailable")
+            }
             DriverError::TokenDead => SwapdError::new(ErrorCode::TokenDead, "token dead"),
             DriverError::Throttled { .. } => SwapdError::new(ErrorCode::Http, "throttled"),
             DriverError::Locked(s) => SwapdError::new(ErrorCode::Locked, s),

@@ -1,0 +1,872 @@
+//! Reading and replacing Claude Code's live login.
+//!
+//! Port of cswap `credentials.py:108-140` (retry constants),
+//! `credentials.py:536-563` (`_read_active_oauth_keychain` /
+//! `_read_one_oauth_keychain`), `credentials.py:180-268`
+//! (`looks_like_api_key`, `_credential_object`, `SHARED_CREDENTIAL_KEYS`,
+//! `shared_credential_fields`, `merge_shared_credential_fields`),
+//! `switcher.py:739-760` (`_prepare_credentials_for_activation`),
+//! `switcher.py:7102-7126` (the `oauthAccount` config splice) and
+//! `switcher.py:5236-5250` (`_plan_label`).
+//!
+//! **A `Login` here is an envelope**: the live credential blob's JSON object
+//! with one extra top-level key, `oauthAccount`, copied from `~/.claude.json`
+//! at read time. `write_live` splits it again — the credential store never
+//! receives the `oauthAccount` key, and `~/.claude.json` receives nothing else.
+
+use std::fs;
+use std::io::{ErrorKind, Write as _};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Map, Value};
+
+use crate::core::store::write_json_atomic;
+use crate::driver::claude::{locks, paths};
+use crate::driver::{DriverError, Env, Identity, Login};
+use crate::errors::ErrorCode;
+#[cfg(target_os = "macos")]
+use crate::security_cli::RealSecurity;
+use crate::security_cli::SecurityCli;
+
+/// Bounded retry for the live OAuth-credential keychain read
+/// (`credentials.py:132-133`). A locked/contended login keychain can fail a
+/// single `security` call transiently — e.g. just after wake, or under
+/// contention with Claude Code's own statusline polling the same item — and a
+/// second attempt a moment later usually succeeds. This is an I/O backoff
+/// between retries of an external CLI, not a sleep papering over a race.
+const ACTIVE_READ_ATTEMPTS: u32 = 2;
+const ACTIVE_READ_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// The siblings of `claudeAiOauth` that are machine-shared rather than
+/// account-scoped (`credentials.py:199-206`): they hold OAuth integrations that
+/// rotate independently of any slot, so on activation the live copy is
+/// authoritative. Everything else — known or unknown — stays with the target
+/// slot: a stale restore of an unlisted shared field merely re-prompts for
+/// auth, while carrying a live account-bound field across a switch would
+/// present one account's credential under another.
+const SHARED_CREDENTIAL_KEYS: [&str; 5] = [
+    "mcpOAuth",
+    "mcpOAuthClientConfig",
+    "mcpXaaIdp",
+    "mcpXaaIdpConfig",
+    "pluginSecrets",
+];
+
+/// Where Claude Code's live credential lives on this machine.
+///
+/// A value, not a `cfg`: tests build `Keychain(FakeSecurity)` on every OS so
+/// Linux CI covers the keychain logic too.
+// One variant is unconstructed on either platform (`default_for_platform`
+// picks by `cfg`), so both need the allow; the tests build `Keychain` on every
+// OS.
+#[allow(dead_code)]
+pub enum LiveStore {
+    Keychain(Arc<dyn SecurityCli>),
+    File,
+}
+
+/// The Claude provider driver. Task 7 adds `impl Driver for ClaudeDriver`
+/// (oauth, usage, run) on top of these inherent methods.
+pub struct ClaudeDriver {
+    pub store: LiveStore,
+}
+
+impl ClaudeDriver {
+    pub fn new(store: LiveStore) -> Self {
+        Self { store }
+    }
+
+    /// macOS keeps the live credential in the login keychain; every other
+    /// platform in `<config_home>/.credentials.json`.
+    // Consumed by Task 7's `Driver` impl / registry entry.
+    #[allow(dead_code)]
+    pub fn default_for_platform() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::new(LiveStore::Keychain(Arc::new(RealSecurity)))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::new(LiveStore::File)
+        }
+    }
+
+    /// Claude Code's live login for this environment, as an envelope (see the
+    /// module docs).
+    ///
+    /// `NoLogin` when every service is genuinely absent;
+    /// `KeychainUnavailable` when the backend errored on every attempt for a
+    /// service — an unreadable keychain stops the walk, since it is a property
+    /// of the keychain and not of the item.
+    // Consumed by Task 7's `Driver` impl and Task 9's collector (the active
+    // slot is the one whose fingerprint matches this login's).
+    #[allow(dead_code)]
+    pub fn read_live(&self, env: &Env) -> Result<Login, DriverError> {
+        let raw = self.read_live_raw(env)?.ok_or(DriverError::NoLogin)?;
+        Ok(Login {
+            bytes: embed_oauth_account(env, raw),
+        })
+    }
+
+    /// Replace it, under Claude Code's own locks, with the 9s production
+    /// per-lock budget.
+    // Consumed by Task 7's `Driver` impl and Task 9/10's verbs.
+    #[allow(dead_code)]
+    pub fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError> {
+        self.write_live_with_timeout(env, login, locks::DEFAULT_TIMEOUT)
+    }
+
+    /// `write_live` with an explicit per-lock wait budget (the suite uses a
+    /// few hundred ms; production uses `locks::DEFAULT_TIMEOUT`).
+    ///
+    /// Splits the envelope, takes the credential locks and then the config lock
+    /// (Claude Code's order), composes the credential with the machine's live
+    /// shared fields, writes the credential store, and splices `oauthAccount`
+    /// into `~/.claude.json`. The live credential is read *under* the lock: that
+    /// is the whole point of holding it, so a refresh landing mid-swap cannot
+    /// hand us a superseded generation.
+    pub fn write_live_with_timeout(
+        &self,
+        env: &Env,
+        login: &Login,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        let (credential, oauth_account) = split_envelope(&login.bytes);
+
+        // Dropped in reverse declaration order: config lock first, then the
+        // credential pair (legacy before primary).
+        let _credentials = locks::credentials_lock(env, timeout)?;
+        let _config = locks::config_lock(env, timeout)?;
+
+        // An unreadable live credential is not fatal: with no live JSON object
+        // to take shared fields from, the target activates unchanged, exactly
+        // as cswap's `_prepare_credentials_for_activation` does.
+        let live = self.read_live_raw(env).unwrap_or(None);
+        let composed = prepare_for_activation(&credential, live.as_deref())?;
+        self.write_credential(env, &composed)?;
+        if let Some(oauth_account) = oauth_account {
+            splice_oauth_account(env, oauth_account)?;
+        }
+        Ok(())
+    }
+
+    /// The live credential exactly as the store holds it — no envelope.
+    fn read_live_raw(&self, env: &Env) -> Result<Option<String>, DriverError> {
+        match &self.store {
+            LiveStore::Keychain(cli) => read_keychain(cli.as_ref(), env),
+            LiveStore::File => read_credentials_file(env),
+        }
+    }
+
+    fn write_credential(&self, env: &Env, value: &str) -> Result<(), DriverError> {
+        match &self.store {
+            LiveStore::Keychain(cli) => {
+                // The item Claude Code reads for *this* environment: the first
+                // service in try-order (the profile's own, hashed item when
+                // `CLAUDE_CONFIG_DIR` names one).
+                let service = paths::live_services(env)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| paths::DEFAULT_SERVICE.to_string());
+                cli.add(&service, &keychain_account(env), value)
+                    .map_err(map_security_error)
+            }
+            LiveStore::File => write_credentials_file(env, value),
+        }
+    }
+}
+
+/// Account name for the live-credential keychain item, mirroring Claude Code's
+/// `getUsername()` (`macos_keychain.py:76-93`): `$USER`, else a stable
+/// fallback. Matching it exactly matters on headless/launchd hosts where
+/// `$USER` is unset — a divergent default would key a *different* item than
+/// Claude Code's.
+fn keychain_account(env: &Env) -> String {
+    match env.vars.get("USER") {
+        Some(user) if !user.is_empty() => user.clone(),
+        _ => "claude".to_string(),
+    }
+}
+
+fn map_security_error(err: crate::errors::SwapdError) -> DriverError {
+    match err.code {
+        ErrorCode::KeychainUnavailable => DriverError::KeychainUnavailable,
+        _ => DriverError::Invalid(err.message),
+    }
+}
+
+/// Walk the environment's services in order, first hit wins
+/// (`credentials.py:536-548`).
+fn read_keychain(cli: &dyn SecurityCli, env: &Env) -> Result<Option<String>, DriverError> {
+    for service in paths::live_services(env) {
+        if let Some(value) = read_one_service(cli, &service)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+/// One item, with a bounded retry (`credentials.py:550-563`). An absent item
+/// (`Ok(None)`) is not retried; only a backend error is.
+fn read_one_service(cli: &dyn SecurityCli, service: &str) -> Result<Option<String>, DriverError> {
+    for attempt in 0..ACTIVE_READ_ATTEMPTS {
+        match cli.find(service, None) {
+            Ok(Some(value)) if !value.trim().is_empty() => return Ok(Some(value)),
+            Ok(_) => return Ok(None),
+            Err(_) => {
+                if attempt + 1 < ACTIVE_READ_ATTEMPTS {
+                    std::thread::sleep(ACTIVE_READ_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    Err(DriverError::KeychainUnavailable)
+}
+
+fn read_credentials_file(env: &Env) -> Result<Option<String>, DriverError> {
+    let path = paths::credentials_file(env)?;
+    match fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Ok(Some(text)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn write_credentials_file(env: &Env, value: &str) -> Result<(), DriverError> {
+    let path = paths::credentials_file(env)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_private(&path, value)
+}
+
+/// Write `value` to `path` with 0600, truncating any existing file.
+fn write_private(path: &Path, value: &str) -> Result<(), DriverError> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+/// The envelope's `oauthAccount` (from `~/.claude.json`) glued onto the raw
+/// credential object. A credential that is not a JSON object (a managed
+/// `sk-ant-api…` key, an opaque legacy blob) is returned unchanged.
+fn embed_oauth_account(env: &Env, raw: String) -> String {
+    let Some(oauth_account) = config_oauth_account(env) else {
+        return raw;
+    };
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&raw) else {
+        return raw;
+    };
+    map.insert("oauthAccount".to_string(), oauth_account);
+    serde_json::to_string(&Value::Object(map)).unwrap_or(raw)
+}
+
+/// The reverse: the credential without `oauthAccount`, plus that value.
+fn split_envelope(bytes: &str) -> (String, Option<Value>) {
+    match serde_json::from_str::<Value>(bytes) {
+        Ok(Value::Object(mut map)) => match map.remove("oauthAccount") {
+            Some(oauth_account) => (
+                serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| bytes.to_string()),
+                Some(oauth_account),
+            ),
+            None => (bytes.to_string(), None),
+        },
+        _ => (bytes.to_string(), None),
+    }
+}
+
+fn read_config(env: &Env) -> Result<Option<Value>, DriverError> {
+    let path = paths::config_json(env)?;
+    match fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(value @ Value::Object(_)) => Ok(Some(value)),
+            // Fail loud rather than clobber: a torn or foreign config is the
+            // user's data, and rewriting it from scratch would lose it.
+            _ => Err(DriverError::Invalid(format!(
+                "{} is not a JSON object",
+                path.display()
+            ))),
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn config_oauth_account(env: &Env) -> Option<Value> {
+    let config = read_config(env).ok()??;
+    config
+        .get("oauthAccount")
+        .filter(|v| v.is_object())
+        .cloned()
+}
+
+/// Replace only `oauthAccount` in `~/.claude.json`, preserving every other key
+/// (`switcher.py:7102-7126`). The file is created when absent.
+fn splice_oauth_account(env: &Env, oauth_account: Value) -> Result<(), DriverError> {
+    let path = paths::config_json(env)?;
+    let mut config = match read_config(env)? {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    config.insert("oauthAccount".to_string(), oauth_account);
+    write_json_atomic(&path, &Value::Object(config)).map_err(|e| match e.code {
+        ErrorCode::Io => DriverError::Io(std::io::Error::other(e.message)),
+        _ => DriverError::Invalid(e.message),
+    })
+}
+
+/// Whether a stored credential is a raw managed API key rather than OAuth JSON
+/// (`credentials.py:166-178`). Strict on purpose: requiring the `sk-ant-api`
+/// prefix (and that it isn't JSON) keeps a raw `sk-ant-oat…` setup token from
+/// being misclassified.
+fn looks_like_api_key(credentials: &str) -> bool {
+    let text = credentials.trim();
+    text.starts_with("sk-ant-api") && !text.starts_with('{')
+}
+
+/// Parse a JSON credential object, excluding managed API keys
+/// (`credentials.py:181-189`).
+fn credential_object(credentials: Option<&str>) -> Option<Map<String, Value>> {
+    let credentials = credentials?;
+    if credentials.is_empty() || looks_like_api_key(credentials) {
+        return None;
+    }
+    match serde_json::from_str::<Value>(credentials) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// The machine-shared fields of a Claude credential object
+/// (`credentials.py:216-241`). `None` means the input is not a JSON credential
+/// object (missing, malformed, or a managed API key). A map — including an
+/// empty one — is authoritative for every allowlisted key: a key absent here is
+/// absent from the machine's current shared state.
+fn shared_credential_fields(credentials: Option<&str>) -> Option<Map<String, Value>> {
+    let data = credential_object(credentials)?;
+    let mut shared = Map::new();
+    for key in SHARED_CREDENTIAL_KEYS {
+        if let Some(value) = data.get(key) {
+            shared.insert(key.to_string(), value.clone());
+        }
+    }
+    Some(shared)
+}
+
+/// Compose a target login with the machine's shared fields
+/// (`credentials.py:244-268`). The allowlisted keys are wholly live-owned,
+/// presence and absence alike; all other target fields pass through untouched.
+/// A target that is not a JSON object carrying a Claude login (managed API
+/// keys, opaque legacy shapes) stays activatable verbatim.
+fn merge_shared_credential_fields(target: &str, shared: &Map<String, Value>) -> String {
+    let Some(target_map) = credential_object(Some(target)) else {
+        return target.to_string();
+    };
+    if !target_map.contains_key("claudeAiOauth") {
+        return target.to_string();
+    }
+    let mut composed: Map<String, Value> = target_map
+        .into_iter()
+        .filter(|(key, _)| !SHARED_CREDENTIAL_KEYS.contains(&key.as_str()))
+        .collect();
+    for (key, value) in shared {
+        composed.insert(key.clone(), value.clone());
+    }
+    serde_json::to_string(&Value::Object(composed)).unwrap_or_else(|_| target.to_string())
+}
+
+/// Compose the credential to activate from its two owners
+/// (`switcher.py:739-760`).
+///
+/// The machine-shared OAuth integrations (`SHARED_CREDENTIAL_KEYS`, notably
+/// `mcpOAuth`) are frozen in the slot at backup time and may hold rotated-out
+/// tokens, while the live credential's copies are by definition the current
+/// generation — so for those keys the live credential wins, absence included.
+/// Every other field travels with the slot: account-bound state such as
+/// `trustedDeviceToken`, and any field swapd does not recognize, must not leak
+/// across an account switch.
+pub fn prepare_for_activation(target: &str, live: Option<&str>) -> Result<String, DriverError> {
+    match shared_credential_fields(live) {
+        Some(shared) => Ok(merge_shared_credential_fields(target, &shared)),
+        None => Ok(target.to_string()),
+    }
+}
+
+/// The identity `~/.claude.json` currently advertises (`switcher.py:3505-3508`).
+// Consumed by Task 7's `identity()`, which prefers the config identity and
+// falls back to the OAuth profile endpoint.
+#[allow(dead_code)]
+pub fn read_config_identity(env: &Env) -> Option<Identity> {
+    let config = read_config(env).ok()??;
+    identity_from_oauth_account(config.get("oauthAccount")?)
+}
+
+/// An `Identity` from an `oauthAccount` object.
+// Also consumed by Task 7's `identity(login)`, which falls back to the
+// envelope's own `oauthAccount` when the config has none.
+#[allow(dead_code)]
+pub fn identity_from_oauth_account(value: &Value) -> Option<Identity> {
+    let oauth = value.as_object()?;
+    let text = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(Identity {
+        email: text("emailAddress"),
+        organization_uuid: text("organizationUuid"),
+        organization_name: text("organizationName"),
+        plan: plan_label(oauth),
+        uuid: Some(text("accountUuid")).filter(|s| !s.is_empty()),
+    })
+}
+
+/// Human plan label from an `oauthAccount` profile (`switcher.py:5236-5250`),
+/// `None` if unknown. Prefers the rate-limit tier
+/// (`default_claude_max_20x` -> "Max 20x", seat tiers over org tiers), falling
+/// back to the organization type (`claude_pro` -> "Pro").
+fn plan_label(oauth: &Map<String, Value>) -> Option<String> {
+    let raw = [
+        "userRateLimitTier",
+        "organizationRateLimitTier",
+        "organizationType",
+    ]
+    .iter()
+    .find_map(|key| {
+        oauth
+            .get(*key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    })
+    .unwrap_or("");
+    let raw = raw.strip_prefix("default_").unwrap_or(raw);
+    let raw = raw.strip_prefix("claude_").unwrap_or(raw);
+    if raw.is_empty() {
+        return None;
+    }
+    let words: Vec<String> = raw
+        .split('_')
+        .map(|word| {
+            // "20x" stays as it is; every other word is capitalized.
+            let stem = &word[..word.len().saturating_sub(1)];
+            if word.ends_with('x') && !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()) {
+                word.to_string()
+            } else {
+                capitalize(word)
+            }
+        })
+        .collect();
+    Some(words.join(" "))
+}
+
+/// Python's `str.capitalize`: first character upper, the rest lower.
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::claude::tests::{env_with, temp_home};
+    use crate::errors::SwapdError;
+    use crate::security_cli::FakeSecurity;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    fn fake_driver() -> (ClaudeDriver, Arc<FakeSecurity>) {
+        let fake = Arc::new(FakeSecurity::default());
+        (ClaudeDriver::new(LiveStore::Keychain(fake.clone())), fake)
+    }
+
+    /// A default profile whose `~/.claude` exists, so `live_services` yields
+    /// the hashed item *and* the unsuffixed fallback.
+    fn default_profile_env(home: &TempDir) -> (Env, Vec<String>) {
+        let config_home = home.path().join(".claude");
+        fs::create_dir_all(&config_home).unwrap();
+        let env = env_with(
+            home,
+            [
+                ("CLAUDE_CONFIG_DIR", config_home.to_str().unwrap()),
+                ("USER", "tester"),
+            ],
+        );
+        let services = paths::live_services(&env);
+        assert_eq!(
+            services.len(),
+            2,
+            "expected hashed + fallback: {services:?}"
+        );
+        (env, services)
+    }
+
+    #[test]
+    fn read_live_tries_services_in_order() {
+        let home = temp_home();
+        let (env, services) = default_profile_env(&home);
+        let (driver, fake) = fake_driver();
+
+        fake.add(
+            &services[0],
+            "tester",
+            r#"{"claudeAiOauth":{"refreshToken":"hashed"}}"#,
+        )
+        .unwrap();
+        fake.add(
+            &services[1],
+            "tester",
+            r#"{"claudeAiOauth":{"refreshToken":"unsuffixed"}}"#,
+        )
+        .unwrap();
+
+        // First hit wins: the profile's own hashed item.
+        assert!(driver.read_live(&env).unwrap().bytes.contains("hashed"));
+
+        // With it gone, the walk falls through to the unsuffixed item.
+        fake.delete(&services[0], "tester").unwrap();
+        assert!(driver.read_live(&env).unwrap().bytes.contains("unsuffixed"));
+
+        // With both gone, that is a genuine absence, not a backend failure.
+        fake.delete(&services[1], "tester").unwrap();
+        assert!(matches!(driver.read_live(&env), Err(DriverError::NoLogin)));
+    }
+
+    /// Fails `find` a fixed number of times, then answers `Ok(None)`.
+    struct FlakySecurity {
+        remaining_failures: Mutex<u32>,
+    }
+
+    impl SecurityCli for FlakySecurity {
+        fn find(
+            &self,
+            _service: &str,
+            _account: Option<&str>,
+        ) -> crate::errors::Result<Option<String>> {
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(SwapdError::new(
+                    ErrorCode::KeychainUnavailable,
+                    "keychain unavailable",
+                ));
+            }
+            Ok(None)
+        }
+        fn add(&self, _service: &str, _account: &str, _value: &str) -> crate::errors::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _service: &str, _account: &str) -> crate::errors::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_live_retries_once_then_reports_keychain_unavailable() {
+        let home = temp_home();
+        let env = env_with(&home, []);
+
+        // One transient failure is ridden out by the second attempt: the item
+        // then reads as absent, which is NoLogin, not KeychainUnavailable.
+        let flaky = Arc::new(FlakySecurity {
+            remaining_failures: Mutex::new(1),
+        });
+        let driver = ClaudeDriver::new(LiveStore::Keychain(flaky));
+        assert!(matches!(driver.read_live(&env), Err(DriverError::NoLogin)));
+
+        // Both attempts failing is a keychain problem, never "no login".
+        let flaky = Arc::new(FlakySecurity {
+            remaining_failures: Mutex::new(2),
+        });
+        let driver = ClaudeDriver::new(LiveStore::Keychain(flaky));
+        assert!(matches!(
+            driver.read_live(&env),
+            Err(DriverError::KeychainUnavailable)
+        ));
+    }
+
+    #[test]
+    fn read_live_embeds_oauth_account_and_write_live_strips_it() {
+        let home = temp_home();
+        let (env, services) = default_profile_env(&home);
+        let (driver, fake) = fake_driver();
+
+        fs::write(
+            paths::config_json(&env).unwrap(),
+            r#"{"numStartups":7,"oauthAccount":{"emailAddress":"a@example.com"}}"#,
+        )
+        .unwrap();
+        fake.add(
+            &services[0],
+            "tester",
+            r#"{"claudeAiOauth":{"refreshToken":"rt-1"}}"#,
+        )
+        .unwrap();
+
+        let login = driver.read_live(&env).unwrap();
+        let envelope: Value = serde_json::from_str(&login.bytes).unwrap();
+        assert_eq!(envelope["oauthAccount"]["emailAddress"], "a@example.com");
+        assert_eq!(envelope["claudeAiOauth"]["refreshToken"], "rt-1");
+        // The envelope key does not disturb the fingerprint.
+        assert!(login.fingerprint().starts_with("sha256:"));
+
+        driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+            .unwrap();
+
+        let stored = fake.find(&services[0], None).unwrap().unwrap();
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert!(
+            stored.get("oauthAccount").is_none(),
+            "claude code's own item must not carry swapd's envelope key: {stored}"
+        );
+        assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-1");
+    }
+
+    #[test]
+    fn write_live_preserves_mcp_oauth_from_live() {
+        let home = temp_home();
+        let (env, services) = default_profile_env(&home);
+        let (driver, fake) = fake_driver();
+
+        // Live: a current mcpOAuth generation, no pluginSecrets.
+        fake.add(
+            &services[0],
+            "tester",
+            r#"{"claudeAiOauth":{"refreshToken":"live"},"mcpOAuth":{"srv":"live-token"}}"#,
+        )
+        .unwrap();
+
+        // Target slot: a stale mcpOAuth, a stale pluginSecrets, and an
+        // account-bound trustedDeviceToken that must travel with the slot.
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-2"},"mcpOAuth":{"srv":"stale"},"pluginSecrets":{"p":"stale"},"trustedDeviceToken":"tdt-2"}"#
+                .to_string(),
+        };
+        driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+            .unwrap();
+
+        let stored: Value =
+            serde_json::from_str(&fake.find(&services[0], None).unwrap().unwrap()).unwrap();
+        assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-2");
+        // Shared key: the live generation wins.
+        assert_eq!(stored["mcpOAuth"]["srv"], "live-token");
+        // Shared key absent from the live credential: absence wins too — the
+        // slot's stale copy is not resurrected.
+        assert!(stored.get("pluginSecrets").is_none(), "stored: {stored}");
+        // Account-scoped key: travels with the slot.
+        assert_eq!(stored["trustedDeviceToken"], "tdt-2");
+    }
+
+    #[test]
+    fn write_live_splices_only_oauth_account_into_config() {
+        let home = temp_home();
+        let (env, _services) = default_profile_env(&home);
+        let (driver, _fake) = fake_driver();
+
+        let config_path = paths::config_json(&env).unwrap();
+        fs::write(
+            &config_path,
+            r#"{"numStartups":7,"oauthAccount":{"emailAddress":"old@example.com"},"mcpServers":{"srv":{"url":"http://x"}}}"#,
+        )
+        .unwrap();
+
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-3"},"oauthAccount":{"emailAddress":"new@example.com","organizationName":"Org"}}"#
+                .to_string(),
+        };
+        driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+            .unwrap();
+
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["oauthAccount"]["emailAddress"], "new@example.com");
+        assert_eq!(config["oauthAccount"]["organizationName"], "Org");
+        // Everything else is preserved byte-for-byte in value terms.
+        assert_eq!(config["numStartups"], 7);
+        assert_eq!(config["mcpServers"]["srv"]["url"], "http://x");
+        assert_eq!(config.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn write_live_without_an_envelope_leaves_the_config_alone() {
+        let home = temp_home();
+        let (env, _services) = default_profile_env(&home);
+        let (driver, _fake) = fake_driver();
+
+        let config_path = paths::config_json(&env).unwrap();
+        let before = r#"{"oauthAccount":{"emailAddress":"old@example.com"}}"#;
+        fs::write(&config_path, before).unwrap();
+
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-4"}}"#.to_string(),
+        };
+        driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+    }
+
+    #[test]
+    fn write_live_refuses_when_lock_held() {
+        let home = temp_home();
+        let (env, _services) = default_profile_env(&home);
+        let (driver, _fake) = fake_driver();
+
+        // Claude Code holds its primary refresh lock, freshly touched.
+        let held = home.path().join(".claude/.oauth_refresh.lock");
+        fs::create_dir_all(&held).unwrap();
+
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-5"}}"#.to_string(),
+        };
+        let err = driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(200))
+            .unwrap_err();
+        match err {
+            DriverError::Locked(msg) => assert!(msg.contains(".oauth_refresh.lock"), "{msg}"),
+            other => panic!("expected Locked, got {other:?}"),
+        }
+        assert!(
+            held.is_dir(),
+            "we must not have stolen a live holder's lock"
+        );
+    }
+
+    #[test]
+    fn write_live_uses_the_file_store_with_0600() {
+        let home = temp_home();
+        let env = env_with(&home, [("USER", "tester")]);
+        let driver = ClaudeDriver::new(LiveStore::File);
+
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-6"}}"#.to_string(),
+        };
+        driver
+            .write_live_with_timeout(&env, &login, Duration::from_millis(300))
+            .unwrap();
+
+        let path = paths::credentials_file(&env).unwrap();
+        let stored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-6");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // And it round-trips through the file store's read path.
+        assert!(driver.read_live(&env).unwrap().bytes.contains("rt-6"));
+    }
+
+    #[test]
+    fn prepare_for_activation_passes_api_keys_and_missing_live_through() {
+        let target = r#"{"claudeAiOauth":{"refreshToken":"rt"},"mcpOAuth":{"srv":"slot"}}"#;
+        // No live credential at all: the slot's blob activates unchanged.
+        assert_eq!(prepare_for_activation(target, None).unwrap(), target);
+        // A live managed API key is not a credential object either.
+        assert_eq!(
+            prepare_for_activation(target, Some("sk-ant-api03-fake")).unwrap(),
+            target
+        );
+        // A managed API key as the *target* stays activatable verbatim.
+        assert_eq!(
+            prepare_for_activation("sk-ant-api03-fake", Some(target)).unwrap(),
+            "sk-ant-api03-fake"
+        );
+        // So does a target with no claudeAiOauth.
+        assert_eq!(
+            prepare_for_activation(r#"{"other":1}"#, Some(target)).unwrap(),
+            r#"{"other":1}"#
+        );
+    }
+
+    #[test]
+    fn read_config_identity_reads_email_org_and_plan() {
+        let home = temp_home();
+        let env = env_with(&home, []);
+        assert!(read_config_identity(&env).is_none());
+
+        fs::write(
+            home.path().join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"a@example.com","organizationUuid":"org-1","organizationName":"Acme","accountUuid":"acc-1","userRateLimitTier":"default_claude_max_20x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_config_identity(&env).unwrap(),
+            Identity {
+                email: "a@example.com".to_string(),
+                organization_uuid: "org-1".to_string(),
+                organization_name: "Acme".to_string(),
+                plan: Some("Max 20x".to_string()),
+                uuid: Some("acc-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_label_ports_the_tier_precedence() {
+        let label = |json: &str| {
+            let value: Value = serde_json::from_str(json).unwrap();
+            plan_label(value.as_object().unwrap())
+        };
+        // Seat tier wins over org tier, which wins over the org type.
+        assert_eq!(
+            label(
+                r#"{"userRateLimitTier":"default_claude_max_5x","organizationRateLimitTier":"default_claude_max_20x","organizationType":"claude_pro"}"#
+            ),
+            Some("Max 5x".to_string())
+        );
+        assert_eq!(
+            label(r#"{"organizationRateLimitTier":"default_claude_max_20x"}"#),
+            Some("Max 20x".to_string())
+        );
+        assert_eq!(
+            label(r#"{"organizationType":"claude_pro"}"#),
+            Some("Pro".to_string())
+        );
+        assert_eq!(label(r#"{"organizationType":""}"#), None);
+        assert_eq!(label("{}"), None);
+    }
+
+    #[test]
+    fn write_live_refuses_to_clobber_a_torn_config() {
+        let home = temp_home();
+        let (env, _services) = default_profile_env(&home);
+        let (driver, _fake) = fake_driver();
+
+        let config_path = paths::config_json(&env).unwrap();
+        fs::write(&config_path, "{\"numStartups\": 7,").unwrap();
+
+        let login = Login {
+            bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-7"},"oauthAccount":{"emailAddress":"new@example.com"}}"#
+                .to_string(),
+        };
+        assert!(matches!(
+            driver.write_live_with_timeout(&env, &login, Duration::from_millis(300)),
+            Err(DriverError::Invalid(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "{\"numStartups\": 7,",
+            "the user's torn config must be left as it was"
+        );
+    }
+}

@@ -1119,6 +1119,7 @@ mod tests {
     /// Wraps `FakeSecurity` and, on its first `add`, makes `dir` unwritable —
     /// so the config splice that follows the credential write fails, with no
     /// threads and no timing window.
+    #[cfg(unix)]
     struct BreakDirOnFirstWrite {
         inner: FakeSecurity,
         // Only the `#[cfg(unix)]` branch of `add` below reads this — chmod'ing
@@ -1128,6 +1129,7 @@ mod tests {
         broken: Mutex<bool>,
     }
 
+    #[cfg(unix)]
     impl SecurityCli for BreakDirOnFirstWrite {
         fn find(
             &self,

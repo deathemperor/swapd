@@ -106,8 +106,7 @@ internal/locks/       cross-process locks (dir-mkdir mutex, per CLI)
 ```
 
 - `windows[].kind` ∈ `5h | 7d | daily | monthly | scoped | spend`.
-  `spend` carries `used`, `limit`, `currency` instead of `pct`… no:
-  `pct` is always present (0–100, may exceed 100 for overage); `spend`
+  `pct` is always present (0–100, above 100 for overage); `spend`
   adds `used/limit/currency`. `resetsAt` may be absent (spend, or an
   unknown reset).
 - `usageStatus` ∈ `ok | stale | relogin-required | token-expired |

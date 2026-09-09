@@ -392,7 +392,7 @@ fn read_one_service(cli: &dyn SecurityCli, service: &str) -> Result<Option<Strin
     Err(DriverError::KeychainUnavailable)
 }
 
-fn read_credentials_file(env: &Env) -> Result<Option<String>, DriverError> {
+pub fn read_credentials_file(env: &Env) -> Result<Option<String>, DriverError> {
     let path = paths::credentials_file(env)?;
     match fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => Ok(Some(text)),
@@ -497,7 +497,7 @@ fn config_oauth_account(env: &Env) -> Option<Value> {
 
 /// Replace only `oauthAccount` in `~/.claude.json`, preserving every other key
 /// (`switcher.py:7102-7126`). The file is created when absent.
-pub fn splice_oauth_account(
+fn splice_oauth_account(
     env: &Env,
     config: Option<Value>,
     oauth_account: Value,
@@ -508,7 +508,14 @@ pub fn splice_oauth_account(
         _ => Map::new(),
     };
     config.insert("oauthAccount".to_string(), oauth_account);
-    write_json_atomic(&path, &Value::Object(config)).map_err(|e| match e.code {
+    write_json_config(&path, &Value::Object(config))
+}
+
+/// Write a `.claude.json` atomically, 0600 (`write_json_atomic` creates its temp
+/// with that mode and renames over the target). Shared with the run profile's
+/// seed, which writes the same file with more than one key.
+pub fn write_json_config(path: &Path, value: &Value) -> Result<(), DriverError> {
+    write_json_atomic(path, value).map_err(|e| match e.code {
         ErrorCode::Io => DriverError::Io(std::io::Error::other(e.message)),
         _ => DriverError::Invalid(e.message),
     })

@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use serde_json::{Map, Value};
+
 use crate::driver::claude::live::{self, ClaudeDriver};
 use crate::driver::claude::paths;
 use crate::driver::{DriverError, Env, Login, RunProfile};
@@ -237,10 +239,7 @@ pub fn run_profile(
     let seeded = login.fingerprint();
     if needs_seeding(driver, &profile_env, &dir, &seeded)? {
         live::write_credentials_file(&profile_env, &credential)?;
-        if let Some(oauth_account) = oauth_account {
-            let config = live::read_config(&profile_env)?;
-            live::splice_oauth_account(&profile_env, config, oauth_account)?;
-        }
+        seed_profile_config(env, &profile_env, oauth_account)?;
         write_marker(&dir, &seeded)?;
     }
 
@@ -265,6 +264,58 @@ pub fn run_profile(
     Ok(profile)
 }
 
+/// Seed the profile's `.claude.json` (`session.py:860-875`).
+///
+/// Merged into whatever the profile already has, so a re-seed keeps its own
+/// projects and history. `hasCompletedOnboarding` and `theme` are load-bearing,
+/// not cosmetic: Claude Code shows the interactive onboarding flow when
+/// `!config.theme || !config.hasCompletedOnboarding`, which in a fresh profile
+/// means the igniter never returns and every first run hangs to its timeout.
+///
+/// `theme` is a `setdefault`: the profile's own choice wins, then the user's
+/// real `~/.claude.json`, then `"dark"`. `oauthAccount` is written only when the
+/// envelope carries one — the identity seed is what makes the profile show the
+/// right account before its first refresh.
+fn seed_profile_config(
+    env: &Env,
+    profile_env: &Env,
+    oauth_account: Option<Value>,
+) -> Result<(), DriverError> {
+    let path = paths::config_json(profile_env)?;
+    // Parse-or-empty, unlike `read_config`'s caller-facing fail-loud: this file
+    // is swapd's own to write, and refusing to run a slot because the profile
+    // config it manages went torn would strand the account with no way back.
+    let mut config = match live::read_config(profile_env) {
+        Ok(Some(Value::Object(map))) => map,
+        _ => Map::new(),
+    };
+    if let Some(oauth_account) = oauth_account {
+        config.insert("oauthAccount".to_string(), oauth_account);
+    }
+    config.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
+    config
+        .entry("theme")
+        .or_insert_with(|| Value::String(live_theme(env)));
+    live::write_json_config(&path, &Value::Object(config))
+}
+
+/// The theme the user's real `~/.claude.json` records, else cswap's `"dark"`
+/// default. Best-effort by construction: a missing or unreadable config is a
+/// default, never a failed run.
+fn live_theme(env: &Env) -> String {
+    live::read_config(env)
+        .ok()
+        .flatten()
+        .and_then(|config| {
+            config
+                .get("theme")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|theme| !theme.is_empty())
+        .unwrap_or_else(|| "dark".to_string())
+}
+
 /// Whether the profile has to be seeded (`session.py`'s reuse check).
 ///
 /// Not when it already holds credential material that this login put there:
@@ -285,8 +336,12 @@ fn needs_seeding(
     }
     // An unreadable keychain answers "has material": re-seeding over a profile
     // that may hold the freshest generation is the one irreversible mistake here
-    // (`_may_have_credential_material`).
-    let has_material = match driver.read_profile_credential(profile_env) {
+    // (`session.py:288-314` `_may_have_credential_material`).
+    //
+    // Deliberately the STRICT read, and not `read_profile_credential`: that one
+    // answers a keychain error from the plaintext seed, which erases exactly the
+    // distinction this gate turns on (`session.py:298-300`). Do not "unify" them.
+    let has_material = match driver.read_live_raw(profile_env) {
         Ok(material) => material.is_some(),
         Err(_) => true,
     };
@@ -349,8 +404,23 @@ impl ClaudeDriver {
     /// The same read without the envelope, against an already-built profile
     /// environment: the hashed keychain item first (when this driver has a
     /// keychain at all), then `<dir>/.credentials.json`.
+    ///
+    /// Best-effort on the keychain (`session.py:366-390`
+    /// `read_config_dir_credentials`, non-strict arm). `read_live_raw` already
+    /// retries a backend error once and already falls through to the file on an
+    /// *absent* item; what it will not do is fall through on an error, and here
+    /// it must: the child `claude` reads that same plaintext file when the
+    /// keychain is unusable, so the rotation this read exists to capture is in
+    /// it. Failing instead would report a successful, rotating run as
+    /// `KeychainUnavailable` and lose the rotation. Only when both stores are
+    /// unreadable or absent is the answer `None`.
     fn read_profile_credential(&self, profile_env: &Env) -> Result<Option<String>, DriverError> {
-        self.read_live_raw(profile_env)
+        match self.read_live_raw(profile_env) {
+            Ok(found) => Ok(found),
+            // The file read is best-effort too: a byte-corrupt seed is "no
+            // readable credential material", not an error to propagate.
+            Err(_) => Ok(live::read_credentials_file(profile_env).ok().flatten()),
+        }
     }
 }
 
@@ -511,7 +581,7 @@ mod tests {
     use super::*;
     use crate::driver::claude::live::LiveStore;
     use crate::driver::claude::tests::{endpoints, env_with, temp_home};
-    use crate::security_cli::SecurityCli as _;
+    use crate::security_cli::SecurityCli;
 
     fn login() -> Login {
         Login {
@@ -834,6 +904,99 @@ mod tests {
 
         // A profile that was never seeded has nothing to read.
         assert!(driver.read_profile_login(&env, 7).unwrap().is_none());
+    }
+
+    /// Fails every `find`, the way a locked or busy keychain does.
+    struct BrokenSecurity;
+
+    impl SecurityCli for BrokenSecurity {
+        fn find(
+            &self,
+            _service: &str,
+            _account: Option<&str>,
+        ) -> crate::errors::Result<Option<String>> {
+            Err(crate::errors::SwapdError::new(
+                crate::errors::ErrorCode::KeychainUnavailable,
+                "keychain unavailable",
+            ))
+        }
+        fn add(&self, _service: &str, _account: &str, _value: &str) -> crate::errors::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _service: &str, _account: &str) -> crate::errors::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_profile_login_falls_back_to_the_seed_when_the_keychain_errors() {
+        let home = temp_home();
+        let env = env_with(&home, [("USER", "tester")]);
+
+        // Seed the profile with a working store first: an always-erroring one
+        // would answer `needs_seeding` with "has material" and seed nothing.
+        let driver = ClaudeDriver::new(LiveStore::File, endpoints());
+        run_profile(&driver, &env, 8, &login()).unwrap();
+
+        // Now the keychain is locked. The child `claude` reads the same
+        // plaintext seed in that state, so the profile's credential is
+        // readable — failing here would lose a rotation over a lock.
+        let broken = ClaudeDriver::new(
+            LiveStore::Keychain(std::sync::Arc::new(BrokenSecurity)),
+            endpoints(),
+        );
+        let read = broken.read_profile_login(&env, 8).unwrap().unwrap();
+        assert!(read.bytes.contains("rt-1"));
+        assert!(read.bytes.contains("you@example.com"));
+
+        // With no seed to fall back to either, the answer is a plain absence.
+        assert!(broken.read_profile_login(&env, 9).unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_config_seed_completes_onboarding_and_keeps_existing_keys() {
+        let home = temp_home();
+        let env = env_with(&home, [("USER", "tester")]);
+        let driver = ClaudeDriver::new(LiveStore::File, endpoints());
+
+        // The user's real config, which is where the profile inherits its theme.
+        fs::write(home.path().join(".claude.json"), r#"{"theme":"light"}"#).unwrap();
+        // A profile that already ran: its own history must survive a re-seed.
+        let dir = env.home.join("profiles/claude/4");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".claude.json"), r#"{"numStartups":3}"#).unwrap();
+
+        run_profile(&driver, &env, 4, &login()).unwrap();
+
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(".claude.json")).unwrap()).unwrap();
+        // Load-bearing: without both of these claude runs its onboarding flow
+        // and the igniter never returns.
+        assert_eq!(config["hasCompletedOnboarding"], Value::Bool(true));
+        assert_eq!(config["theme"], "light");
+        assert_eq!(config["numStartups"], 3);
+        assert_eq!(config["oauthAccount"]["emailAddress"], "you@example.com");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join(".claude.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // No theme to inherit: cswap's own default, never an absent key.
+        let bare = temp_home();
+        let bare_env = env_with(&bare, [("USER", "tester")]);
+        run_profile(&driver, &bare_env, 4, &login()).unwrap();
+        let config: Value = serde_json::from_str(
+            &fs::read_to_string(bare_env.home.join("profiles/claude/4/.claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["theme"], "dark");
     }
 
     #[cfg(unix)]

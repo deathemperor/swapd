@@ -1,0 +1,9 @@
+{
+  "access_token": "at-2",
+  "refresh_token": "rt-2",
+  "expires_in": 28800,
+  "scope": "user:inference user:profile",
+  "token_type": "Bearer",
+  "account": {"uuid": "acc-0001", "email_address": "you@example.com"},
+  "organization": {"uuid": "org-0000"}
+}

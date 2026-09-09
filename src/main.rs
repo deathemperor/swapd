@@ -143,32 +143,15 @@ fn doctor(json: bool) -> Result<()> {
 }
 
 /// Find the `claude` binary on PATH or in a set of well-known install locations.
+///
+/// One lookup, shared with the Claude driver's `installed()` and its igniter
+/// (`driver::claude::run::find_claude`), so doctor cannot disagree with what a
+/// run would actually execute.
 fn locate_claude() -> (bool, Option<String>) {
-    if let Some(path) = find_on_path("claude") {
-        return (true, Some(path));
-    }
     let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.claude/local/claude"),
-        format!("{home}/.local/bin/claude"),
-        "/opt/homebrew/bin/claude".to_string(),
-        "/usr/local/bin/claude".to_string(),
-    ];
-    for candidate in candidates {
-        if Path::new(&candidate).is_file() {
-            return (true, Some(candidate));
-        }
+    match driver::claude::run::find_claude(std::env::var("PATH").ok().as_deref(), Path::new(&home))
+    {
+        Some(path) => (true, Some(path.to_string_lossy().into_owned())),
+        None => (false, None),
     }
-    (false, None)
-}
-
-fn find_on_path(bin: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
 }

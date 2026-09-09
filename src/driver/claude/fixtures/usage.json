@@ -1,0 +1,36 @@
+{
+  "five_hour": {
+    "utilization": 12.5,
+    "resets_at": "2026-09-09T15:59:59Z"
+  },
+  "seven_day": {
+    "utilization": 61.0,
+    "resets_at": "2026-09-15T10:59:59Z"
+  },
+  "extra_usage": {
+    "is_enabled": true,
+    "used_credits": 1234,
+    "monthly_limit": 5000,
+    "utilization": 24.68,
+    "currency": "USD",
+    "resets_at": "2026-10-01T00:00:00Z"
+  },
+  "limits": [
+    {
+      "scope": {"model": {"display_name": "Fable"}},
+      "percent": 29.0,
+      "resets_at": "2026-09-15T10:59:59Z",
+      "weekly_scoped": true
+    },
+    {
+      "scope": {"model": {"display_name": "Sonnet"}},
+      "percent": 4,
+      "resets_at": "2026-09-15T10:59:59Z",
+      "weekly_scoped": true
+    },
+    {
+      "scope": {"organization": {"uuid": "org-0000"}},
+      "percent": 88.0
+    }
+  ]
+}

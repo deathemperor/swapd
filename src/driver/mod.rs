@@ -13,8 +13,6 @@ use crate::errors::{ErrorCode, SwapdError};
 use crate::paths::Home;
 
 /// The CLI's credential blob, opaque to core.
-// Constructed by Task 6's Claude driver (`read_live`/`write_live`/`refresh`).
-#[allow(dead_code)]
 pub struct Login {
     pub bytes: String,
 }
@@ -46,8 +44,6 @@ impl Login {
     }
 }
 
-// Constructed by Task 6's Claude driver `identity()`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Identity {
     pub email: String,
@@ -57,15 +53,14 @@ pub struct Identity {
     pub uuid: Option<String>,
 }
 
-// Constructed by Task 6's Claude driver `usage()`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Usage {
     pub windows: Vec<crate::contract::Window>,
     pub fetched_at: f64,
 }
 
-// Variants are produced by Task 6's Claude driver / Task 8's verbs.
+// `Unsupported` has no producer yet: it is the answer a capability-gated verb
+// gives, and the verbs are Task 8's.
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
@@ -134,12 +129,24 @@ impl Env {
 
 /// Per-slot environment for `run`/`ignite`: env overrides plus a working
 /// dir, with a cleanup hook that runs on drop (e.g. removing a temp dir).
-// Constructed by Task 6's Claude driver `run_profile()` / Task 8's `run` verb.
-#[allow(dead_code)]
 pub struct RunProfile {
     pub env: Vec<(String, String)>,
     pub dir: PathBuf,
     cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl RunProfile {
+    /// A profile that outlives the run: the Claude driver's per-slot profile
+    /// directories persist (they hold the slot's credential and its copied
+    /// customizations), so there is nothing to clean up. A driver whose profile
+    /// is a temp dir sets `cleanup` instead.
+    pub fn new(env: Vec<(String, String)>, dir: PathBuf) -> Self {
+        Self {
+            env,
+            dir,
+            cleanup: None,
+        }
+    }
 }
 
 impl Drop for RunProfile {
@@ -152,8 +159,6 @@ impl Drop for RunProfile {
 
 /// What a driver supports, so callers can gate verbs on capability rather
 /// than on provider identity.
-// Constructed by Task 6's Claude driver `capabilities()`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Caps {
     pub ignite: bool,
@@ -163,8 +168,9 @@ pub struct Caps {
     pub run: bool,
 }
 
-// Implemented by Task 6's Claude driver, the trait's first (and phase-1
-// only) implementor.
+// The trait is fully implemented (`driver::claude`) but nothing *calls* it
+// until Task 8's verbs; the allow seeds the dead-code analysis so the whole
+// driver behind it counts as live.
 #[allow(dead_code)]
 pub trait Driver: Send + Sync {
     fn id(&self) -> &'static str; // "claude"
@@ -183,12 +189,10 @@ pub trait Driver: Send + Sync {
 }
 
 /// All known provider drivers.
-// Consumed by Task 8's verbs once Task 6 registers a driver; the
-// registry_is_empty_until_drivers_land test exercises it meanwhile.
+// Consumed by Task 8's verbs; the tests below exercise it meanwhile.
 #[allow(dead_code)]
 pub fn registry() -> Vec<Box<dyn Driver>> {
-    // Task 6 registers the Claude driver
-    Vec::new()
+    vec![Box::new(claude::live::ClaudeDriver::default_for_platform())]
 }
 
 // Consumed by Task 8's verbs.
@@ -231,8 +235,26 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_empty_until_drivers_land() {
-        assert!(registry().is_empty());
-        assert!(by_id("claude").is_none());
+    fn registry_holds_the_claude_driver() {
+        let drivers = registry();
+        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers[0].id(), "claude");
+        assert!(by_id("claude").is_some());
+        assert!(by_id("codex").is_none());
+    }
+
+    #[test]
+    fn claude_supports_every_verb() {
+        let caps = by_id("claude").unwrap().capabilities();
+        assert_eq!(
+            caps,
+            Caps {
+                ignite: true,
+                add_token: true,
+                prefer: true,
+                refresh: true,
+                run: true,
+            }
+        );
     }
 }

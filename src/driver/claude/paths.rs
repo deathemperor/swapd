@@ -24,7 +24,7 @@ pub const DEFAULT_SERVICE: &str = "Claude Code-credentials";
 ///
 /// `env.home` is *swapd's* own directory, not `$HOME`; Claude Code's paths
 /// hang off `$HOME`. A missing/empty `HOME` is an error, never a panic.
-fn home(env: &Env) -> Result<PathBuf, DriverError> {
+pub fn home(env: &Env) -> Result<PathBuf, DriverError> {
     match env.vars.get("HOME") {
         Some(h) if !h.is_empty() => Ok(PathBuf::from(h)),
         _ => Err(DriverError::Invalid("HOME is not set".to_string())),

@@ -1,0 +1,4 @@
+{
+  "account": {"uuid": "acc-0001", "email": "you@example.com", "full_name": "Example User"},
+  "organization": {"uuid": "org-0000", "name": "Example Org"}
+}

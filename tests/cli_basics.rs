@@ -69,8 +69,10 @@ fn doctor_without_home_or_swapd_home_is_a_json_error_not_a_panic() {
     let out = Command::cargo_bin("swapd")
         .unwrap()
         .env_remove("HOME")
-        // Windows resolves the home from USERPROFILE, not HOME.
-        .env_remove("USERPROFILE")
+        // The platform defaults: %APPDATA%\swapd on Windows, $XDG_DATA_HOME
+        // on Linux — every route to a data dir is closed, not only $HOME.
+        .env_remove("APPDATA")
+        .env_remove("XDG_DATA_HOME")
         .env_remove("SWAPD_HOME")
         .args(["doctor", "--json"])
         .output()

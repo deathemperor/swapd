@@ -1,5 +1,7 @@
 //! `swapd list` — every provider's accounts, their usage, and the rotation.
 
+use std::time::Duration;
+
 use crate::contract::{ListPayload, ProviderView, UsageStatus, WindowKind};
 use crate::core::collect::{collect, CollectOpts};
 use crate::ctx::Ctx;
@@ -8,9 +10,16 @@ use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
 
 pub fn run(ctx: &Ctx, drivers: &[Box<dyn Driver>]) -> Result<ListPayload> {
+    // A status verb behind the app's pump: it degrades
+    // (`activeUnreadable: switch-in-progress`) after one second rather than
+    // stalling the pump for the default `engine.lock` timeout.
+    let opts = CollectOpts {
+        lock_wait: Duration::from_secs(1),
+        ..CollectOpts::default()
+    };
     let providers = drivers
         .iter()
-        .map(|driver| collect(ctx, driver.as_ref(), &CollectOpts::default()))
+        .map(|driver| collect(ctx, driver.as_ref(), &opts))
         .collect::<Result<Vec<_>>>()?;
     Ok(ListPayload {
         schema_version: output::SCHEMA_VERSION,

@@ -36,7 +36,6 @@ use crate::secrets::slot_key;
 const MAX_FETCH_THREADS: usize = 4;
 
 /// What a caller wants fetched this pass, on top of what the store's plans say.
-#[derive(Default)]
 pub struct CollectOpts {
     /// Slots to fetch regardless of freshness or plan (`refresh --slot n`).
     /// Backoff, claims and the dead-token quarantine still apply.
@@ -50,6 +49,23 @@ pub struct CollectOpts {
     /// store. Whether a listed slot is actually fetched is still `reserve`'s
     /// call — plans, freshness, backoff and claims all apply.
     pub only: Option<Vec<u32>>,
+    /// How long to wait for `engine.lock` before degrading to
+    /// `active_unreadable: switch-in-progress` (step 1 of `collect`). `list`
+    /// is a status verb behind a pump that must not stall, so it waits a
+    /// short beat instead of the default; every other caller keeps the full
+    /// `slots::LOCK_TIMEOUT` so a real switch has time to land.
+    pub lock_wait: std::time::Duration,
+}
+
+impl Default for CollectOpts {
+    fn default() -> Self {
+        CollectOpts {
+            force_slots: Vec::new(),
+            all_stale: false,
+            only: None,
+            lock_wait: slots::LOCK_TIMEOUT,
+        }
+    }
 }
 
 /// One slot's state for this pass: the credential it would be fetched with, and
@@ -91,7 +107,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     // generation. The lock is the fence; a switch in flight is a normal state
     // for a status verb, so failing to take it degrades the pass instead of
     // failing it.
-    let engine = match FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT) {
+    let engine = match FileLock::acquire(&ctx.home.engine_lock_base(), opts.lock_wait) {
         Ok(lock) => Some(lock),
         Err(e) if e.code == ErrorCode::Locked => None,
         Err(e) => return Err(e),

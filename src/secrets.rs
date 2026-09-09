@@ -163,12 +163,16 @@ impl Secrets for MemorySecrets {
     }
 }
 
-/// Ported sticky per-process fallback: once `primary` errors, every later call in this
-/// process goes straight to `fallback`. A `None` result from `primary` is not a
-/// failure. `delete` always fans out to both backends (so a plaintext copy the file
-/// backend may hold can't outlive the keychain item, and vice versa) and reports
-/// `fallback`'s result; a successful `set` on `primary` also clears any stale copy in
-/// `fallback` left by an earlier degraded run, ignoring that delete's result.
+/// Ported sticky per-process fallback: once `primary` errors with
+/// `ErrorCode::KeychainUnavailable` — a backend failure, not a caller mistake — every
+/// later call in this process goes straight to `fallback`. Any other error
+/// (`InvalidInput`, `Io`, …) propagates as-is without degrading: it means the call was
+/// wrong, not that the backend is unreachable. A `None` result from `primary` is not a
+/// failure either. `delete` fans out to both backends best-effort (so a plaintext copy
+/// the file backend may hold can't outlive the keychain item, and vice versa) but
+/// reports `primary`'s result while not degraded, `fallback`'s once degraded. A
+/// successful `set` on `primary` also clears any stale copy in `fallback` left by an
+/// earlier degraded run, ignoring that delete's result.
 // Not wired into a verb yet; `default_secrets` builds one for the macOS default.
 #[allow(dead_code)]
 pub struct StickySecrets {
@@ -193,10 +197,14 @@ impl Secrets for StickySecrets {
         if self.degraded.load(Ordering::SeqCst) {
             return self.fallback.get(key);
         }
-        self.primary.get(key).or_else(|_| {
-            self.degraded.store(true, Ordering::SeqCst);
-            self.fallback.get(key)
-        })
+        match self.primary.get(key) {
+            Ok(v) => Ok(v),
+            Err(e) if e.code == ErrorCode::KeychainUnavailable => {
+                self.degraded.store(true, Ordering::SeqCst);
+                self.fallback.get(key)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -212,10 +220,11 @@ impl Secrets for StickySecrets {
                 let _ = self.fallback.delete(key);
                 Ok(())
             }
-            Err(_) => {
+            Err(e) if e.code == ErrorCode::KeychainUnavailable => {
                 self.degraded.store(true, Ordering::SeqCst);
                 self.fallback.set(key, value)
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -223,12 +232,17 @@ impl Secrets for StickySecrets {
         if self.degraded.load(Ordering::SeqCst) {
             return self.fallback.delete(key);
         }
-        // Fan out to both backends regardless of `primary`'s outcome, so a copy in
-        // one can't outlive the other; `fallback`'s result is the one reported.
-        if self.primary.delete(key).is_err() {
-            self.degraded.store(true, Ordering::SeqCst);
+        let primary_result = self.primary.delete(key);
+        if let Err(e) = &primary_result {
+            if e.code == ErrorCode::KeychainUnavailable {
+                self.degraded.store(true, Ordering::SeqCst);
+            }
         }
-        self.fallback.delete(key)
+        // Best-effort fan-out: a copy in the fallback shouldn't outlive a keychain
+        // item `primary` just deleted, but its result never overrides `primary`'s —
+        // that's the one the caller asked about.
+        let _ = self.fallback.delete(key);
+        primary_result
     }
 }
 
@@ -354,6 +368,41 @@ mod tests {
         assert_eq!(sticky.get("k").unwrap(), Some("tok-1".to_string()));
     }
 
+    struct InvalidInputSecrets;
+    impl Secrets for InvalidInputSecrets {
+        fn get(&self, _key: &str) -> Result<Option<String>> {
+            Err(SwapdError::new(ErrorCode::InvalidInput, "bad"))
+        }
+        fn set(&self, _key: &str, _value: &str) -> Result<()> {
+            Err(SwapdError::new(ErrorCode::InvalidInput, "bad"))
+        }
+        fn delete(&self, _key: &str) -> Result<()> {
+            Err(SwapdError::new(ErrorCode::InvalidInput, "bad"))
+        }
+    }
+
+    #[test]
+    fn sticky_does_not_degrade_on_invalid_input() {
+        let fallback_mem = Arc::new(MemorySecrets::new());
+        let sticky = StickySecrets::new(
+            Box::new(InvalidInputSecrets),
+            Box::new(SharedSecrets(fallback_mem.clone())),
+        );
+
+        let err = sticky.set("k", "v").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            fallback_mem.get("k").unwrap(),
+            None,
+            "a caller error must not reach the fallback"
+        );
+
+        // Not degraded: a later call still hits the primary, so it fails the same way
+        // rather than silently succeeding against the (empty) fallback.
+        let err = sticky.get("k").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
     struct CountingFailingSecrets(Arc<Mutex<u32>>);
     impl Secrets for CountingFailingSecrets {
         fn get(&self, _key: &str) -> Result<Option<String>> {
@@ -448,6 +497,9 @@ mod tests {
             Box::new(SharedSecrets(primary_mem.clone())),
             Box::new(SharedSecrets(fallback_mem.clone())),
         );
+        // `MemorySecrets::delete` never errors, so this is `Ok(())` regardless of
+        // whether `StickySecrets::delete` reports `primary`'s or `fallback`'s result —
+        // this test only checks that both backends are actually cleared.
         sticky.delete("k").unwrap();
 
         assert_eq!(primary_mem.get("k").unwrap(), None);

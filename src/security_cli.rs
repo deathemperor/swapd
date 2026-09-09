@@ -321,12 +321,13 @@ mod tests {
     #[test]
     #[ignore]
     fn security_real() {
+        // Best-effort only: the cleanup delete is explicitly asserted at the end of
+        // the test body below. A `.expect()` here would double-panic (and hide the
+        // original assertion) if the body itself already failed.
         struct Cleanup;
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                RealSecurity
-                    .delete("swapd test", "swapd-test-account")
-                    .expect("cleanup delete must succeed (0 or already-absent 44)");
+                let _ = RealSecurity.delete("swapd test", "swapd-test-account");
             }
         }
         let _cleanup = Cleanup;

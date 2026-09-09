@@ -68,7 +68,7 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
 | `SWAPD_URL_ANTHROPIC_API` | overrides the Anthropic API base URL |
 | `SWAPD_URL_PLATFORM` | overrides the platform (console) base URL |
 | `SWAPD_CLAUDE_CLI` | the `claude` binary to run, overriding PATH lookup |
-| `SWAPD_SUPERVISED` | set by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF |
+| `SWAPD_SUPERVISED` | set to `1` by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF |
 
 ## Storage
 

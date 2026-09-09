@@ -63,14 +63,23 @@ fn doctor_without_home_or_swapd_home_is_a_json_error_not_a_panic() {
 /// `SWAPD_SECRETS=file` (the CI job sets it too) so a run through the real
 /// binary never falls through to the platform default and touches the
 /// developer's login keychain. Every other suite already relies on this
-/// same wiring; this test names the guard explicitly.
+/// same wiring; this test names the guard explicitly. Same hermetic contract
+/// as the other suites (`SWAPD_LIVE_STORE=file`, a temp `HOME`,
+/// `CLAUDE_CONFIG_DIR` removed) even though `add-token` never reaches the
+/// live store today — so a later change that makes it do so fails loud here
+/// instead of quietly hitting the real keychain.
 #[test]
 fn add_token_with_swapd_secrets_file_never_touches_the_login_keychain() {
     let tmp = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
     let out = Command::cargo_bin("swapd")
         .unwrap()
         .env("SWAPD_HOME", tmp.path())
         .env("SWAPD_SECRETS", "file")
+        .env("SWAPD_LIVE_STORE", "file")
+        .env("HOME", claude_home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR")
         .args(["add-token", "-", "--json"])
         .write_stdin("sk-ant-api03-secret-key\n")
         .output()

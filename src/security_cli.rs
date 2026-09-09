@@ -23,28 +23,45 @@ fn keychain_unavailable() -> SwapdError {
 // Not wired into a verb yet.
 #[allow(dead_code)]
 pub trait SecurityCli: Send + Sync {
-    /// `security find-generic-password -s S [-a A] -w`; exit 44 (not found) -> `Ok(None)`.
+    /// `security find-generic-password -s S [-a A] -g`; exit 44 (not found) -> `Ok(None)`.
+    /// Reads via `-g`, not `-w`: `-w` prints the raw value only when every byte is
+    /// printable ASCII and otherwise prints its hex encoding, indistinguishably from a
+    /// secret that legitimately looks like hex (e.g. a 64-char API key) — `-g`'s
+    /// `password:` line format (`"…"` vs `0x<hex>  "…"`) is unambiguous instead.
     fn find(&self, service: &str, account: Option<&str>) -> Result<Option<String>>;
-    /// Never puts `value` on argv (visible in `ps`): runs `security -i` and writes the
-    /// command line to its stdin.
+    /// Never puts `value` on argv (visible in `ps`): runs `security -i` and writes
+    /// `add-generic-password -U -s "S" -a "A" -X <hex>` to its stdin, `value` hex-encoded
+    /// so spaces, quotes, newlines and non-ASCII bytes in it can't break the one-line
+    /// command syntax.
     fn add(&self, service: &str, account: &str, value: &str) -> Result<()>;
     fn delete(&self, service: &str, account: &str) -> Result<()>;
 }
 
-/// Runs `child` to completion, polling `try_wait` and sleeping between polls; kills it
-/// (and reports `KeychainUnavailable`) if `TIMEOUT` elapses first. Returns the exit code
-/// and captured stdout.
-// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
-#[allow(dead_code)]
-fn wait_for(mut child: Child) -> Result<(i32, String)> {
-    let mut stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
+/// Reads a pipe to completion on a background thread, so it never blocks the
+/// `try_wait` poll loop below on a full pipe buffer.
+fn read_to_string_in_background(
+    pipe: Option<impl Read + Send + 'static>,
+) -> std::thread::JoinHandle<String> {
+    let mut pipe = pipe;
+    std::thread::spawn(move || {
         let mut buf = String::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_string(&mut buf);
+        if let Some(p) = pipe.as_mut() {
+            let _ = p.read_to_string(&mut buf);
         }
         buf
-    });
+    })
+}
+
+/// Runs `child` to completion, polling `try_wait` and sleeping between polls; kills it
+/// (and reports `KeychainUnavailable`) if `TIMEOUT` elapses first. Returns the exit
+/// code, captured stdout and captured stderr — `security find-generic-password -g`
+/// puts the `password:` line on stderr, so both are captured, though neither is ever
+/// put in an error message (it can contain the account, or the encoded secret).
+// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
+#[allow(dead_code)]
+fn wait_for(mut child: Child) -> Result<(i32, String, String)> {
+    let stdout_reader = read_to_string_in_background(child.stdout.take());
+    let stderr_reader = read_to_string_in_background(child.stderr.take());
 
     let start = Instant::now();
     let status = loop {
@@ -60,17 +77,62 @@ fn wait_for(mut child: Child) -> Result<(i32, String)> {
             }
         }
     };
-    let stdout = reader.join().unwrap_or_default();
-    Ok((status.code().unwrap_or(-1), stdout))
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
-/// Quotes `s` for `security -i`'s command line: wraps it in double quotes, escaping
-/// embedded backslashes and quotes.
+/// Quotes `service`/`account` for `security -i`'s command line: wraps in double quotes,
+/// escaping embedded backslashes. Callers must reject embedded `"`/`\n`/`\r` first
+/// (`validate_component` below) — this only protects against a stray backslash.
 // Not wired into a verb yet; `RealSecurity::add` (macOS only, below) uses this.
 #[allow(dead_code)]
 fn quote(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped = s.replace('\\', "\\\\");
     format!("\"{escaped}\"")
+}
+
+/// Rejects a keychain `service`/`account` component that would break the `security -i`
+/// one-line command syntax. The secret value itself needs no such check: it goes over
+/// `-X <hex>`, which tolerates any byte.
+// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
+#[allow(dead_code)]
+fn validate_component(s: &str) -> Result<()> {
+    if s.contains('"') || s.contains('\n') || s.contains('\r') {
+        return Err(SwapdError::new(
+            ErrorCode::InvalidInput,
+            "invalid keychain service or account",
+        ));
+    }
+    Ok(())
+}
+
+/// Parses the `password: …` line `security find-generic-password -g` writes to
+/// stderr. Verified against `/usr/bin/security` on Darwin 25.6 (macOS 26): the line is
+/// `password: "<content>"` when every byte of the value is printable ASCII with no
+/// backslash, `password: 0x<HEX>  "<preview>"` otherwise (the preview is discarded —
+/// only the hex is decoded), or `password: ` with nothing after it for an empty value.
+/// Never echoes `stderr` on a parse failure: it can contain the account name.
+// Not wired into a verb yet; `RealSecurity::find` (macOS only, below) uses this.
+#[allow(dead_code)]
+fn parse_password_line(stderr: &str) -> Result<String> {
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("password: "))
+        .ok_or_else(keychain_unavailable)?;
+    let rest = &line["password: ".len()..];
+    if rest.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(hex_token) = rest.strip_prefix("0x") {
+        let hex_digits = hex_token.split_whitespace().next().unwrap_or("");
+        let bytes = hex::decode(hex_digits).map_err(|_| keychain_unavailable())?;
+        return String::from_utf8(bytes).map_err(|_| keychain_unavailable());
+    }
+    if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+        return Ok(rest[1..rest.len() - 1].to_string());
+    }
+    Err(keychain_unavailable())
 }
 
 // Not wired into a verb yet; Task 6's Claude driver constructs this to read/write the
@@ -83,8 +145,8 @@ pub struct RealSecurity;
 #[allow(dead_code)]
 #[cfg(target_os = "macos")]
 impl RealSecurity {
-    fn run(cmd: &mut Command, stdin_data: Option<&str>) -> Result<(i32, String)> {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    fn run(cmd: &mut Command, stdin_data: Option<&str>) -> Result<(i32, String, String)> {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(if stdin_data.is_some() {
             Stdio::piped()
         } else {
@@ -106,30 +168,36 @@ impl RealSecurity {
 #[cfg(target_os = "macos")]
 impl SecurityCli for RealSecurity {
     fn find(&self, service: &str, account: Option<&str>) -> Result<Option<String>> {
+        validate_component(service)?;
+        if let Some(account) = account {
+            validate_component(account)?;
+        }
         let mut cmd = Command::new("/usr/bin/security");
         cmd.arg("find-generic-password").arg("-s").arg(service);
         if let Some(account) = account {
             cmd.arg("-a").arg(account);
         }
-        cmd.arg("-w");
-        let (code, stdout) = Self::run(&mut cmd, None)?;
+        cmd.arg("-g");
+        let (code, _stdout, stderr) = Self::run(&mut cmd, None)?;
         match code {
             44 => Ok(None),
-            0 => Ok(Some(stdout.trim_end_matches('\n').to_string())),
+            0 => parse_password_line(&stderr).map(Some),
             _ => Err(keychain_unavailable()),
         }
     }
 
     fn add(&self, service: &str, account: &str, value: &str) -> Result<()> {
+        validate_component(service)?;
+        validate_component(account)?;
         let mut cmd = Command::new("/usr/bin/security");
         cmd.arg("-i");
         let line = format!(
-            "add-generic-password -U -s {} -a {} -w {}\n",
+            "add-generic-password -U -s {} -a {} -X {}\n",
             quote(service),
             quote(account),
-            quote(value)
+            hex::encode(value.as_bytes())
         );
-        let (code, _) = Self::run(&mut cmd, Some(&line))?;
+        let (code, _, _) = Self::run(&mut cmd, Some(&line))?;
         if code != 0 {
             return Err(keychain_unavailable());
         }
@@ -137,13 +205,15 @@ impl SecurityCli for RealSecurity {
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
+        validate_component(service)?;
+        validate_component(account)?;
         let mut cmd = Command::new("/usr/bin/security");
         cmd.arg("delete-generic-password")
             .arg("-s")
             .arg(service)
             .arg("-a")
             .arg(account);
-        let (code, _) = Self::run(&mut cmd, None)?;
+        let (code, _, _) = Self::run(&mut cmd, None)?;
         if code != 0 {
             return Err(keychain_unavailable());
         }
@@ -218,33 +288,80 @@ mod tests {
         assert_eq!(fake.find("swapd", Some("claude:1")).unwrap(), None);
     }
 
-    // Exercises the real macOS keychain by hand: `cargo test -- --ignored real_security_roundtrip`.
-    // Uses service "swapd-test" and deletes its item at the end (even on panic) so it
-    // never leaves a trace.
+    // Exercises the real macOS keychain by hand: `cargo test -- --ignored security_real`.
+    // Uses a service containing a space and deletes its item at the end (even on
+    // panic) so it never leaves a trace. Round-trips three values byte-exact to lock in
+    // both `security -g` `password:` line shapes and the ambiguity between them:
+    // a JSON blob (forces the `0x<hex>` branch: has a newline and a non-ASCII byte),
+    // a value that looks like hex (`deadbeef`: printable-ASCII branch — the case a
+    // `-w`-based read would have silently corrupted by re-decoding it as hex), and a
+    // value with a backslash and a quote (printable-ASCII branch; backslash is the only
+    // byte the `-i` line quoting has to escape).
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
-    fn real_security_roundtrip() {
+    fn security_real() {
         struct Cleanup;
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = RealSecurity.delete("swapd-test", "swapd-test-account");
+                let _ = RealSecurity.delete("swapd test", "swapd-test-account");
             }
         }
         let _cleanup = Cleanup;
 
         let cli = RealSecurity;
-        let service = "swapd-test";
+        let service = "swapd test";
         let account = "swapd-test-account";
-        // Stresses the `security -i` quoting: an embedded space and double quote.
-        let value = r#"tok real "1""#;
 
-        cli.add(service, account, value).unwrap();
-        assert_eq!(
-            cli.find(service, Some(account)).unwrap(),
-            Some(value.to_string())
-        );
+        for value in [
+            "{\"a\": \"b c\",\n\"e\": \"🩸\"}",
+            "deadbeef",
+            "back\\slash \"quote\"",
+        ] {
+            cli.add(service, account, value).unwrap();
+            assert_eq!(
+                cli.find(service, Some(account)).unwrap(),
+                Some(value.to_string()),
+                "roundtrip failed for {value:?}"
+            );
+        }
         cli.delete(service, account).unwrap();
         assert_eq!(cli.find(service, Some(account)).unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn add_rejects_quote_in_service() {
+        let err = RealSecurity
+            .add("swapd\"evil", "account", "value")
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn parse_password_line_printable_branch() {
+        let stderr = "keychain: \"x\"\npassword: \"has \"quotes\" and space\"\nattributes:\n";
+        assert_eq!(
+            parse_password_line(stderr).unwrap(),
+            "has \"quotes\" and space"
+        );
+    }
+
+    #[test]
+    fn parse_password_line_hex_branch_ignores_preview() {
+        let stderr = "password: 0x68656c6c6f  \"hello\"\n";
+        assert_eq!(parse_password_line(stderr).unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_password_line_empty_value() {
+        let stderr = "password: \n";
+        assert_eq!(parse_password_line(stderr).unwrap(), "");
+    }
+
+    #[test]
+    fn parse_password_line_missing_line_is_keychain_unavailable() {
+        let err = parse_password_line("no password here\n").unwrap_err();
+        assert_eq!(err.code, ErrorCode::KeychainUnavailable);
     }
 }

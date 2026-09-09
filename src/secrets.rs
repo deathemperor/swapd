@@ -202,15 +202,17 @@ impl Secrets for StickySecrets {
     }
 }
 
-/// `SWAPD_SECRETS` = `file` | `memory` overrides (tests, CI); else macOS:
-/// `Sticky(Security, File)`; Linux/Windows: `File`.
+/// `SWAPD_SECRETS` = `file` | `memory` overrides (tests, CI); unset -> macOS
+/// `Sticky(Security, File)`, elsewhere `File`. An unrecognized (non-empty, non-`file`,
+/// non-`memory`) value also falls back to `File` — never silently to the keychain.
 // Not wired into a verb yet; later tasks (login, use) call this to build their store.
 #[allow(dead_code)]
 pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
-    match std::env::var("SWAPD_SECRETS").as_deref() {
-        Ok("file") => Box::new(FileSecrets::new(home.credentials_dir())),
-        Ok("memory") => Box::new(MemorySecrets::new()),
-        _ => platform_default(home),
+    match std::env::var("SWAPD_SECRETS") {
+        Ok(v) if v == "file" => Box::new(FileSecrets::new(home.credentials_dir())),
+        Ok(v) if v == "memory" => Box::new(MemorySecrets::new()),
+        Ok(_) => Box::new(FileSecrets::new(home.credentials_dir())),
+        Err(_) => platform_default(home),
     }
 }
 
@@ -355,6 +357,22 @@ mod tests {
         secrets.set("claude:1", "tok-1").unwrap();
         std::env::remove_var("SWAPD_SECRETS");
 
+        let path = home.credentials_dir().join("claude_1");
+        assert_eq!(fs::read_to_string(path).unwrap(), "tok-1");
+    }
+
+    #[test]
+    fn env_override_unrecognized_falls_back_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home {
+            root: dir.path().to_path_buf(),
+        };
+        std::env::set_var("SWAPD_SECRETS", "bogus");
+        let secrets = default_secrets(&home);
+        secrets.set("claude:1", "tok-1").unwrap();
+        std::env::remove_var("SWAPD_SECRETS");
+
+        // Never the keychain: the value must land in the file backend.
         let path = home.credentials_dir().join("claude_1");
         assert_eq!(fs::read_to_string(path).unwrap(), "tok-1");
     }

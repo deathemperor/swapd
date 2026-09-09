@@ -78,22 +78,19 @@ impl Driver for ClaudeDriver {
 
     /// This login's usage windows.
     ///
-    /// An expired (or nearly expired) access token is refreshed first, since the
-    /// usage endpoint would only answer 401 — cswap's `_fetch_active_usage`
-    /// order. The rotated login is used for the request and then dropped: the
-    /// trait returns `Usage` alone, so a caller that wants to keep the rotation
-    /// must call `refresh()` itself and persist the result.
+    /// An expired (or nearly expired) access token is reported as
+    /// `NeedsRefresh`, never refreshed here. A Claude refresh token is
+    /// single-use: a refresh performed inside `usage()` would rotate the
+    /// lineage into a `Login` the caller never receives, so the next call would
+    /// POST a token the server has already spent and earn `invalid_grant` on a
+    /// live account. The caller refreshes, persists, and calls again.
     ///
     /// `fetched_at` is read once and used both for the pace baseline and for the
     /// snapshot's own timestamp, so the two cannot drift apart.
     fn usage(&self, login: &Login) -> Result<Usage, DriverError> {
-        let refreshed;
-        let login = if oauth::is_expired(login, oauth::now_ms()) {
-            refreshed = oauth::refresh(&self.endpoints, login)?;
-            &refreshed
-        } else {
-            login
-        };
+        if oauth::is_expired(login, oauth::now_ms()) {
+            return Err(DriverError::NeedsRefresh);
+        }
         let access_token = oauth::access_token(login)
             .ok_or_else(|| DriverError::Invalid("no access token".to_string()))?;
         let raw = usage::fetch(&self.endpoints, &access_token)?;
@@ -107,7 +104,7 @@ impl Driver for ClaudeDriver {
         })
     }
 
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError> {
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<Option<Login>, DriverError> {
         run::ignite(self, env, slot, login)
     }
 

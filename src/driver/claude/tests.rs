@@ -274,7 +274,7 @@ mod http_tests {
         let rotated = oauth::refresh(
             &endpoints_at(&server),
             &login(
-                r#"{"claudeAiOauth":{"accessToken":"at-1","refreshToken":"rt-1"},"oauthAccount":{"emailAddress":"you@example.com"}}"#,
+                r#"{"claudeAiOauth":{"accessToken":"at-1","refreshToken":"rt-1"},"oauthAccount":{"emailAddress":"stale@example.com","organizationName":"Example Org"}}"#,
             ),
         )
         .unwrap();
@@ -286,8 +286,38 @@ mod http_tests {
         assert_eq!(value["claudeAiOauth"]["scopes"][1], "user:profile");
         let expires_at = value["claudeAiOauth"]["expiresAt"].as_i64().unwrap();
         assert!(expires_at >= before + 28800 * 1000);
-        // Every sibling key rides through, the envelope's identity included.
+        // Every sibling key rides through, the envelope's identity included —
+        // and the response's own `account`/`organization` are folded into it
+        // under Claude Code's key names (`_parse_token_account`).
         assert_eq!(value["oauthAccount"]["emailAddress"], "you@example.com");
+        assert_eq!(value["oauthAccount"]["accountUuid"], "acc-0001");
+        assert_eq!(value["oauthAccount"]["organizationUuid"], "org-0000");
+        // Fields the response cannot know are preserved, not clobbered: the
+        // plan label depends on them.
+        assert_eq!(value["oauthAccount"]["organizationName"], "Example Org");
+    }
+
+    #[test]
+    fn refresh_without_a_token_account_leaves_the_envelope_alone() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            // Some responses carry no `account` object at all.
+            then.status(200)
+                .body(r#"{"access_token":"at-2","expires_in":28800}"#);
+        });
+
+        let rotated = oauth::refresh(
+            &endpoints_at(&server),
+            &login(
+                r#"{"claudeAiOauth":{"refreshToken":"rt-1"},"oauthAccount":{"emailAddress":"you@example.com"}}"#,
+            ),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&rotated.bytes).unwrap();
+        assert_eq!(value["claudeAiOauth"]["accessToken"], "at-2");
+        assert_eq!(value["oauthAccount"]["emailAddress"], "you@example.com");
+        assert!(value["oauthAccount"].get("accountUuid").is_none());
     }
 
     #[test]
@@ -324,20 +354,14 @@ mod http_tests {
     }
 
     #[test]
-    fn expired_login_is_refreshed_before_usage() {
+    fn expired_login_reports_needs_refresh() {
         let server = MockServer::start();
         let token = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/oauth/token")
-                .json_body_partial(r#"{"refresh_token":"rt-1"}"#.to_string());
+            when.method(POST).path("/v1/oauth/token");
             then.status(200).body(TOKEN_REFRESH);
         });
-        // The usage request must carry the ROTATED token: an expired one would
-        // only earn a 401.
         let usage_call = server.mock(|when, then| {
-            when.method(GET)
-                .path("/api/oauth/usage")
-                .header("authorization", "Bearer at-2");
+            when.method(GET).path("/api/oauth/usage");
             then.status(200).body(USAGE);
         });
 
@@ -347,15 +371,32 @@ mod http_tests {
             oauth::now_ms() - 1000
         ));
 
-        let usage = driver.usage(&expired).unwrap();
-        token.assert();
-        usage_call.assert();
-        assert_eq!(usage.windows.len(), 5);
-        assert!(usage.fetched_at > 0.0);
+        let err = driver.usage(&expired).unwrap_err();
+        assert!(matches!(err, DriverError::NeedsRefresh));
+        // Neither call was made: a refresh token is single-use, so rotating it
+        // into a `Login` the caller never receives would spend the lineage —
+        // the caller refreshes, persists, and calls again.
+        assert_eq!(token.hits(), 0);
+        assert_eq!(usage_call.hits(), 0);
     }
 
     #[test]
-    fn a_live_token_is_not_refreshed_before_usage() {
+    fn usage_401_reports_needs_refresh() {
+        let server = MockServer::start();
+        let denied = server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/usage");
+            then.status(401).body(r#"{"error":"unauthorized"}"#);
+        });
+
+        // The server's verdict on a token that looked live: same answer, same
+        // reason — swapd does not refresh behind the caller's back.
+        let err = usage::fetch(&endpoints_at(&server), "at-1").unwrap_err();
+        denied.assert();
+        assert!(matches!(err, DriverError::NeedsRefresh));
+    }
+
+    #[test]
+    fn a_live_token_goes_straight_to_usage() {
         let server = MockServer::start();
         let token = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -374,8 +415,10 @@ mod http_tests {
             oauth::now_ms() + 3_600_000
         ));
 
-        assert!(driver.usage(&fresh).is_ok());
-        // A single-use refresh token is not spent on a token that still works.
+        let usage = driver.usage(&fresh).unwrap();
+        assert_eq!(usage.windows.len(), 5);
+        assert!(usage.fetched_at > 0.0);
+        // `usage()` never touches the token endpoint at all.
         assert_eq!(token.hits(), 0);
     }
 

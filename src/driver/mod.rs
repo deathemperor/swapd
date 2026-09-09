@@ -72,6 +72,12 @@ pub enum DriverError {
     KeychainUnavailable,
     #[error("token dead")]
     TokenDead,
+    /// The access token is expired (or the server says so). A driver never
+    /// refreshes on its own — a Claude refresh token is single-use, so a
+    /// refresh whose result the caller cannot persist burns the lineage. The
+    /// caller refreshes, persists, and retries.
+    #[error("login needs refresh")]
+    NeedsRefresh,
     #[error("throttled")]
     Throttled { retry_after: Option<f64> },
     #[error("{0}")]
@@ -97,6 +103,9 @@ impl From<DriverError> for SwapdError {
                 SwapdError::new(ErrorCode::KeychainUnavailable, "keychain unavailable")
             }
             DriverError::TokenDead => SwapdError::new(ErrorCode::TokenDead, "token dead"),
+            DriverError::NeedsRefresh => {
+                SwapdError::new(ErrorCode::RefreshDenied, "login needs refresh")
+            }
             DriverError::Throttled { .. } => SwapdError::new(ErrorCode::Http, "throttled"),
             DriverError::Locked(s) => SwapdError::new(ErrorCode::Locked, s),
             DriverError::Io(e) => SwapdError::new(ErrorCode::Io, e.to_string()),
@@ -111,6 +120,7 @@ impl From<DriverError> for SwapdError {
 /// the process env captured once at startup.
 // Constructed by Task 6/8 call sites (`Env::current`); nothing calls it yet.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct Env {
     pub home: PathBuf,
     pub vars: HashMap<String, String>,
@@ -127,11 +137,33 @@ impl Env {
     }
 }
 
+/// Reads a run profile's credential back after the child exits (see
+/// `RunProfile::read_back`).
+pub type ReadBack = Box<dyn Fn() -> Result<Option<Login>, DriverError> + Send>;
+
 /// Per-slot environment for `run`/`ignite`: env overrides plus a working
 /// dir, with a cleanup hook that runs on drop (e.g. removing a temp dir).
 pub struct RunProfile {
+    /// Variables to set on the child.
     pub env: Vec<(String, String)>,
+    /// Variables to *remove* from the child. `env` can only add, and some
+    /// variables are dangerous precisely when inherited — an exported API key
+    /// makes the CLI bypass the account this profile selects (see the Claude
+    /// driver's `AUTH_OVERRIDE_ENV_VARS`).
+    pub unset: Vec<String>,
+    /// The profile's own directory. `ignite` deliberately runs elsewhere (an
+    /// empty cwd of swapd's own); Task 8's `run` verb reports this to the user.
+    #[allow(dead_code)]
     pub dir: PathBuf,
+    /// Reads the profile's credential back after the child exits, answering
+    /// `Some(login)` when the CLI rotated it in place.
+    ///
+    /// The CLI refreshes its own token as it runs and writes the new generation
+    /// into the profile, where nothing else would ever see it: a caller that
+    /// does not read it back leaves the slot's stored login one generation
+    /// behind, and Claude refresh tokens are single-use, so the stale one is
+    /// already spent.
+    pub read_back: Option<ReadBack>,
     cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -140,10 +172,12 @@ impl RunProfile {
     /// directories persist (they hold the slot's credential and its copied
     /// customizations), so there is nothing to clean up. A driver whose profile
     /// is a temp dir sets `cleanup` instead.
-    pub fn new(env: Vec<(String, String)>, dir: PathBuf) -> Self {
+    pub fn new(env: Vec<(String, String)>, unset: Vec<String>, dir: PathBuf) -> Self {
         Self {
             env,
+            unset,
             dir,
+            read_back: None,
             cleanup: None,
         }
     }
@@ -182,8 +216,16 @@ pub trait Driver: Send + Sync {
     fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError>;
     fn identity(&self, login: &Login) -> Result<Identity, DriverError>; // email, org, plan
     fn refresh(&self, login: &Login) -> Result<Login, DriverError>; // TokenDead on invalid_grant
-    fn usage(&self, login: &Login) -> Result<Usage, DriverError>; // windows[]; Throttled{retry_after}
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError>; // one minimal request as this login
+    /// windows[]; `Throttled{retry_after}` when rate-limited, `NeedsRefresh`
+    /// when the login's access token is expired or the server rejects it — a
+    /// driver never refreshes behind the caller's back.
+    fn usage(&self, login: &Login) -> Result<Usage, DriverError>;
+    /// Make one minimal request as this login, in the slot's own run profile.
+    ///
+    /// Answers `Some(login)` when the CLI rotated the credential while running
+    /// (see `RunProfile::read_back`) — the caller must persist it, or the slot
+    /// keeps a refresh token the CLI has already spent.
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<Option<Login>, DriverError>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
     fn capabilities(&self) -> Caps; // ignite, add_token, prefer, refresh…
 }

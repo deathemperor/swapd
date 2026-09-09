@@ -64,6 +64,12 @@ pub fn fetch(ep: &Endpoints, access_token: &str) -> Result<Value, DriverError> {
             .map(|v| v.max(0.0));
         return Err(DriverError::Throttled { retry_after });
     }
+    if status == 401 {
+        // The token the caller handed us is not (or no longer) good. Refreshing
+        // here would spend a single-use refresh token whose rotation the caller
+        // never sees, so the caller is told to do it and retry.
+        return Err(DriverError::NeedsRefresh);
+    }
     if status != 200 {
         return Err(DriverError::Http(format!("usage: http-{status}")));
     }

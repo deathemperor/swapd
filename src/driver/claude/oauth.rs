@@ -206,11 +206,59 @@ pub fn refresh(ep: &Endpoints, login: &Login) -> Result<Login, DriverError> {
         oauth.insert("scopes".to_string(), Value::Array(scopes));
     }
     data.insert("claudeAiOauth".to_string(), Value::Object(oauth));
+    merge_token_account(&mut data, &resp);
 
     Ok(Login {
         bytes: serde_json::to_string(&Value::Object(data))
             .map_err(|_| DriverError::Http("refresh: malformed response".to_string()))?,
     })
+}
+
+/// Fold the token response's optional account identity into the envelope's
+/// `oauthAccount` (`oauth.py:198-228` `_parse_token_account`).
+///
+/// The refresh grant may carry `account` / `organization` objects naming who
+/// the rotated token belongs to; some responses omit them. cswap's strict
+/// boundary applies: usable only with a non-empty string `account.uuid`, every
+/// other field str-or-nothing, and anything malformed ignored — this identity
+/// is opportunistic and must never break the refresh that carried it.
+///
+/// cswap's keys (`uuid`, `email`, `organizationUuid`) are translated to the ones
+/// Claude Code writes in `~/.claude.json`'s `oauthAccount` (`accountUuid`,
+/// `emailAddress`, `organizationUuid`) — that is the shape this envelope's
+/// `oauthAccount` has, and `identity()` reads it by those names. Merged, not
+/// replaced: the response carries neither `organizationName` nor the rate-limit
+/// tier, and dropping them would cost the plan label.
+fn merge_token_account(data: &mut Map<String, Value>, resp: &Map<String, Value>) {
+    let Some(account) = resp.get("account").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(uuid) = account
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return;
+    };
+
+    let mut oauth_account = match data.get("oauthAccount") {
+        Some(Value::Object(existing)) => existing.clone(),
+        _ => Map::new(),
+    };
+    oauth_account.insert("accountUuid".to_string(), Value::from(uuid));
+    if let Some(email) = account.get("email_address").and_then(Value::as_str) {
+        oauth_account.insert("emailAddress".to_string(), Value::from(email));
+    }
+    if let Some(org_uuid) = resp
+        .get("organization")
+        .and_then(Value::as_object)
+        .and_then(|org| org.get("uuid"))
+        .and_then(Value::as_str)
+    {
+        oauth_account.insert("organizationUuid".to_string(), Value::from(org_uuid));
+    }
+    data.insert("oauthAccount".to_string(), Value::Object(oauth_account));
 }
 
 /// `oauth.py:167-192`: the body's top-level `error` member decides, and only on

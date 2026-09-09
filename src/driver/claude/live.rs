@@ -72,6 +72,18 @@ pub enum LiveStore {
     File,
 }
 
+impl Clone for LiveStore {
+    /// Shares the one backend rather than duplicating it: `RunProfile`'s
+    /// read-back closure has to own a driver, and a `security` CLI wrapper is
+    /// stateless anyway.
+    fn clone(&self) -> Self {
+        match self {
+            LiveStore::Keychain(cli) => LiveStore::Keychain(cli.clone()),
+            LiveStore::File => LiveStore::File,
+        }
+    }
+}
+
 /// The Claude provider driver: where the live login lives on this machine, and
 /// which upstreams to talk to. `impl Driver for ClaudeDriver` is in the module
 /// root, over these inherent methods plus `oauth`/`usage`/`run`.
@@ -212,7 +224,7 @@ impl ClaudeDriver {
     /// logged in while the keychain was unusable — is a real login, not an empty
     /// slot. A keychain *error* still propagates: that is a property of the
     /// keychain, and answering from a possibly-stale file would hide it.
-    fn read_live_raw(&self, env: &Env) -> Result<Option<String>, DriverError> {
+    pub fn read_live_raw(&self, env: &Env) -> Result<Option<String>, DriverError> {
         match &self.store {
             LiveStore::Keychain(cli) => match read_keychain(cli.as_ref(), env)? {
                 Some(value) => Ok(Some(value)),
@@ -303,7 +315,7 @@ fn refresh_stale_credentials_file(env: &Env, value: &str) {
 
 /// Reject anything that is not an OAuth login object before it can reach
 /// Claude Code's OAuth item (see `write_live_with_timeout`).
-fn require_oauth_login(credential: &str) -> Result<(), DriverError> {
+pub fn require_oauth_login(credential: &str) -> Result<(), DriverError> {
     let is_oauth = credential_object(Some(credential))
         .and_then(|map| map.get("claudeAiOauth").cloned())
         .map(|value| value.is_object())
@@ -394,13 +406,13 @@ fn read_credentials_file(env: &Env) -> Result<Option<String>, DriverError> {
 /// `credentials.py:751-772` `_write_active_credentials_file`). On Linux this is
 /// *the* live store and Claude Code reads it without taking any lock, so a
 /// truncate-then-write would give it a window to read a torn credential.
-fn write_credentials_file(env: &Env, value: &str) -> Result<(), DriverError> {
+pub fn write_credentials_file(env: &Env, value: &str) -> Result<(), DriverError> {
     let path = paths::credentials_file(env)?;
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
 
     let tmp = dir.join(format!(".credentials.json.tmp.{}", rand::random::<u64>()));
-    match write_private(&tmp, value).and_then(|()| Ok(fs::rename(&tmp, &path)?)) {
+    match write_private_file(&tmp, value).and_then(|()| Ok(fs::rename(&tmp, &path)?)) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = fs::remove_file(&tmp);
@@ -410,7 +422,7 @@ fn write_credentials_file(env: &Env, value: &str) -> Result<(), DriverError> {
 }
 
 /// Create `path` with 0600 and write `value` to it.
-fn write_private(path: &Path, value: &str) -> Result<(), DriverError> {
+pub fn write_private_file(path: &Path, value: &str) -> Result<(), DriverError> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -428,7 +440,7 @@ fn write_private(path: &Path, value: &str) -> Result<(), DriverError> {
 /// The envelope's `oauthAccount` (from `~/.claude.json`) glued onto the raw
 /// credential object. A credential that is not a JSON object (a managed
 /// `sk-ant-api…` key, an opaque legacy blob) is returned unchanged.
-fn embed_oauth_account(env: &Env, raw: String) -> String {
+pub fn embed_oauth_account(env: &Env, raw: String) -> String {
     let Some(oauth_account) = config_oauth_account(env) else {
         return raw;
     };

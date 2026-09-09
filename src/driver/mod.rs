@@ -218,9 +218,8 @@ pub struct Caps {
     pub run: bool,
 }
 
-// The trait is fully implemented (`driver::claude`) but nothing *calls* it
-// until Task 8's verbs; the allow seeds the dead-code analysis so the whole
-// driver behind it counts as live.
+// The collector calls most of it; `ignite`/`run_profile` wait for the `run`
+// verb, and the allow keeps the whole driver behind them counting as live.
 #[allow(dead_code)]
 pub trait Driver: Send + Sync {
     fn id(&self) -> &'static str; // "claude"
@@ -231,6 +230,23 @@ pub trait Driver: Send + Sync {
     /// does not own (Claude: MCP OAuth tokens, non-account config).
     fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError>;
     fn identity(&self, login: &Login) -> Result<Identity, DriverError>; // email, org, plan
+    /// Who this login belongs to, *without touching the network* — `None` when
+    /// the credential does not say.
+    ///
+    /// The collector matches the live login against a slot on every pass, and
+    /// `identity()`'s remote fallback would make a status verb issue a request
+    /// outside the usage table's cadence, claims and backoff. This is the
+    /// question a read path is allowed to ask.
+    fn identity_offline(&self, login: &Login) -> Option<Identity>;
+    /// When this login's access token expires, in unix seconds, or `None` when
+    /// the credential does not say.
+    ///
+    /// Offline and unbuffered: it answers "which of these two credentials is
+    /// the later generation" (a spent refresh token must never overwrite its
+    /// successor) and "is the active login past its expiry" for a slot the
+    /// fetch gate kept out of this pass. `usage()`'s own expiry check keeps its
+    /// refresh buffer; this one reports the stated moment.
+    fn expires_at(&self, login: &Login) -> Option<f64>;
     fn refresh(&self, login: &Login) -> Result<Login, DriverError>; // TokenDead on invalid_grant
     /// windows[]; `Throttled{retry_after}` when rate-limited, `NeedsRefresh`
     /// when the login's access token is expired or the server rejects it — a

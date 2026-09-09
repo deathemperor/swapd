@@ -59,19 +59,31 @@ impl Driver for ClaudeDriver {
     /// org name, no plan). Neither yielding one is an error, not a blank
     /// identity: a caller must not present an account it cannot name.
     fn identity(&self, login: &Login) -> Result<Identity, DriverError> {
-        let from_envelope = serde_json::from_str::<serde_json::Value>(&login.bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("oauthAccount")
-                    .and_then(live::identity_from_oauth_account)
-            });
-        if let Some(identity) = from_envelope {
+        if let Some(identity) = self.identity_offline(login) {
             return Ok(identity);
         }
         oauth::access_token(login)
             .and_then(|token| oauth::profile(&self.endpoints, &token))
             .ok_or_else(|| DriverError::Invalid("no identity".to_string()))
+    }
+
+    /// The envelope's own `oauthAccount` and nothing else — the copy Claude
+    /// Code advertises for this credential, carrying the organization name and
+    /// the plan.
+    fn identity_offline(&self, login: &Login) -> Option<Identity> {
+        serde_json::from_str::<serde_json::Value>(&login.bytes)
+            .ok()?
+            .get("oauthAccount")
+            .and_then(live::identity_from_oauth_account)
+    }
+
+    /// `claudeAiOauth.expiresAt`, which Claude Code stores in milliseconds.
+    fn expires_at(&self, login: &Login) -> Option<f64> {
+        serde_json::from_str::<serde_json::Value>(&login.bytes)
+            .ok()?
+            .pointer("/claudeAiOauth/expiresAt")
+            .and_then(serde_json::Value::as_f64)
+            .map(|ms| ms / 1000.0)
     }
 
     fn refresh(&self, login: &Login) -> Result<Login, DriverError> {

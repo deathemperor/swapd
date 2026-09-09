@@ -808,8 +808,6 @@ impl UsageStore {
     /// (`usage_store.py:1185-1211`): the strikes — and the failure state riding
     /// with them — no longer reflect reality, and the account must become
     /// fetch-eligible so the next pass can prove the new token good.
-    // The re-login path (Task 10) is what lifts a quarantine.
-    #[allow(dead_code)]
     pub fn clear_dead(&self, key: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut rows = self.read_rows()?;

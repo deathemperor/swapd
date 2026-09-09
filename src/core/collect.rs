@@ -62,6 +62,9 @@ struct SlotState {
     login: Option<Login>,
     fingerprint: Option<String>,
     active: bool,
+    /// The live store holds an OLDER generation than this slot's stored copy:
+    /// the fetch heals the divergence before it uses the credential.
+    heal_live: bool,
     sentinel: Option<UsageStatus>,
 }
 
@@ -102,7 +105,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     // no identity of its own.
     let live_identity = live
         .as_ref()
-        .and_then(|login| provider.identity(login).ok())
+        .and_then(|login| provider.identity_offline(login))
         .map(|i| (i.email.to_lowercase(), i.organization_uuid));
     let active_slot = order.iter().copied().find(|n| {
         let Some(meta) = slots.slots.get(n) else {
@@ -119,6 +122,10 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
 
     // 2. Every slot's credential, and the sentinels derivable without a fetch.
     let mut states = Vec::new();
+    // Slots whose stored credential this pass replaced from the live store: a
+    // dead-token quarantine bound to the generation they used to hold no longer
+    // describes them (step 3 lifts it).
+    let mut adopted = Vec::new();
     for slot in &order {
         let Some(meta) = slots.slots.get(slot).cloned() else {
             continue;
@@ -136,18 +143,39 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         let active = live.is_some()
             && (active_slot == Some(*slot)
                 || (active_slot.is_none() && stored_fingerprint == live_fingerprint));
+        let mut heal_live = false;
         let (login, fingerprint) = if active {
             // The active account's credential is Claude Code's live one; every
             // other slot reads its stored copy. When the CLI rotated the
-            // lineage itself the stored copy is a spent token: replace it now,
-            // before anything can POST it.
+            // lineage itself the stored copy is a spent token — but the reverse
+            // happens too (a `write_live` that failed after we persisted a
+            // rotation), and adopting there would overwrite the successor with
+            // the token the endpoint has already spent. So the adopt is
+            // GENERATIONAL: the live login wins unless it is provably the older
+            // generation, in which case the stored copy is used and written
+            // back to heal the divergence.
             let live = live.take().expect("`active` is gated on a live login");
-            let fingerprint = live_fingerprint.clone();
-            if stored_fingerprint != fingerprint {
-                ctx.secrets.set(&key, &live.bytes)?;
-                record_slot_fingerprint(ctx, id, *slot, fingerprint.as_deref())?;
+            let live_expiry = provider.expires_at(&live);
+            let stored_expiry = stored.as_ref().and_then(|l| provider.expires_at(l));
+            let live_is_older = match (live_expiry, stored_expiry) {
+                (Some(live), Some(stored)) => live < stored,
+                // An unknown expiry on either side is no evidence of order.
+                _ => false,
+            };
+            match (live_is_older, stored, stored_fingerprint) {
+                (true, Some(stored), fingerprint) => {
+                    heal_live = true;
+                    (Some(stored), fingerprint)
+                }
+                (_, _, fingerprint) => {
+                    if fingerprint != live_fingerprint {
+                        ctx.secrets.set(&key, &live.bytes)?;
+                        record_slot_fingerprint(ctx, id, *slot, live_fingerprint.as_deref())?;
+                        adopted.push(key.clone());
+                    }
+                    (Some(live), live_fingerprint.clone())
+                }
             }
-            (Some(live), fingerprint)
         } else {
             (stored, stored_fingerprint)
         };
@@ -166,6 +194,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
             login,
             fingerprint,
             active,
+            heal_live,
             sentinel,
         });
     }
@@ -183,6 +212,20 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         })
         .collect();
     let mut entries = ctx.store.entries(&keys, &ctx.settings.models)?;
+    // A slot whose credential this pass replaced is not the slot the strikes
+    // condemned. Clearing the sentinel is not enough: `reserve` gates on the
+    // raw strike count, so a row left struck would never be fetched again and
+    // the account would freeze at its last-known-good measurement forever.
+    let healed: Vec<&String> = adopted
+        .iter()
+        .filter(|key| entry_of(&entries, key).auth_dead_strikes > 0)
+        .collect();
+    if !healed.is_empty() {
+        for key in healed {
+            ctx.store.clear_dead(key)?;
+        }
+        entries = ctx.store.entries(&keys, &ctx.settings.models)?;
+    }
     for st in &mut states {
         if st.sentinel.is_some() {
             continue;
@@ -208,6 +251,26 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         .collect();
     let claims = ctx.store.reserve(&candidates, !opts.all_stale, force)?;
 
+    // An expired ACTIVE credential the fetch gate kept out of this pass —
+    // failure backoff, another collector's claim, the poll plan — still has to
+    // surface as expired (`switcher.py:4810-4830`), or a caller reads a stale
+    // `ok` and counts the gap as a healthy account. When the gate lifts, the
+    // fetch path refreshes it and the sentinel clears itself.
+    let now = ctx.now();
+    for st in &mut states {
+        if st.sentinel.is_some() || !st.active || claims.contains_key(&st.key) {
+            continue;
+        }
+        let expired = st
+            .login
+            .as_ref()
+            .and_then(|login| provider.expires_at(login))
+            .is_some_and(|expires_at| expires_at < now);
+        if expired || st.heal_live {
+            st.sentinel = Some(UsageStatus::TokenExpired);
+        }
+    }
+
     // 5. The fetches.
     if !claims.is_empty() {
         let jobs: Vec<(usize, &str)> = states
@@ -215,7 +278,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
             .enumerate()
             .filter_map(|(i, st)| claims.get(&st.key).map(|claim| (i, claim.as_str())))
             .collect();
-        for (i, sentinel) in fetch_all(ctx, provider, &states, &jobs)? {
+        for (i, sentinel) in fetch_all(ctx, provider, &states, &jobs, keychain_down)? {
             states[i].sentinel = states[i].sentinel.or(sentinel);
         }
 
@@ -232,7 +295,6 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         }
     }
 
-    let now = ctx.now();
     let accounts: Vec<AccountView> = states
         .iter()
         .map(|st| account_view(st, entry_of(&entries, &st.key), now))
@@ -323,6 +385,7 @@ fn fetch_all(
     provider: &dyn Driver,
     states: &[SlotState],
     jobs: &[(usize, &str)],
+    keychain_down: bool,
 ) -> Result<Vec<(usize, Option<UsageStatus>)>> {
     let chunk = jobs.len().div_ceil(MAX_FETCH_THREADS).max(1);
     std::thread::scope(|scope| {
@@ -332,7 +395,10 @@ fn fetch_all(
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|(i, claim)| Ok((*i, fetch_one(ctx, provider, &states[*i], claim)?)))
+                        .map(|(i, claim)| {
+                            let done = fetch_one(ctx, provider, &states[*i], claim, keychain_down)?;
+                            Ok((*i, done))
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
             })
@@ -355,15 +421,33 @@ fn fetch_one(
     provider: &dyn Driver,
     st: &SlotState,
     claim: &str,
+    keychain_down: bool,
 ) -> Result<Option<UsageStatus>> {
     let login = st
         .login
         .as_ref()
         .expect("a slot with no credential is sentinelled before it can be claimed");
+
+    // The live store holds an older generation than this slot's copy: heal it
+    // before the credential is used, while the claim still fences a failure.
+    if st.heal_live {
+        if let Err(e) = provider.write_live(&ctx.env, login) {
+            return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
+        }
+    }
+
     match provider.usage(login) {
         Ok(usage) => {
             record_success(ctx, st, claim, usage.windows)?;
             Ok(None)
+        }
+        Err(DriverError::NeedsRefresh) if keychain_down => {
+            // No pass may spend a refresh token it cannot write back: with the
+            // live store unreadable there is no way to tell whether the
+            // credential in hand is still the one Claude Code holds.
+            ctx.store
+                .record_failure(&st.key, claim, "keychain-unavailable", None, None)?;
+            Ok(Some(UsageStatus::Stale))
         }
         Err(DriverError::NeedsRefresh) => refresh_then_usage(ctx, provider, st, claim, login),
         Err(e) => {
@@ -371,6 +455,24 @@ fn fetch_one(
             Ok(None)
         }
     }
+}
+
+/// A live-store write that failed is one account's problem, never the verb's:
+/// the credential itself is safe in the secret store, and every other account's
+/// freshly fetched result still has to reach the caller.
+fn degrade_write_live(
+    ctx: &Ctx,
+    st: &SlotState,
+    claim: &str,
+    err: &DriverError,
+) -> Result<UsageStatus> {
+    eprintln!(
+        "warning: slot {}: the live login could not be replaced ({err})",
+        st.slot
+    );
+    ctx.store
+        .record_failure(&st.key, claim, "write-live", None, None)?;
+    Ok(UsageStatus::TokenExpired)
 }
 
 /// The refresh half of the fetch, run exactly once per pass.
@@ -411,13 +513,19 @@ fn refresh_then_usage(
     };
 
     ctx.secrets.set(&st.key, &refreshed.bytes)?;
-    if st.active {
-        provider.write_live(&ctx.env, &refreshed)?;
-    }
+    let live_write = if st.active {
+        provider.write_live(&ctx.env, &refreshed)
+    } else {
+        Ok(())
+    };
     // Every persisted rotation is stamped, active or not: `slots.json`'s
     // fingerprint is the stored login's, and a stale one both hides a
-    // quarantine and refuses to heal.
+    // quarantine and refuses to heal. Stamped even when the live write failed —
+    // the secret store already holds this generation.
     record_slot_fingerprint(ctx, provider.id(), st.slot, Some(&refreshed.fingerprint()))?;
+    if let Err(e) = live_write {
+        return Ok(Some(degrade_write_live(ctx, st, claim, &e)?));
+    }
 
     // Once per pass: a second `NeedsRefresh` is recorded as the 401 it is
     // rather than spending another refresh token on it.
@@ -481,18 +589,21 @@ fn failure_kind(err: &DriverError) -> (String, Option<f64>) {
 
 /// One account as the contract describes it.
 ///
-/// `fetched_at`/`age_seconds` describe `windows`, so they are reported together
-/// or not at all: a measurement too old to serve moves into `last_good`, where
-/// its age is what the reader is meant to judge it by.
+/// `windows` (with the `fetched_at`/`age_seconds` that describe it) is the
+/// account's CURRENT utilization, and only an `ok` account has one: anything
+/// else — too old to serve, quarantined, expired, held back — reports its
+/// measurement as `last_good`, annotated with the age the reader is meant to
+/// judge it by. One shape per status, so a reader never has to look in two
+/// places for the same number.
 fn account_view(st: &SlotState, entry: &Entry, now: f64) -> AccountView {
     let fresh = entry.age_s.is_some_and(|age| age <= STALE_OK_S);
-    let stored = entry.last_good.clone().unwrap_or_default();
     let status = st.sentinel.unwrap_or(if fresh {
         UsageStatus::Ok
     } else {
         UsageStatus::Stale
     });
-    let last_good = match (fresh, entry.fetched_at, entry.last_good.as_ref()) {
+    let current = status == UsageStatus::Ok;
+    let last_good = match (current, entry.fetched_at, entry.last_good.as_ref()) {
         (false, Some(fetched_at), Some(windows)) => Some(LastGood {
             fetched_at: format_ts(fetched_at).unwrap_or_default(),
             age_seconds: now - fetched_at,
@@ -512,11 +623,15 @@ fn account_view(st: &SlotState, entry: &Entry, now: f64) -> AccountView {
         disabled: st.meta.disabled,
         preferred: st.meta.preferred,
         usage_status: status,
-        fetched_at: fresh
+        fetched_at: current
             .then(|| entry.fetched_at.and_then(format_ts))
             .flatten(),
-        age_seconds: fresh.then_some(entry.age_s).flatten(),
-        windows: if fresh { stored } else { Vec::new() },
+        age_seconds: current.then_some(entry.age_s).flatten(),
+        windows: if current {
+            entry.last_good.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         last_good,
     }
 }
@@ -545,19 +660,24 @@ fn next_candidate(
         .map(|st| st.slot)
 }
 
-fn healthy(ctx: &Ctx, st: &SlotState, entry: &Entry) -> bool {
-    if st.meta.disabled {
-        return false;
-    }
-    if matches!(
-        st.sentinel,
-        Some(
-            UsageStatus::NoCredentials
-                | UsageStatus::ApiKey
-                | UsageStatus::ReloginRequired
-                | UsageStatus::Unsupported
+/// Whether the rotation may land on this slot at all — before any question of
+/// how much headroom it has. A disabled slot is out by the user's choice; a
+/// slot with no usable credential is out until someone logs in again.
+fn rotatable(st: &SlotState) -> bool {
+    !st.meta.disabled
+        && !matches!(
+            st.sentinel,
+            Some(
+                UsageStatus::NoCredentials
+                    | UsageStatus::ApiKey
+                    | UsageStatus::ReloginRequired
+                    | UsageStatus::Unsupported
+            )
         )
-    ) {
+}
+
+fn healthy(ctx: &Ctx, st: &SlotState, entry: &Entry) -> bool {
+    if !rotatable(st) {
         return false;
     }
     entry
@@ -574,7 +694,10 @@ fn next_recovery(
 ) -> Option<NextRecovery> {
     states
         .iter()
-        .filter(|st| !st.meta.disabled)
+        // An account nobody can switch to is no recovery, however its windows
+        // read — and a quarantined row keeps serving them long past the stale
+        // bound, because its failures extend the trust bridge.
+        .filter(|st| rotatable(st))
         .filter_map(|st| {
             let windows = entry_of(entries, &st.key).decision_windows()?;
             let at = limiting_reset_ts(windows, &ctx.settings.models)?;

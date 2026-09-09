@@ -273,6 +273,10 @@ mod tests {
 
         let probe = FileLock::probe(&path).unwrap();
         assert!(probe.held);
+        // Windows locks are mandatory: the note cannot be read from a second
+        // handle while the lock is held, so `probe` reports it only once the
+        // lock is released (`doctor` shows `held` without a pid there).
+        #[cfg(unix)]
         assert_eq!(probe.note.as_deref(), Some("held-by-test"));
 
         drop(lock);

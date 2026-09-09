@@ -13,11 +13,12 @@ use crate::output;
 /// health rule (`collect::within_threshold`) — a plain `rotate` lands where the
 /// contract said it would.
 ///
-/// `consume-first` and `best` deliberately rank PAST that threshold: the first
-/// exists to land on the account closest to its reset, and a `best` that
-/// answered "no candidate" because every account is over the threshold would
-/// withhold the very account it was asked for. Only an exhausted window is out
-/// for them.
+/// `consume-first` is gated on the same threshold (brief step 5's "soonest 7d
+/// reset among healthy", cswap `autoswitch.py:2109-2113`), with cswap's
+/// `all_above` escape: when every candidate is above the threshold the gate is
+/// dropped rather than the answer withheld. `best` is ungated — it is asked for
+/// by name and already ranks by the most headroom, so only an exhausted window
+/// is out for it.
 pub const DEFAULT_STRATEGY: Strategy = Strategy::NextAvailable;
 
 pub fn run(ctx: &Ctx, provider: &dyn Driver, strategy: Strategy) -> Result<SwitchOutput> {
@@ -26,7 +27,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, strategy: Strategy) -> Result<Switc
     // so a rotate costs at most the fetches those plans already wanted.
     let cursor = collect(ctx, provider, &CollectOpts::default())?;
     let preferred: Vec<String> = Vec::new();
-    let ranked = switch::rank(ctx, &cursor, strategy, &preferred);
+    let ranked = switch::rank(ctx, &cursor, strategy, &preferred)?;
 
     // The whole ranking, not just its head: a candidate whose credential turns
     // out to be dead is exactly the case rotation exists for, and giving up on

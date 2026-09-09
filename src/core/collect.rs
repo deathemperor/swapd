@@ -661,6 +661,43 @@ fn healthy(ctx: &Ctx, st: &SlotState, entry: &Entry) -> bool {
     rotatable(st) && within_threshold(ctx, entry.decision_windows().unwrap_or(&[]))
 }
 
+/// The slots a rotation may land on, by the rule AND the inputs
+/// `nextCandidate` is computed from.
+///
+/// The rule alone is not enough to agree with `list`: `nextCandidate` decides
+/// on `Entry::decision_windows()`, which drops a measurement past the store's
+/// trust ceiling and answers *unknown* — still a candidate. The contract view
+/// carries `lastGood` at any age and cannot express that, so a ranker deciding
+/// from the view calls an hour-old 95% reading authoritative while `list` calls
+/// it unknown, and the two name different slots. Hence the verdict is exposed
+/// here rather than re-derived over there.
+///
+/// `nextCandidate` is the head of this list among the non-active slots;
+/// `rotate` needs the whole of it, because a candidate can fail.
+pub fn healthy_slots(ctx: &Ctx, provider: &str, view: &ProviderView) -> Result<Vec<u32>> {
+    let keys: Vec<(String, String, String)> = view
+        .accounts
+        .iter()
+        .map(|a| {
+            (
+                slot_key(provider, a.slot),
+                a.email.clone(),
+                a.organization_uuid.clone(),
+            )
+        })
+        .collect();
+    let entries = ctx.store.entries(&keys, &ctx.settings.models)?;
+    Ok(view
+        .accounts
+        .iter()
+        .filter(|a| {
+            let entry = entry_of(&entries, &slot_key(provider, a.slot));
+            within_threshold(ctx, entry.decision_windows().unwrap_or(&[]))
+        })
+        .map(|a| a.slot)
+        .collect())
+}
+
 /// Whether an account's measured headroom leaves the rotation willing to land
 /// on it: its binding window is below the configured threshold.
 ///

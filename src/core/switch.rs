@@ -18,7 +18,7 @@
 //! is held for local I/O only.
 
 use crate::contract::{AccountView, ProviderView, UsageStatus};
-use crate::core::collect::{record_slot_fingerprint, within_threshold};
+use crate::core::collect::{healthy_slots, record_slot_fingerprint};
 use crate::core::history::{self, SlotRef, SwitchRecord};
 use crate::core::poll_policy::{binding_pct, parse_reset_ts};
 use crate::core::slots::{self, ProviderSlots};
@@ -235,7 +235,9 @@ pub fn perform(
     }) {
         warnings.push(format!(
             "the switch landed but slot {target} could not be recorded as active ({e}); \
-             `swapd list` will re-derive it from the live login"
+             the stored record stays stale until the next `swapd switch` or `swapd add` \
+             writes it (`swapd list` derives the active account from the live login for \
+             its own output, but does not write it back)"
         ));
     }
 
@@ -442,25 +444,66 @@ fn match_slot(provider: &dyn Driver, slots: &ProviderSlots, login: &Login) -> Op
 ///
 /// An account nobody has measured yet is a candidate: unknown headroom is not
 /// evidence of an empty account, and proving it is what the switch does.
-pub fn rank(ctx: &Ctx, view: &ProviderView, strategy: Strategy, preferred: &[String]) -> Vec<u32> {
-    let rotation: Vec<&AccountView> = view
+///
+/// The health gate comes from the collector (`collect::healthy_slots`), rule
+/// and inputs both: deciding from the view's own `lastGood` would call a
+/// measurement `list` has stopped trusting authoritative, and the two verbs
+/// would name different slots.
+pub fn rank(
+    ctx: &Ctx,
+    view: &ProviderView,
+    strategy: Strategy,
+    preferred: &[String],
+) -> Result<Vec<u32>> {
+    let healthy = healthy_slots(ctx, view.provider.as_str(), view)?;
+    let candidates: Vec<&AccountView> = view
         .accounts
         .iter()
         .filter(|a| !a.active && rotatable(a))
-        .filter(|a| match strategy {
-            // `next-available` is the strategy `list` advertises as
-            // `nextCandidate`, so it answers with the collector's own health
-            // rule — an account over the threshold is not "available", however
-            // much of its window is technically left.
-            Strategy::NextAvailable => within_threshold(ctx, decision_windows(a)),
-            // The other two are asked for on purpose and rank PAST the
-            // threshold: `consume-first` exists to land on the account closest
-            // to its reset, and a `best` that answered "no candidate" because
-            // every account is over 90% would withhold the very account it was
-            // asked to find. Only an exhausted window is out.
-            _ => headroom(ctx, a).is_none_or(|h| h > 0.0),
-        })
         .collect();
+
+    let rotation: Vec<&AccountView> = match strategy {
+        // `next-available` is the strategy `list` advertises as
+        // `nextCandidate`, so it answers with the collector's health verdict
+        // and nothing else — including when that leaves nothing, which is what
+        // `nextCandidate: null` means on the same board.
+        Strategy::NextAvailable => candidates
+            .iter()
+            .copied()
+            .filter(|a| healthy.contains(&a.slot))
+            .collect(),
+        // `consume-first` ranks among healthy accounts too (brief step 5,
+        // cswap `autoswitch.py:2109-2113`) — an account already over the
+        // threshold is not one to consume further. cswap's `all_above` escape
+        // (`autoswitch.py:2113-2135`) is what keeps that from withholding: when
+        // the gate leaves nothing, every candidate is above the threshold, and
+        // ranking them all by soonest reset is a better answer than "none".
+        Strategy::ConsumeFirst => {
+            let live: Vec<&AccountView> = candidates
+                .iter()
+                .copied()
+                .filter(|a| headroom(ctx, a).is_none_or(|h| h > 0.0))
+                .collect();
+            let gated: Vec<&AccountView> = live
+                .iter()
+                .copied()
+                .filter(|a| healthy.contains(&a.slot))
+                .collect();
+            if gated.is_empty() {
+                live
+            } else {
+                gated
+            }
+        }
+        // `best` is ungated: it is asked for by name, it already ranks by the
+        // most headroom, and gating it would only ever withhold the account it
+        // was asked to find. Only an exhausted window is out.
+        Strategy::Best => candidates
+            .iter()
+            .copied()
+            .filter(|a| headroom(ctx, a).is_none_or(|h| h > 0.0))
+            .collect(),
+    };
 
     if strategy == Strategy::NextAvailable {
         // Rotation order, resumed after the active slot: `view.accounts` is
@@ -472,11 +515,11 @@ pub fn rank(ctx: &Ctx, view: &ProviderView, strategy: Strategy, preferred: &[Str
             .map(|i| i + 1)
             .unwrap_or(0);
         let len = view.accounts.len();
-        return (0..len)
+        return Ok((0..len)
             .map(|offset| &view.accounts[(start + offset) % len])
             .filter(|a| rotation.iter().any(|c| c.slot == a.slot))
             .map(|a| a.slot)
-            .collect();
+            .collect());
     }
 
     let mut ranked: Vec<(RankKey, u32)> = rotation
@@ -509,7 +552,7 @@ pub fn rank(ctx: &Ctx, view: &ProviderView, strategy: Strategy, preferred: &[Str
             .then(a.0.second.total_cmp(&b.0.second))
             .then(a.1.cmp(&b.1))
     });
-    ranked.into_iter().map(|(_, slot)| slot).collect()
+    Ok(ranked.into_iter().map(|(_, slot)| slot).collect())
 }
 
 /// One candidate's sort key. `preferred` is a `bool` inverted at construction
@@ -947,6 +990,47 @@ mod tests {
         );
         let file: SlotsFile = read_json(&ctx.home.slots_file()).unwrap();
         assert_eq!(file.providers["claude"].active_slot, None);
+    }
+
+    /// The other half of M2, and the only place it can be driven: the switch
+    /// lands, the record of which slot is active does not, and the warning says
+    /// what will actually repair it. (The integration suite cannot reach this —
+    /// through the real driver the live envelope never matches the stored bytes
+    /// exactly, so the back-up re-stamps first and fails on the same lock.)
+    #[test]
+    fn a_landed_switch_reports_an_unrecorded_active_slot_as_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        // The live login is byte-identical to slot 1's stored copy, so the
+        // back-up writes nothing and the only `slots.json` write left is the
+        // active-slot one.
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false);
+        // A directory where the lock file belongs: it can never be taken.
+        // (Seeding the board already created the lock file, so it goes first.)
+        let lock = dir.path().join("slots.json.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir_all(&lock).unwrap();
+
+        let result = perform(&ctx, &driver, 2, "manual").unwrap();
+        assert!(result.switched, "the live store holds the target");
+        assert_eq!(
+            driver.live.lock().unwrap().clone().unwrap(),
+            login_for("two@example.com", "rt-2")
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("stays stale") && w.contains("swapd add")),
+            "the warning must name what repairs the record: {:?}",
+            result.warnings
+        );
+        // The switch is logged even though the record is stale: the log is what
+        // says the swap happened at all.
+        assert_eq!(
+            crate::core::history::read(&ctx.home, None).unwrap().len(),
+            1
+        );
     }
 
     #[test]

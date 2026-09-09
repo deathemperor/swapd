@@ -348,6 +348,27 @@ fn a_credential_that_cannot_be_stored_names_what_was_imported() {
     assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-1");
 }
 
+/// Two failures at once: the message the user gets must be the one that says
+/// what happened to their import, not an unrelated bookkeeping error about a
+/// slot that landed fine.
+#[test]
+fn a_quarantine_that_cannot_be_lifted_does_not_mask_the_store_failure() {
+    let fx = Fixture::new();
+    // Slot 2's credential cannot be written…
+    std::fs::create_dir_all(fx.home.path().join("credentials").join("claude_2")).unwrap();
+    // …and slot 1's dead-token quarantine cannot be lifted either.
+    std::fs::create_dir_all(fx.home.path().join("usage.json")).unwrap();
+
+    let envelope = cswap_envelope(vec![
+        account(1, "one@example.com", "org-1"),
+        account(2, "two@example.com", "org-2"),
+    ]);
+    let err = fx.import_err(&envelope, &[]);
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("slot 2"), "{message}");
+    assert!(message.contains("already imported: 1"), "{message}");
+}
+
 #[test]
 fn unknown_envelopes_are_refused_by_name() {
     let fx = Fixture::new();

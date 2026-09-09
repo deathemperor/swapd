@@ -197,10 +197,18 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
     // Outside the lock, so the usage store's is never nested inside it: a slot
     // holding new bytes under the quarantine its previous credential earned
     // would read as "re-login needed" forever (`switcher.py:3535`).
+    // The credential failure is the one that describes what went wrong and
+    // names what landed, so it wins: a `clear_dead` that also failed would
+    // otherwise replace it with an unrelated message about a slot that imported
+    // fine. Every slot is still attempted — one quarantine that cannot be
+    // lifted must not skip the rest.
+    let mut quarantine = None;
     for slot in &imported {
-        ctx.store.clear_dead(&crate::secrets::slot_key(id, *slot))?;
+        if let Err(e) = ctx.store.clear_dead(&crate::secrets::slot_key(id, *slot)) {
+            quarantine.get_or_insert(e);
+        }
     }
-    if let Some(failure) = failure {
+    if let Some(failure) = failure.or(quarantine) {
         return Err(failure);
     }
 

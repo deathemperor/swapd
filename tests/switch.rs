@@ -698,6 +698,124 @@ fn rotate_next_available_skips_an_account_over_the_threshold() {
     );
 }
 
+/// The gate is the collector's INPUTS as well as its rule: a measurement past
+/// the store's trust ceiling is unknown to `list`, so it must be unknown to
+/// `rotate` too, or the two name different slots on one board.
+#[test]
+fn rotate_next_available_agrees_with_list_on_a_stale_board() {
+    let fx = rotate_fixture();
+    // Two hours old: past the store's trust ceiling, so `lastGood` is no longer
+    // authoritative and slot 2's 95% reads as unknown — a candidate again.
+    let now = now_s();
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 7200.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 7200.0,
+            "lastGood": [{"kind": "7d", "pct": 95.0, "resetsAt": "2026-09-30T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 7200.0,
+            "lastGood": [{"kind": "7d", "pct": 40.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+    }));
+
+    let listed = fx.run(&["list", "--json", "--provider", "claude"]);
+    let next_candidate = listed["providers"][0]["nextCandidate"].clone();
+    assert_eq!(next_candidate, 2, "a reading this old is unknown, not 95%");
+
+    let out = fx.run(&["rotate", "--json"]);
+    assert_eq!(
+        out["to"]["slot"], next_candidate,
+        "`next-available` must land where `nextCandidate` said"
+    );
+}
+
+/// `consume-first` consumes the account closest to its reset AMONG THE HEALTHY
+/// ones (brief step 5, cswap `autoswitch.py:2109-2113`): an account already over
+/// the threshold is not one to consume further.
+#[test]
+fn rotate_consume_first_skips_an_account_over_the_threshold() {
+    let fx = rotate_fixture();
+    // Slot 2 resets soonest — and is at 95%, so it is out. Slot 3 is the
+    // soonest healthy one.
+    let now = now_s();
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 95.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 40.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+    }));
+
+    let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
+    assert_eq!(
+        out["to"]["slot"], 3,
+        "the 95% account is not one to consume"
+    );
+}
+
+/// cswap's `all_above` escape (`autoswitch.py:2113-2135`): when EVERY candidate
+/// is over the threshold the gate is dropped rather than the answer withheld —
+/// while `next-available`, which promises parity with `nextCandidate`, still
+/// says there is none.
+#[test]
+fn rotate_consume_first_escapes_the_gate_when_every_candidate_is_above_it() {
+    let fx = rotate_fixture();
+    let now = now_s();
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 95.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 97.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+    }));
+
+    // `list` has no candidate to offer on this board.
+    let listed = fx.run(&["list", "--json", "--provider", "claude"]);
+    assert!(listed["providers"][0]["nextCandidate"].is_null());
+    let out = fx.run(&["rotate", "--strategy", "next-available", "--json"]);
+    assert_eq!(out["switched"], false);
+    assert_eq!(out["reason"], "no-candidate");
+
+    // consume-first still answers, with the soonest reset among them all.
+    let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
+    assert_eq!(out["to"]["slot"], 2, "soonest reset, gate dropped");
+
+    // And `best`, ungated by design, names the one with the most headroom.
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (1, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+        (3, "three@example.com", "org-3"),
+    ]);
+    for (slot, email, org) in [
+        (1, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+        (3, "three@example.com", "org-3"),
+    ] {
+        fx.write_stored(
+            slot,
+            &fx.login(email, org, &format!("rt-{slot}"), NOT_EXPIRED_MS),
+        );
+    }
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-1",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 95.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 97.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+    }));
+    let out = fx.run(&["rotate", "--strategy", "best", "--json"]);
+    assert_eq!(out["to"]["slot"], 2, "most headroom, gate never applied");
+}
+
 /// A candidate whose credential turns out to be dead is what rotation is FOR:
 /// the next one in the ranking is tried rather than the rotate failing.
 #[test]

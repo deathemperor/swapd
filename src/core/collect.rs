@@ -148,6 +148,20 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     let unreadable_active = (keychain_down || switch_in_flight || cli_busy)
         .then_some(slots.active_slot)
         .flatten();
+    // The reason `active_unreadable` reports to `list --json`, in the same
+    // priority as the blocks above: a switch in flight is the most specific
+    // fact (`engine.lock` says exactly who owns the store), so it wins over
+    // a merely-unreadable keychain, which in turn wins over a busy CLI.
+    let active_unreadable = unreadable_active.map(|_| {
+        if switch_in_flight {
+            "switch-in-progress"
+        } else if keychain_down {
+            "keychain-unavailable"
+        } else {
+            "cli-busy"
+        }
+        .to_string()
+    });
 
     // The active slot is an IDENTITY match against the live login (cswap
     // `_build_accounts_info`): the same refresh-token lineage can be rotated by
@@ -357,6 +371,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         provider: id.to_string(),
         installed: provider.installed(&ctx.env).is_some(),
         active_slot: states.iter().find(|st| st.active).map(|st| st.slot),
+        active_unreadable,
         next_candidate: next_candidate(ctx, &states, &entries),
         next_recovery: next_recovery(ctx, &states, &entries),
         accounts,

@@ -778,12 +778,21 @@ impl<'a> AutoEngine<'a> {
 
         let now = self.ctx.now();
         let entries = self.entries(&pre)?;
-        // A quarantined account can never be a target, so spending the single
-        // alternate poll slot on one is a wasted request.
+        // An account that can never be a target is not worth the single
+        // alternate poll slot. Quarantined slots are cswap's own exclusion; a
+        // managed API key is swapd's — cswap can land on one as a last resort,
+        // swapd cannot, and because such a slot is never fetched it also never
+        // gets a `fetchedAt`, which would make it the permanently stalest
+        // account in the fleet and starve every OAuth peer of measurements.
         let candidates: Vec<u32> = pre
             .accounts
             .iter()
-            .filter(|a| a.slot != current && !quarantined.contains(&a.slot) && switchable(a))
+            .filter(|a| {
+                a.slot != current
+                    && !quarantined.contains(&a.slot)
+                    && switchable(a)
+                    && !is_api_key(a)
+            })
             .map(|a| a.slot)
             .collect();
 

@@ -722,6 +722,35 @@ fn all_exhausted_emits_earliest_reset() {
     assert_eq!(sleep["until"], format_ts(T0 + MAX_SLEEP_S).unwrap());
 }
 
+/// A managed API-key slot has no usage to fetch, so it never gets a
+/// `fetchedAt` — and a never-fetched account is the stalest thing in the fleet,
+/// which is what the single alternate poll slot goes to. Nominating one would
+/// therefore starve every OAuth peer of measurements for as long as the active
+/// account stays out of the escalation band.
+#[test]
+fn an_api_key_slot_never_takes_the_one_candidate_poll() {
+    let board = Board::new();
+    board.seed_api_key(3, "keyed@example.com");
+    // Well below the escalation band, so only the baseline runs.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    board.driver.take_usage_calls();
+    board.advance(400.0);
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    let fetched = board.driver.take_usage_calls();
+    assert!(
+        fetched.contains(&"two@example.com".to_string()),
+        "the OAuth peer must still get the candidate slot: {fetched:?}"
+    );
+}
+
 /// A managed API-key slot in the fleet is not a candidate at default settings,
 /// and must not stand between the engine and the reason it is actually stuck:
 /// with `unsupported` in the way, a fleet with one API-key slot could never

@@ -185,7 +185,32 @@ pub fn proper_lockfile(
 
 /// Bump `dir`'s mtime (cswap's `os.utime(lock_dir)`).
 fn touch(dir: &Path) -> std::io::Result<()> {
-    fs::File::open(dir)?.set_modified(SystemTime::now())
+    open_dir(dir)?.set_modified(SystemTime::now())
+}
+
+/// A handle on a DIRECTORY that `set_modified` accepts.
+///
+/// A plain `File::open` on a directory is refused by Windows, so the toucher
+/// could never refresh the mtime there and every held lock would read as
+/// stale after `staleness` — and be stolen while its holder is still writing.
+/// `FILE_FLAG_BACKUP_SEMANTICS` is how a directory handle is opened on Windows,
+/// and `FILE_WRITE_ATTRIBUTES` is exactly the access `SetFileTime` needs — no
+/// wider, so an ACL that forbids writing the entries does not block the touch.
+fn open_dir(dir: &Path) -> std::io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        opts.access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    #[cfg(not(windows))]
+    {
+        opts.read(true);
+    }
+    opts.open(dir)
 }
 
 /// Hold Claude Code's credential-refresh locks, in Claude Code's own order.
@@ -224,7 +249,7 @@ mod tests {
     use crate::driver::claude::tests::{env_with, temp_home};
 
     fn set_mtime(dir: &Path, ago: Duration) {
-        fs::File::open(dir)
+        open_dir(dir)
             .unwrap()
             .set_modified(SystemTime::now() - ago)
             .unwrap();

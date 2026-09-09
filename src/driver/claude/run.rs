@@ -177,11 +177,13 @@ fn candidate_paths(home: &Path) -> Vec<PathBuf> {
         .iter()
         .map(|c| {
             let path = Path::new(c);
-            if path.is_absolute() {
+            let path = if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 home.join(path)
-            }
+            };
+            // The list is spelled the unix way; Windows installs `claude.exe`.
+            path.with_file_name(binary_name())
         })
         .collect()
 }
@@ -884,7 +886,9 @@ mod tests {
     #[test]
     fn widen_path_appends_the_candidate_dirs_once() {
         let home = temp_home();
-        let widened = widen_path(Some("/usr/bin:/usr/local/bin"), home.path());
+        // Spelled through `join_paths` so the separator is the platform's own.
+        let path_var = std::env::join_paths(["/usr/bin", "/usr/local/bin"]).unwrap();
+        let widened = widen_path(path_var.to_str(), home.path());
         let dirs: Vec<PathBuf> = std::env::split_paths(&widened).collect();
         assert_eq!(dirs[0], PathBuf::from("/usr/bin"));
         assert_eq!(dirs[1], PathBuf::from("/usr/local/bin"));
@@ -947,7 +951,7 @@ mod tests {
         fs::write(config_home.join("history.jsonl"), "{}").unwrap();
 
         let profile = run_profile(&driver, &env, 3, &login()).unwrap();
-        let dir = env.home.join("profiles/claude/3");
+        let dir = env.home.join("profiles").join("claude").join("3");
         assert_eq!(profile.dir, dir);
         // Both axes point at the profile: a caller layering these over its
         // environment cannot leave an exported securestorage var naming the

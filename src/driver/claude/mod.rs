@@ -39,6 +39,10 @@ impl Driver for ClaudeDriver {
         ClaudeDriver::read_live(self, env)
     }
 
+    fn read_live_locked(&self, env: &Env) -> Result<Login, DriverError> {
+        ClaudeDriver::read_live_locked(self, env)
+    }
+
     fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError> {
         ClaudeDriver::write_live(self, env, login)
     }

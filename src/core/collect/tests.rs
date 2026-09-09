@@ -222,6 +222,13 @@ pub fn login_expiring(email: &str, token: &str, expires_at: i64) -> String {
     )
 }
 
+/// A login that names no account — the envelope a `~/.claude.json` with no
+/// `oauthAccount` produces, which every identity match falls back to the
+/// fingerprint for.
+pub fn anonymous_login(token: &str, expires_at: i64) -> String {
+    format!(r#"{{"claudeAiOauth":{{"refreshToken":"{token}","expiresAt":{expires_at}}}}}"#)
+}
+
 fn slot_row(email: &str) -> Slot {
     Slot {
         email: email.to_string(),
@@ -358,4 +365,63 @@ fn a_heal_then_a_refresh_leaves_the_successor_live() {
         refreshed,
         "a spent generation must never be the one left live"
     );
+}
+
+#[test]
+fn a_fingerprint_matched_active_slot_still_gets_its_live_login_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_for(dir.path());
+    // A live login that names no account: `~/.claude.json` has no
+    // `oauthAccount`, so the slot is matched by fingerprint alone — the
+    // fallback `match_slot` and `export` have always had.
+    let login = anonymous_login("rt-1", 4_102_444_800_000);
+    ctx.secrets.set(&slot_key("claude", 1), &login).unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        provider.insert(1, slot_row("one@example.com"));
+        Ok((true, ()))
+    })
+    .unwrap();
+    let driver = FakeDriver::new(&login);
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert_eq!(view.active_slot, Some(1), "matched by fingerprint");
+
+    // The rotation must reach the live store: refusing it there leaves the CLI
+    // on the spent generation, and the next pass no longer recognises the slot
+    // as active — nothing would ever heal it.
+    let refreshed = anonymous_login("rt-next-1", 4_102_444_800_000);
+    assert_eq!(
+        driver.writes.lock().unwrap().clone(),
+        vec![refreshed.clone()]
+    );
+    assert_eq!(driver.live_bytes().unwrap(), refreshed);
+}
+
+#[test]
+fn a_contended_refresh_lock_is_stale_not_a_strike() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+    // Another process is spending this slot's token: its refresh lock is held
+    // for longer than the pass will wait.
+    let _held = crate::core::store::FileLock::acquire(
+        &ctx.home.refresh_lock_base("claude", 1),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"));
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert!(driver.refreshes.lock().unwrap().is_empty());
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Stale);
+    // No strike, no backoff — and the claim is handed back, so the next pass
+    // (by when the winner is done) fetches instead of skipping.
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.home.usage_file()).unwrap()).unwrap();
+    let row = &rows["rows"]["claude:1"];
+    assert_eq!(row["consecutiveFailures"], 0);
+    assert!(row["lastError"].is_null(), "{row}");
+    assert!(row["backoffUntil"].is_null(), "{row}");
+    assert!(row["claimUntil"].is_null(), "{row}");
 }

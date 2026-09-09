@@ -233,6 +233,19 @@ pub trait Driver: Send + Sync {
     fn installed(&self, env: &Env) -> Option<PathBuf>;
     /// The CLI's live login for the current environment.
     fn read_live(&self, env: &Env) -> Result<Login, DriverError>;
+    /// The same read, but fenced against the CLI ITSELF writing mid-read.
+    ///
+    /// `engine.lock` fences swapd's own writers; it says nothing about the CLI,
+    /// whose `/login` can write its credential store and its config in two
+    /// steps. A reader that lands between them sees one account's credential
+    /// beside another's identity — the torn pair the collector must never
+    /// adopt. A driver whose CLI has locks takes them here, briefly; the
+    /// default is `read_live`, which is the right answer for a provider that
+    /// has none. `DriverError::Locked` means the CLI holds them: the caller
+    /// degrades (serves from the store) rather than waits.
+    fn read_live_locked(&self, env: &Env) -> Result<Login, DriverError> {
+        self.read_live(env)
+    }
     /// Replace it, under the CLI's own locks; preserve state the login
     /// does not own (Claude: MCP OAuth tokens, non-account config).
     fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError>;

@@ -179,6 +179,15 @@ impl Fixture {
         })
     }
 
+    /// Record a slot as the active one, the way a `switch` leaves it.
+    fn set_active_slot(&self, slot: u32) {
+        let path = self.home.path().join("slots.json");
+        let mut slots: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        slots["providers"]["claude"]["activeSlot"] = json!(slot);
+        write(&path, &slots.to_string());
+    }
+
     fn cmd(&self) -> Command {
         let mut cmd = Command::cargo_bin("swapd").unwrap();
         cmd.env("SWAPD_HOME", self.home.path())
@@ -696,4 +705,50 @@ fn a_gated_active_slot_with_an_expired_login_reports_token_expired() {
     assert_eq!(slot["lastGood"]["windows"][0]["pct"], 42.0);
     two.assert_hits(0);
     token.assert_hits(0);
+}
+
+/// `engine.lock` fences swapd's own writers; Claude Code's `/login` is a writer
+/// it knows nothing about. The collector therefore reads the live login under
+/// Claude Code's own locks too, and when the CLI holds them the pass degrades
+/// exactly as it does for a switch in flight: the recorded active slot is
+/// served from the store as `stale`, and nothing is adopted from a pair that
+/// may be half written.
+#[test]
+fn the_active_slot_is_stale_while_claude_code_holds_its_own_locks() {
+    let fx = Fixture::new();
+    // Claude Code rotated slot 2's lineage; an unfenced pass would adopt it.
+    fx.write_live_login(
+        "two@example.com",
+        "org-2",
+        "tok-2",
+        "rt-2-rotated",
+        NOT_EXPIRED_MS,
+    );
+    fx.set_active_slot(2);
+    fx.usage_mock(1, 200, usage_body(12.0, 34.0));
+
+    // The proper-lockfile directory Claude Code takes first, freshly made: too
+    // young to be stolen as stale, so swapd's read spends its budget and
+    // degrades.
+    let held = fx.claude_home.path().join(".claude/.oauth_refresh.lock");
+    std::fs::create_dir_all(&held).unwrap();
+
+    let payload = fx.list();
+
+    assert!(payload["providers"][0]["activeSlot"].is_null(), "{payload}");
+    assert_eq!(account(&payload, 2)["usageStatus"], "stale");
+    assert_eq!(account(&payload, 2)["active"], false);
+    // Slot 1 is unaffected: only the account whose credential is behind the
+    // lock is held back.
+    assert_eq!(account(&payload, 1)["usageStatus"], "ok");
+
+    // Nothing adopted: the stored copy and the recorded fingerprint are what
+    // they were.
+    let stored =
+        std::fs::read_to_string(fx.home.path().join("credentials").join("claude_2")).unwrap();
+    assert!(stored.contains("\"rt-2\""), "{stored}");
+    let slots: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.home.path().join("slots.json")).unwrap())
+            .unwrap();
+    assert!(slots["providers"]["claude"]["slots"]["2"]["fingerprint"].is_null());
 }

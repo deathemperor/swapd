@@ -795,6 +795,22 @@ impl UsageStore {
     /// (`usage_store.py:1185-1211`): the strikes — and the failure state riding
     /// with them — no longer reflect reality, and the account must become
     /// fetch-eligible so the next pass can prove the new token good.
+    /// Give a claim back unmeasured: no window, no failure, no backoff.
+    ///
+    /// The lease would age out on its own after `CLAIM_TTL_S`, but a pass that
+    /// KNOWS it fetched nothing (a contended refresh lock) should not cost the
+    /// account 90s of being skipped by every other surface — the contention it
+    /// lost to is over in seconds.
+    pub fn release(&self, key: &str, claim: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut rows = self.read_rows()?;
+        let Some(row) = rows.get_mut(key).filter(|row| fenced(row, claim)) else {
+            return Ok(());
+        };
+        release_claim(row);
+        self.write_rows(rows)
+    }
+
     pub fn clear_dead(&self, key: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut rows = self.read_rows()?;

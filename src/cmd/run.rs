@@ -16,6 +16,7 @@ use std::io::IsTerminal;
 use std::process::{Command, ExitStatus};
 
 use crate::core::slots::{self, ProviderSlots};
+use crate::core::store::FileLock;
 use crate::core::switch::{match_slot, resolve};
 use crate::ctx::Ctx;
 use crate::driver::{Driver, Login};
@@ -193,7 +194,15 @@ fn ambient_config_dir(ctx: &Ctx) -> Option<&str> {
 /// for a credential that carries none. Any failure to read the live login
 /// answers "no" — the fast path must never be taken on a guess, and the profile
 /// route is correct for every account, including this one.
+///
+/// Read under `engine.lock`, like every other live read: a torn pair mid-swap
+/// (keychain = B, config = A) would answer "slot A is live" and run the child
+/// as account B. A switch in flight means "no" and the profile route, which is
+/// right whatever lands.
 fn is_live_account(ctx: &Ctx, driver: &dyn Driver, slots: &ProviderSlots, slot: u32) -> bool {
+    let Ok(_engine) = FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT) else {
+        return false;
+    };
     match driver.read_live(&ctx.env) {
         Ok(live) if !live.bytes.trim().is_empty() => match_slot(driver, slots, &live) == Some(slot),
         _ => false,

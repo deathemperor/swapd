@@ -45,6 +45,10 @@ const TOUCH_INTERVAL: Duration = Duration::from_secs(3);
 /// This is a PER-LOCK budget: `credentials_lock` acquires two sequentially, so
 /// its worst case is ~2x this value.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(9);
+/// The budget for a READ that only wants a consistent pair (credential +
+/// config). A status verb degrades instead of waiting, so this is short enough
+/// that a `list` racing a busy CLI answers rather than stalls.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A held proper-lockfile directory lock. `Drop` stops the toucher thread and
 /// removes the directory.

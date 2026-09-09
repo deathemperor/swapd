@@ -103,6 +103,9 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     // than failing every slot's usage with it (the one slot that *is* affected
     // is held back below). Any other error is a real fault and propagates.
     let mut keychain_down = false;
+    // The CLI is mid-write of its own login pair (its `/login`), which is the
+    // same torn read `engine.lock` fences swapd's own switches against.
+    let mut cli_busy = false;
     // A switch owns the live store right now: whatever is in it is a
     // half-written pair, and no answer derived from it is worth having. Not
     // read at all, rather than read and distrusted.
@@ -112,12 +115,25 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         );
         None
     } else {
-        match provider.read_live(&ctx.env) {
+        // Under the CLI's OWN locks too: `engine.lock` fences swapd's writers,
+        // and the CLI's `/login` is a writer it knows nothing about. Same
+        // degradation when the CLI holds them — a busy CLI is a normal state,
+        // and a status verb that stalls on it is worse than one that serves the
+        // active slot from the store.
+        match provider.read_live_locked(&ctx.env) {
             Ok(login) => Some(login),
             Err(DriverError::NoLogin) => None,
             Err(DriverError::KeychainUnavailable) => {
                 eprintln!("warning: {id}: the live login is unreadable (keychain unavailable)");
                 keychain_down = true;
+                None
+            }
+            Err(DriverError::Locked(why)) => {
+                eprintln!(
+                    "warning: {id}: the CLI holds its own login locks ({why}); \
+                     the active account is served from the store"
+                );
+                cli_busy = true;
                 None
             }
             Err(e) => return Err(e.into()),
@@ -129,7 +145,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     // it is served from the table and not fetched, instead of being fetched
     // with a stored copy the CLI may have rotated past. Every other slot is
     // unaffected and fetches normally.
-    let unreadable_active = (keychain_down || switch_in_flight)
+    let unreadable_active = (keychain_down || switch_in_flight || cli_busy)
         .then_some(slots.active_slot)
         .flatten();
 
@@ -550,9 +566,15 @@ fn write_live_guarded(
     if live_fingerprint == login.fingerprint() {
         return Ok(LiveWrite::Done); // already there (another refresher wrote it)
     }
-    let same_account = provider
-        .identity_offline(&live)
-        .is_some_and(|identity| slots::same_account(&identity, &st.meta));
+    // The same fallback every other identity match has (`match_slot`,
+    // `export`): a credential whose envelope carries no `oauthAccount` is
+    // matched by fingerprint alone — which is exactly what `expected` checks
+    // below. Without it a fingerprint-matched active slot could never be
+    // healed, and its live copy would stay on the spent generation forever.
+    let same_account = match provider.identity_offline(&live) {
+        Some(identity) if !identity.email.is_empty() => slots::same_account(&identity, &st.meta),
+        _ => true,
+    };
     if !same_account || expected != Some(live_fingerprint.as_str()) {
         return Ok(moved(
             st,
@@ -624,6 +646,14 @@ fn refresh_then_usage(
                 Some(&login.fingerprint()),
             )?;
             return Ok(Some(UsageStatus::ReloginRequired));
+        }
+        // Another process is spending this slot's token right now. That is not
+        // a failed fetch: no strike, no backoff, and not `token-expired` — the
+        // account is simply unmeasured this pass. The claim goes back so the
+        // next pass (the winner will be done by then) fetches it.
+        Refreshed::Failed(DriverError::Locked(_)) => {
+            ctx.store.release(&st.key, claim)?;
+            return Ok(Some(UsageStatus::Stale));
         }
         Refreshed::Failed(_) => {
             ctx.store

@@ -307,7 +307,8 @@ that driver's sub-spec is written.
   auto-state.json              cooldowns, quarantine
   credentials/<provider>/<slot>   0600 files (non-macOS)
   profiles/<provider>/<slot>/  per-slot run profiles
-  engine.lock                  one switch: the live read, the swap, the record
+  engine.lock                  the live login's fence: every read of it
+                               (list, add, export, run) and every write
   refresh-<provider>-<slot>.lock  one slot's token refresh
   auto.lock                    the `auto` daemon's mutex
 ```
@@ -356,7 +357,7 @@ TUI, directory mappings, session resume, cmux, Slack/Telegram sending
 - Active slot = identity match (email, organizationUuid) from the live envelope, fingerprint as fallback; the active fetch always uses the live login. Adopting the live login into a slot's secret is generational (`expires_at`): a spent generation never overwrites its successor, in the collector and in `switch`.
 - `write_live` failure after a refresh is per-account (`token-expired`), never fatal for `list`; keychain-down passes refresh nothing.
 - Sentinel statuses (`relogin-required`, `token-expired`, keychain hold-back) never populate `windows`; the measurement goes to `lastGood`.
-- Every slots.json write is a read-modify-write under `<slots.json>.lock`; `switch` also holds `home/engine.lock` per switch; the daemon mutex is `home/auto.lock` for its lifetime. Network before locks.
+- Every slots.json write is a read-modify-write under `<slots.json>.lock`; `home/engine.lock` fences the live login — every read of it (`list`, `add`, `export`, `run`) and every write (`switch`, the collector's heal); the collector also takes the CLI's own locks for the read, briefly, and degrades the active slot to `stale` rather than waiting; the daemon mutex is `home/auto.lock` for its lifetime. Network before locks.
 - `switch::perform(ctx, driver, target, trigger, Freshen { buffer_s, required })`: manual `{0, false}`, auto `{600, true}` (cswap FRESHEN_BUFFER_MS). Once `write_live` succeeds the switch has landed; later bookkeeping failures are warnings.
 - API-key slots cannot be activated in phase 1 (`can_activate`); `includeApiKeyAccounts` is stored only.
 - Settings defaults are cswap's `AutoSwitchSettings` (threshold 90.0, interval 60, cooldown 300, hysteresis 10, strategy best, unhealthyTicks 3, model/preferred empty); a plain `rotate` uses `settings.strategy`.

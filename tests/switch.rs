@@ -1199,3 +1199,56 @@ fn history_limit_keeps_the_newest() {
     assert_eq!(last["switches"].as_array().unwrap().len(), 1);
     assert_eq!(last["switches"][0]["to"]["slot"], 1);
 }
+
+/// A per-slot refresh lock is a fact about ONE candidate's credential, so the
+/// refusal is `refresh-denied` (which `rotate` skips past) and not `locked`
+/// (which is about the machine, and stops it).
+#[test]
+fn an_expired_target_whose_refresh_lock_is_held_is_refresh_denied() {
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (1, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+    ]);
+    fx.write_stored(
+        1,
+        &fx.login("one@example.com", "org-1", "rt-1", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(2, &fx.login("two@example.com", "org-2", "rt-2", EXPIRED_MS));
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-1",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    let token = fx.server.mock(|when, then| {
+        when.method(POST).path("/v1/oauth/token");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "access_token": "tok-fresh",
+                "refresh_token": "rt-fresh",
+                "expires_in": 28800,
+            }));
+    });
+
+    // Another process is mid-rotation of slot 2's single-use token.
+    let lock_path = fx.home.path().join("refresh-claude-2.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let mut lock = fd_lock::RwLock::new(file);
+    let _held = lock.try_write().expect("the test must own the lock");
+
+    let err = fx.run_err(&["switch", "2", "--json"]);
+    assert_eq!(err["error"]["code"], "refresh-denied");
+    // Not a token was spent, and the live login is still slot 1's.
+    token.assert_hits(0);
+    let live: Value = read_json(&fx.live_credentials());
+    assert_eq!(live["claudeAiOauth"]["refreshToken"], "rt-1");
+}

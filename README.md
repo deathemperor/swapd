@@ -88,7 +88,8 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
   auto-state.json              cooldowns, quarantine
   credentials/<provider>_<slot>   0600 files (non-macOS; macOS default is the login keychain)
   profiles/<provider>/<slot>/  per-slot run profiles (`ignite`, `run`)
-  engine.lock                  held for one switch: the live read, the swap, the record
+  engine.lock                  the live login's fence: every read of it
+                               (list, add, export, run) and every write
   refresh-<provider>-<slot>.lock  held for one slot's token refresh
   auto.lock                    the `auto` daemon's mutex, one per data dir
 ```

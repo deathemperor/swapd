@@ -125,6 +125,50 @@ impl ClaudeDriver {
         })
     }
 
+    /// `read_live` under Claude Code's own locks, in the order `write_live`
+    /// takes them (credentials, then config).
+    ///
+    /// The budget is `locks::READ_TIMEOUT`, not the 9s write budget: this is a
+    /// status read, and a caller that waited out two write budgets would stall
+    /// a `list` for ~18s behind a CLI that is merely busy. `Locked` on timeout,
+    /// which the collector degrades on.
+    ///
+    /// NOT reentrant (the locks are mkdir mutexes), so it belongs only where no
+    /// `write_live` can follow under the same guard.
+    pub fn read_live_locked(&self, env: &Env) -> Result<Login, DriverError> {
+        let _locks = match self.read_locks(env) {
+            Ok(held) => held,
+            // The lock DIRECTORIES cannot be created here at all (a read-only
+            // config dir). Claude Code takes the same directories in the same
+            // place, so a machine where they cannot be made is one where its
+            // own writes are not happening either — and failing every status
+            // verb on it would be a worse answer than the unfenced read this
+            // has always been. Narrowly the permission cases: a full disk or a
+            // vanished home is a fault, and faults are reported.
+            Err(DriverError::Io(e))
+                if matches!(
+                    e.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                return self.read_live(env)
+            }
+            Err(e) => return Err(e),
+        };
+        self.read_live(env)
+    }
+
+    /// Claude Code's credential locks, then its config lock — acquisition only,
+    /// so `read_live_locked` can tell "held by the CLI" from "cannot be taken".
+    fn read_locks(
+        &self,
+        env: &Env,
+    ) -> Result<(Vec<locks::LockGuard>, locks::LockGuard), DriverError> {
+        let credentials = locks::credentials_lock(env, locks::READ_TIMEOUT)?;
+        let config = locks::config_lock(env, locks::READ_TIMEOUT)?;
+        Ok((credentials, config))
+    }
+
     /// Replace it, under Claude Code's own locks, with the 9s production
     /// per-lock budget.
     pub fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError> {

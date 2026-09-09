@@ -349,8 +349,15 @@ fn refresh_if_stale(
         // generation it is spending would strand the successor it is about to
         // persist. Refused whoever asked — waiting is the answer here, and the
         // daemon's next tick is a wait.
+        //
+        // `refresh-denied`, not `locked`: a PER-SLOT lock is a fact about this
+        // candidate's credential, and `rotate`/`auto` skip a refusal about one
+        // candidate while treating `locked` (the machine's engine lock) as a
+        // reason to stop trying. Kept as its own arm rather than folded into
+        // the generic failure below, whose non-required-freshen path would
+        // switch to the very generation another process is spending.
         Refreshed::Failed(DriverError::Locked(e)) => Err(SwapdError::new(
-            ErrorCode::Locked,
+            ErrorCode::RefreshDenied,
             format!("slot {slot}'s login is being refreshed by another process ({e})"),
         )),
         Refreshed::Failed(e) if freshen.required => Err(SwapdError::new(

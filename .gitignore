@@ -1,0 +1,4 @@
+/swapd
+/dist/
+*.test
+.DS_Store

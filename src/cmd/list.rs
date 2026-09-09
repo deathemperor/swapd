@@ -7,8 +7,7 @@ use crate::driver::{self, Driver};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
 
-pub fn run(ctx: &Ctx, provider_filter: Option<&str>) -> Result<ListPayload> {
-    let drivers = drivers_for(provider_filter)?;
+pub fn run(ctx: &Ctx, drivers: &[Box<dyn Driver>]) -> Result<ListPayload> {
     let providers = drivers
         .iter()
         .map(|driver| collect(ctx, driver.as_ref(), &CollectOpts::default()))

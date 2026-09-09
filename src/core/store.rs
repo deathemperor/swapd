@@ -8,7 +8,6 @@ use serde::Serialize;
 
 use crate::errors::{ErrorCode, Result, SwapdError};
 
-// Not consumed by a verb yet; later tasks (login, use, ls, rm, history) read
 /// Read `path` as JSON, returning `T::default()` if the file doesn't exist.
 pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read(path) {
@@ -47,8 +46,6 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-// Not consumed by a verb yet; later tasks (login, use) take this before
-// mutating store files.
 /// An advisory lock on `<path>.lock`, held for the lifetime of this value.
 pub struct FileLock {
     _file: fs::File,

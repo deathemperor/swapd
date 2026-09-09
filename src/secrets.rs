@@ -238,7 +238,6 @@ impl Secrets for StickySecrets {
 /// `SWAPD_SECRETS` = `file` | `memory` overrides (tests, CI); unset -> macOS
 /// `Sticky(Security, File)`, elsewhere `File`. An unrecognized (non-empty, non-`file`,
 /// non-`memory`) value also falls back to `File` — never silently to the keychain.
-// Not wired into a verb yet; later tasks (login, use) call this to build their store.
 pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
     secrets_for(home, std::env::var("SWAPD_SECRETS").ok().as_deref())
 }
@@ -248,7 +247,6 @@ pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
 /// (a process-global that isn't safe to set/unset from a parallel test binary — a race
 /// could let `platform_default` run and, on macOS, write a test value into the real
 /// login keychain).
-// Not wired into a verb yet; `default_secrets` (above) and tests call this directly.
 pub fn secrets_for(home: &Home, mode: Option<&str>) -> Box<dyn Secrets> {
     match mode {
         Some("file") => Box::new(FileSecrets::new(home.credentials_dir())),

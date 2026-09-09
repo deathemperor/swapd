@@ -84,8 +84,8 @@ pub fn fetch(ep: &Endpoints, access_token: &str) -> Result<Value, DriverError> {
 ///
 /// Prefer `windows_at` wherever the fetch time is already known — pace is
 /// measured against the snapshot's own fetch time, and two `now()` reads drift.
-// `usage()` knows its fetch time and calls `windows_at`; this is for the callers
-// that re-normalize a stored response (Task 9's collector).
+// `usage()` knows its fetch time and calls `windows_at`; nothing re-normalizes a
+// stored response yet.
 #[allow(dead_code)]
 pub fn windows(raw: &Value) -> Vec<Window> {
     windows_at(raw, now_s())
@@ -189,8 +189,6 @@ pub fn relevant<'a>(windows: &'a [Window], models: &[String]) -> Vec<&'a Window>
 /// (`oauth.py:543-561`): `100 - max(pct)`, so `<= 0` means the account is at or
 /// over a limit. `None` when no window data is available, which callers treat
 /// as "unknown" — never as "skip".
-// Consumed by Task 9's autoswitch, which picks the account with the most of it.
-#[allow(dead_code)]
 pub fn headroom(windows: &[Window], models: &[String]) -> Option<f64> {
     let max = relevant(windows, models)
         .into_iter()

@@ -113,13 +113,22 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Version => version(cli.json),
         Command::Doctor => doctor(cli.json),
         Command::List => {
+            // Resolved before `Ctx::from_env()`, which creates the data dir: a
+            // rejected command must not leave one behind.
+            let drivers = cmd::list::drivers_for(cli.provider.as_deref())?;
             let ctx = ctx::Ctx::from_env()?;
-            emit_list(&cmd::list::run(&ctx, cli.provider.as_deref())?, cli.json)
+            emit_list(&cmd::list::run(&ctx, &drivers)?, cli.json)
         }
         Command::Refresh { slot } => {
-            let ctx = ctx::Ctx::from_env()?;
             let provider = cli.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
-            emit_list(&cmd::refresh::run(&ctx, provider, *slot)?, cli.json)
+            let driver = driver::by_id(provider).ok_or_else(|| {
+                SwapdError::new(
+                    ErrorCode::InvalidInput,
+                    format!("unknown provider: {provider}"),
+                )
+            })?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(&cmd::refresh::run(&ctx, driver.as_ref(), *slot)?, cli.json)
         }
     }
 }

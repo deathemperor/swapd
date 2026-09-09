@@ -238,7 +238,7 @@ pub trait Secrets: Send + Sync {
 // security_cli.rs — shared by Task 6's Claude driver (it reads Claude Code's own item through the same trait)
 pub trait SecurityCli: Send + Sync {
     fn find(&self, service: &str, account: Option<&str>) -> Result<Option<String>>; // `security find-generic-password -s S [-a A] -w`; exit 44 (not found) → Ok(None); other failures → KeychainUnavailable
-    fn add(&self, service: &str, account: &str, value: &str) -> Result<()>;         // `security add-generic-password -U -s S -a A -w VALUE`; the value goes on argv of a child no one else can see mid-flight is NOT acceptable → pass it via `-w` read from stdin is not supported, so use `security -i` (interactive mode reading commands from stdin): write "add-generic-password -U -s S -a A -w VALUE\n" to its stdin
+    fn add(&self, service: &str, account: &str, value: &str) -> Result<()>;         // never put VALUE on argv (visible in `ps`): run `security -i` (interactive mode) and write the line `add-generic-password -U -s S -a A -w VALUE\n` to its stdin, then close stdin; non-zero exit → KeychainUnavailable
     fn delete(&self, service: &str, account: &str) -> Result<()>;                   // `security delete-generic-password -s S -a A`
 }
 pub struct RealSecurity;         // /usr/bin/security, 15 s timeout per call
@@ -258,7 +258,7 @@ pub fn slot_key(provider: &str, slot: u32) -> String { format!("{provider}:{slot
 
 - `StickySecrets`: after the primary fails once with a backend error, every later call in this process goes to the fallback (port of the sticky per-process fallback, `credentials.py:126-140`). A `None` from the primary is not a failure.
 
-- [ ] **Step 1:** implement; `KeyringSecrets` maps `keyring::Error::NoEntry` → `Ok(None)`, other errors → `ErrorCode::KeychainUnavailable`.
+- [ ] **Step 1:** implement. `RealSecurity` runs `/usr/bin/security` with a 15 s wait (kill on timeout → KeychainUnavailable); `find` exit status 44 → `Ok(None)`, any other non-zero → `ErrorCode::KeychainUnavailable` with the message "keychain unavailable" (never echo `security`'s stderr, it can contain the account). `SecuritySecrets` uses service `swapd`, account = key. `default_secrets` reads `SWAPD_SECRETS`: `file` → `FileSecrets`, `memory` → `MemorySecrets`, unset → macOS `StickySecrets{Security, File}`, elsewhere `FileSecrets`.
 - [ ] **Step 2: tests** — `memory_roundtrip`, `file_backend_writes_0600` (unix), `security_secrets_roundtrip_through_fake_cli`, `security_not_found_is_none`, `sticky_falls_back_after_primary_error` (a `FailingSecrets` fake that errors on every call), `sticky_stays_on_fallback_for_process_lifetime`, `env_override_selects_file_backend`.
 - [ ] **Step 3:** green, fmt, clippy. **Commit** `secrets: security CLI + 0600 file store, sticky degrade`.
 

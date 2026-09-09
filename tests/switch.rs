@@ -617,41 +617,9 @@ fn switch_refreshes_an_expired_target_before_taking_the_locks() {
 
 #[test]
 fn rotate_consume_first_picks_soonest_weekly_reset() {
-    let fx = Fixture::new();
-    fx.write_slots(&[
-        (1, "one@example.com", "org-1"),
-        (2, "two@example.com", "org-2"),
-        (3, "three@example.com", "org-3"),
-    ]);
-    for (slot, email, org) in [
-        (1, "one@example.com", "org-1"),
-        (2, "two@example.com", "org-2"),
-        (3, "three@example.com", "org-3"),
-    ] {
-        fx.write_stored(
-            slot,
-            &fx.login(email, org, &format!("rt-{slot}"), NOT_EXPIRED_MS),
-        );
-    }
-    fx.write_live(
-        "one@example.com",
-        "org-1",
-        "rt-1",
-        NOT_EXPIRED_MS,
-        json!({}),
-    );
-
     // Fresh rows, so nothing is fetched: slot 3's weekly window resets first,
     // slot 2 has more headroom. consume-first must take 3 anyway.
-    let now = now_s();
-    fx.write_usage(json!({
-        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
-            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
-        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
-            "lastGood": [{"kind": "7d", "pct": 10.0, "resetsAt": "2026-09-30T00:00:00Z"}]},
-        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
-            "lastGood": [{"kind": "7d", "pct": 40.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
-    }));
+    let fx = rotate_fixture();
 
     let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
     assert_eq!(out["switched"], true);
@@ -699,6 +667,121 @@ fn rotate_fixture() -> Fixture {
             "lastGood": [{"kind": "7d", "pct": 40.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
     }));
     fx
+}
+
+/// `next-available` answers with the collector's own health rule, so it skips
+/// an account `list` would not have called `nextCandidate` either.
+#[test]
+fn rotate_next_available_skips_an_account_over_the_threshold() {
+    let fx = rotate_fixture();
+    // Slot 2 is next in rotation order after the active slot 1, but it is at
+    // 95% of its binding window — past the 90% default threshold.
+    let now = now_s();
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 95.0, "resetsAt": "2026-09-30T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 40.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+    }));
+
+    // `list` says the same thing about the same board, which is the parity the
+    // strategy's name claims.
+    let listed = fx.run(&["list", "--json", "--provider", "claude"]);
+    assert_eq!(listed["providers"][0]["nextCandidate"], 3);
+
+    let out = fx.run(&["rotate", "--json"]);
+    assert_eq!(
+        out["to"]["slot"], 3,
+        "the account over the threshold is not available"
+    );
+}
+
+/// A candidate whose credential turns out to be dead is what rotation is FOR:
+/// the next one in the ranking is tried rather than the rotate failing.
+#[test]
+fn rotate_skips_a_candidate_whose_refresh_token_is_dead() {
+    let fx = rotate_fixture();
+    // Slot 2 ranks first (rotation order after the active slot 1) but its
+    // stored login is expired, and the endpoint refuses the grant.
+    fx.write_stored(2, &fx.login("two@example.com", "org-2", "rt-2", EXPIRED_MS));
+    let token = fx.server.mock(|when, then| {
+        when.method(POST).path("/v1/oauth/token");
+        then.status(400)
+            .header("content-type", "application/json")
+            .json_body(json!({ "error": "invalid_grant" }));
+    });
+
+    let out = fx.run(&["rotate", "--json"]);
+    token.assert_hits(1);
+    assert_eq!(out["switched"], true);
+    assert_eq!(out["to"]["slot"], 3, "the next candidate takes it");
+    let warnings = out["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("slot 2")),
+        "the skipped candidate must be reported: {warnings:?}"
+    );
+    // One switch, and it is the one that landed.
+    let history = fx.history();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["to"]["slot"], 3);
+}
+
+/// Once `write_live` has returned, the swap has landed: a bookkeeping failure
+/// after it is a warning on a successful switch, not a failed one.
+#[test]
+fn a_landed_switch_reports_a_logging_failure_as_a_warning() {
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (1, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+    ]);
+    fx.write_stored(
+        1,
+        &fx.login("one@example.com", "org-1", "rt-1", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(
+        2,
+        &fx.login("two@example.com", "org-2", "rt-2", NOT_EXPIRED_MS),
+    );
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-1",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+    // A directory where the log belongs: appending to it cannot succeed.
+    std::fs::create_dir_all(fx.home.path().join("history.jsonl")).unwrap();
+
+    let out = fx.run(&["switch", "2", "--json"]);
+    assert_eq!(out["switched"], true, "the live store holds the target");
+    let warnings = out["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("not logged")),
+        "the unlogged switch must be reported: {warnings:?}"
+    );
+    // And the switch really did land, record and all.
+    let live: Value = read_json(&fx.live_credentials());
+    assert_eq!(live["claudeAiOauth"]["refreshToken"], "rt-2");
+    assert_eq!(fx.slots()["providers"]["claude"]["activeSlot"], 2);
+}
+
+/// `add` with nothing to capture is not a slot problem.
+#[test]
+fn add_without_a_live_login_is_invalid_input() {
+    let fx = Fixture::new();
+    let err = fx.run_err(&["add", "--json"]);
+    assert_eq!(err["error"]["code"], "invalid-input");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("log in first"));
 }
 
 #[test]

@@ -3,8 +3,7 @@
 use serde::Serialize;
 
 use crate::core::history::SlotRef;
-use crate::core::slots::SlotsFile;
-use crate::core::store::read_json;
+use crate::core::slots;
 use crate::core::switch::{self, SwitchResult};
 use crate::ctx::Ctx;
 use crate::driver::Driver;
@@ -28,12 +27,7 @@ pub struct SwitchOutput {
 pub fn run(ctx: &Ctx, provider: &dyn Driver, ident: &str) -> Result<SwitchOutput> {
     // Resolved from the file rather than from a collection pass: naming a slot
     // must not depend on the network being up.
-    let file: SlotsFile = read_json(&ctx.home.slots_file())?;
-    let slots = file
-        .providers
-        .get(provider.id())
-        .cloned()
-        .unwrap_or_default();
+    let slots = slots::load(&ctx.home, provider.id())?;
     let target = switch::resolve(&slots, provider.id(), ident)?;
     Ok(view(switch::perform(ctx, provider, target, "manual")?))
 }

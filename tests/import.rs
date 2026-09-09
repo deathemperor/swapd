@@ -291,6 +291,37 @@ fn a_malformed_account_imports_nothing_at_all() {
     assert!(!fx.home.path().join("slots.json").exists());
 }
 
+/// A credential that cannot be stored stops the import, and the error says
+/// which accounts did land — the rows for those are written, so the import is
+/// resumable rather than a table half of whose slots have no credential.
+#[test]
+fn a_credential_that_cannot_be_stored_names_what_was_imported() {
+    let fx = Fixture::new();
+    // A directory where slot 2's credential belongs: `set` cannot write it.
+    std::fs::create_dir_all(fx.home.path().join("credentials").join("claude_2")).unwrap();
+
+    let envelope = cswap_envelope(vec![
+        account(1, "one@example.com", "org-1"),
+        account(2, "two@example.com", "org-2"),
+    ]);
+    let err = fx.import_err(&envelope, &[]);
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("slot 2"), "{message}");
+    assert!(
+        message.contains("already imported: 1"),
+        "the error must name what landed: {message}"
+    );
+
+    // Slot 1 landed whole — credential and row — so a rerun has less to do,
+    // and no row points at bytes that were never written.
+    let slots = fx.slots();
+    assert_eq!(slot_of(&slots, 1)["email"], "one@example.com");
+    assert!(slot_of(&slots, 1)["fingerprint"].is_string());
+    assert!(slot_of(&slots, 2).is_null(), "slot 2 has no row");
+    let stored: Value = serde_json::from_str(&fx.stored(1)).unwrap();
+    assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-1");
+}
+
 #[test]
 fn unknown_envelopes_are_refused_by_name() {
     let fx = Fixture::new();

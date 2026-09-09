@@ -22,8 +22,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use crate::core::slots::{self, Slot, SlotsFile};
-use crate::core::store::read_json;
+use crate::core::slots::{self, Slot};
 use crate::ctx::Ctx;
 use crate::driver::{Driver, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
@@ -73,12 +72,10 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
 
     // Pass 1: validate. Nothing below this point may fail on the file's
     // contents — only on the environment (disk, keychain).
-    let file: SlotsFile = read_json(&ctx.home.slots_file())?;
-    let existing = file.providers.get(id).cloned().unwrap_or_default();
     let mut entries = Vec::new();
     let mut seen: BTreeMap<u32, String> = BTreeMap::new();
     for raw in accounts {
-        let entry = validate(raw)?;
+        let entry = validate(provider, raw)?;
         if let Some(other) = seen.insert(entry.slot, entry.email.clone()) {
             return Err(invalid(format!(
                 "export names slot {} twice ({other}, {})",
@@ -88,57 +85,112 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
         entries.push(entry);
     }
 
-    // Pass 2: writes.
-    let mut imported = Vec::new();
-    let mut skipped = Vec::new();
-    for entry in entries {
-        if let Some(occupant) = existing.slots.get(&entry.slot) {
-            let same = occupant.email.to_lowercase() == entry.email.to_lowercase()
-                && occupant.organization_uuid == entry.organization_uuid;
-            if same {
-                // Nothing to decide: the slot already holds this account.
-                // `--force` still rewrites it, which is how a fresher
-                // credential for an account you already have gets in.
-                if !force {
-                    skipped.push(Skipped {
-                        slot: entry.slot,
-                        email: entry.email,
-                        reason: "already-present".to_string(),
-                    });
-                    continue;
+    // Pass 2: writes — all of them in ONE `slots.json` lock cycle, so an
+    // import either lands as a table or does not land at all, and the occupancy
+    // decisions are made against the same copy of the file they are written to.
+    let (imported, skipped, failure) = slots::update(&ctx.home.slots_file(), |file| {
+        let existing = file.providers.entry(id.to_string()).or_default();
+        let mut imported: Vec<u32> = Vec::new();
+        let mut skipped: Vec<Skipped> = Vec::new();
+        let mut rows: Vec<(u32, Slot)> = Vec::new();
+        let mut failure = None;
+
+        for entry in entries {
+            if let Some(occupant) = existing.slots.get(&entry.slot) {
+                let same = occupant.email.to_lowercase() == entry.email.to_lowercase()
+                    && occupant.organization_uuid == entry.organization_uuid;
+                if same {
+                    // Nothing to decide: the slot already holds this account.
+                    // `--force` still rewrites it, which is how a fresher
+                    // credential for an account you already have gets in.
+                    if !force {
+                        skipped.push(Skipped {
+                            slot: entry.slot,
+                            email: entry.email,
+                            reason: "already-present".to_string(),
+                        });
+                        continue;
+                    }
+                } else if !force {
+                    // Refused rather than reported: silently skipping would
+                    // leave the user believing an account they can see in the
+                    // file is importable, and overwriting it unasked would
+                    // destroy a login that may exist nowhere else.
+                    return Err(invalid(format!(
+                        "slot {} holds {} ({}); pass --force to overwrite it",
+                        entry.slot,
+                        occupant.email,
+                        if occupant.organization_uuid.is_empty() {
+                            "personal"
+                        } else {
+                            &occupant.organization_uuid
+                        },
+                    )));
                 }
-            } else if !force {
-                // Refused in the write pass rather than reported: silently
-                // skipping would leave the user believing an account they can
-                // see in the file is importable, and overwriting it unasked
-                // would destroy a login that may exist nowhere else.
-                return Err(invalid(format!(
-                    "slot {} holds {} ({}); pass --force to overwrite it",
-                    entry.slot,
-                    occupant.email,
-                    if occupant.organization_uuid.is_empty() {
-                        "personal"
-                    } else {
-                        &occupant.organization_uuid
-                    },
-                )));
             }
+
+            // Secrets first, rows after: bytes without a row are unreferenced,
+            // a row without bytes is a slot that cannot authenticate. A keychain
+            // that fails part way therefore stops the import here and reports
+            // which slots did land, rather than aborting the whole closure and
+            // leaving the credentials it already wrote with nothing pointing at
+            // them.
+            let key = crate::secrets::slot_key(id, entry.slot);
+            if let Err(e) = ctx.secrets.set(&key, &entry.login.bytes) {
+                failure = Some(SwapdError::new(
+                    e.code,
+                    format!(
+                        "slot {}'s credential could not be stored ({}); {}",
+                        entry.slot,
+                        e.message,
+                        if imported.is_empty() {
+                            "nothing was imported".to_string()
+                        } else {
+                            format!(
+                                "already imported: {}",
+                                imported
+                                    .iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ),
+                ));
+                break;
+            }
+            let mut meta = Slot {
+                email: entry.email.clone(),
+                organization_uuid: entry.organization_uuid.clone(),
+                organization_name: entry.organization_name.clone(),
+                plan: None,
+                alias: entry.alias.clone(),
+                icon: None,
+                disabled: false,
+                preferred: false,
+                added: entry.added.clone(),
+                fingerprint: None,
+            };
+            meta.fingerprint = Some(entry.login.fingerprint());
+            rows.push((entry.slot, meta));
+            imported.push(entry.slot);
         }
 
-        let meta = Slot {
-            email: entry.email.clone(),
-            organization_uuid: entry.organization_uuid.clone(),
-            organization_name: entry.organization_name.clone(),
-            plan: None,
-            alias: entry.alias.clone(),
-            icon: None,
-            disabled: false,
-            preferred: false,
-            added: entry.added.clone(),
-            fingerprint: None,
-        };
-        slots::write_slot(ctx, id, entry.slot, meta, &entry.login)?;
-        imported.push(entry.slot);
+        let dirty = !rows.is_empty();
+        for (slot, meta) in rows {
+            existing.insert(slot, meta);
+        }
+        Ok((dirty, (imported, skipped, failure)))
+    })?;
+
+    // Outside the lock, so the usage store's is never nested inside it: a slot
+    // holding new bytes under the quarantine its previous credential earned
+    // would read as "re-login needed" forever (`switcher.py:3535`).
+    for slot in &imported {
+        ctx.store.clear_dead(&crate::secrets::slot_key(id, *slot))?;
+    }
+    if let Some(failure) = failure {
+        return Err(failure);
     }
 
     Ok(ImportResult {
@@ -193,7 +245,7 @@ fn active_slot(envelope: &Map<String, Value>) -> Option<u32> {
 
 /// One account entry, validated whole (`_validate_imported_account`,
 /// `transfer.py:59`).
-fn validate(raw: &Value) -> Result<Entry> {
+fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
     let account = raw
         .as_object()
         .ok_or_else(|| invalid("account entry must be a JSON object"))?;
@@ -228,7 +280,7 @@ fn validate(raw: &Value) -> Result<Entry> {
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty());
 
-    let login = login_of(account, &email)?;
+    let login = login_of(provider, account, &email)?;
     Ok(Entry {
         slot,
         email,
@@ -243,18 +295,20 @@ fn validate(raw: &Value) -> Result<Entry> {
 /// The account's credential as a swapd `Login`: a raw `sk-ant-api…` string for
 /// a managed key, else the credential object with the export's
 /// `config.oauthAccount` spliced in (see the module docs).
-fn login_of(account: &Map<String, Value>, email: &str) -> Result<Login> {
+fn login_of(provider: &dyn Driver, account: &Map<String, Value>, email: &str) -> Result<Login> {
     match account.get("credentials") {
         Some(Value::String(key)) => {
-            let key = key.trim();
-            if !key.starts_with("sk-ant-api") {
+            let login = Login {
+                bytes: key.trim().to_string(),
+            };
+            // The driver's own predicate: a string credential is only ever a
+            // managed key, and what one looks like is the engine's business.
+            if !provider.is_api_key(&login) {
                 return Err(invalid(format!(
-                    "string credentials for {email} must be a raw sk-ant-api… key"
+                    "string credentials for {email} must be a raw managed API key"
                 )));
             }
-            Ok(Login {
-                bytes: key.to_string(),
-            })
+            Ok(login)
         }
         Some(Value::Object(credentials)) => {
             let mut credentials = credentials.clone();
@@ -328,7 +382,8 @@ mod tests {
             "credentials": {"claudeAiOauth": {"refreshToken": "rt-1"}},
             "config": {"oauthAccount": {"emailAddress": "one@example.com"}},
         });
-        let entry = validate(&account).unwrap();
+        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform();
+        let entry = validate(&driver, &account).unwrap();
         let value: Value = serde_json::from_str(&entry.login.bytes).unwrap();
         assert_eq!(value["oauthAccount"]["emailAddress"], "one@example.com");
         assert_eq!(value["claudeAiOauth"]["refreshToken"], "rt-1");
@@ -343,7 +398,8 @@ mod tests {
         });
         // Not `unwrap_err`: `Entry` deliberately has no `Debug`, so a
         // credential can never reach a panic message.
-        match validate(&account) {
+        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform();
+        match validate(&driver, &account) {
             Err(e) => assert_eq!(e.code, ErrorCode::InvalidInput),
             Ok(_) => panic!("a non-key string credential must be refused"),
         }

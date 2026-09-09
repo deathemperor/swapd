@@ -77,55 +77,68 @@ pub fn update<T>(
 /// The `slots.json` layout this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Put a login in slot `n` and record the account it belongs to: the secret,
-/// the slot row (stamped with the login's fingerprint), and the lifting of any
-/// dead-token quarantine the slot's PREVIOUS credential earned.
+/// One provider's table, or an empty one when the file (or the provider) is
+/// not there yet. Every read path outside `update` goes through this.
+pub fn load(home: &crate::paths::Home, provider: &str) -> Result<ProviderSlots> {
+    let file: SlotsFile = read_json(&home.slots_file())?;
+    Ok(file.providers.get(provider).cloned().unwrap_or_default())
+}
+
+/// Decide which slot a login lands in and write it, both under
+/// `slots.json`'s lock.
 ///
-/// The three go together in cswap too (`add_account`, `add_account_from_token`
-/// and `import_accounts` all end in the same trio): a slot holding new bytes
-/// under an old quarantine is an account that reads as "re-login needed"
-/// forever and never fetches again (`switcher.py:3535`).
+/// `decide` sees the provider's table as it stands *inside* the lock and
+/// answers with the slot to write, its row, the credential, and whatever the
+/// caller wants to report (`created`, the resolved email). Deciding outside the
+/// lock and writing inside it is a check-then-act: two concurrent `add`s both
+/// compute the same `next_free()` and the second silently overwrites the
+/// first's row.
 ///
-/// The secret is written BEFORE the row: a row pointing at a fingerprint whose
-/// bytes never landed is a slot that cannot authenticate, while bytes without a
-/// row are merely unreferenced.
-pub fn write_slot(ctx: &Ctx, provider: &str, n: u32, mut meta: Slot, login: &Login) -> Result<()> {
-    let key = crate::secrets::slot_key(provider, n);
-    ctx.secrets.set(&key, &login.bytes)?;
-    meta.fingerprint = Some(login.fingerprint());
-    update(&ctx.home.slots_file(), |file| {
-        file.providers
-            .entry(provider.to_string())
-            .or_default()
-            .insert(n, meta);
-        Ok((true, ()))
+/// What lands is a trio, as in cswap (`add_account`, `add_account_from_token`
+/// and `import_accounts` all end in it): the secret, the slot row stamped with
+/// the login's fingerprint, and the lifting of any dead-token quarantine the
+/// slot's PREVIOUS credential earned — a slot holding new bytes under an old
+/// quarantine reads as "re-login needed" forever and never fetches again
+/// (`switcher.py:3535`).
+///
+/// The secret is written BEFORE the row (a row pointing at bytes that never
+/// landed is a slot that cannot authenticate, while bytes without a row are
+/// merely unreferenced) and inside the lock, because the slot number it is
+/// keyed by is only decided there. `clear_dead` stays outside it, so the usage
+/// store's lock is never nested inside `slots.json`'s.
+///
+/// `activate` records the slot as the provider's active one in the same cycle,
+/// for the verb whose write IS the live login (`add`).
+pub fn claim<T>(
+    ctx: &Ctx,
+    provider: &str,
+    activate: bool,
+    decide: impl FnOnce(&ProviderSlots) -> Result<(u32, Slot, Login, T)>,
+) -> Result<(u32, T)> {
+    let (n, extra) = update(&ctx.home.slots_file(), |file| {
+        let existing = file.providers.entry(provider.to_string()).or_default();
+        let (n, mut meta, login, extra) = decide(existing)?;
+        ctx.secrets
+            .set(&crate::secrets::slot_key(provider, n), &login.bytes)?;
+        meta.fingerprint = Some(login.fingerprint());
+        existing.insert(n, meta);
+        if activate {
+            existing.active_slot = Some(n);
+        }
+        Ok((true, (n, extra)))
     })?;
-    ctx.store.clear_dead(&key)
+    ctx.store
+        .clear_dead(&crate::secrets::slot_key(provider, n))?;
+    Ok((n, extra))
 }
 
 // `remove` waits for the slots verbs (`rm`); the rest are wired up.
+// (Resolving an `<ident>` to a slot is `core::switch::resolve`, which is the
+// one resolver: it tries alias before email and reports ambiguity.)
 #[allow(dead_code)]
 impl ProviderSlots {
     pub fn next_free(&self) -> u32 {
         (1..).find(|n| !self.slots.contains_key(n)).unwrap()
-    }
-
-    pub fn resolve(&self, ident: &str) -> Option<u32> {
-        // number, then exact email (case-insensitive), then alias
-        if let Ok(n) = ident.parse::<u32>() {
-            return self.slots.contains_key(&n).then_some(n);
-        }
-        let l = ident.to_lowercase();
-        self.slots
-            .iter()
-            .find(|(_, s)| s.email.to_lowercase() == l)
-            .map(|(n, _)| *n)
-            .or_else(|| {
-                self.slots
-                    .iter()
-                    .find(|(_, s)| s.alias.as_deref().map(|a| a.to_lowercase()) == Some(l.clone()))
-                    .map(|(n, _)| *n)
-            })
     }
 
     pub fn insert(&mut self, n: u32, slot: Slot) {
@@ -171,19 +184,5 @@ mod tests {
         assert_eq!(ps.next_free(), 3);
         ps.remove(1);
         assert_eq!(ps.next_free(), 1);
-    }
-
-    #[test]
-    fn resolve_by_number_email_alias() {
-        let mut ps = ProviderSlots::default();
-        ps.insert(1, slot("Alice@Example.com", Some("work")));
-        ps.insert(2, slot("bob@example.com", None));
-
-        assert_eq!(ps.resolve("1"), Some(1));
-        assert_eq!(ps.resolve("3"), None);
-        assert_eq!(ps.resolve("alice@example.com"), Some(1));
-        assert_eq!(ps.resolve("BOB@EXAMPLE.COM"), Some(2));
-        assert_eq!(ps.resolve("Work"), Some(1));
-        assert_eq!(ps.resolve("nobody"), None);
     }
 }

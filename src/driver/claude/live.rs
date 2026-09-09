@@ -536,7 +536,7 @@ pub fn write_json_config(path: &Path, value: &Value) -> Result<(), DriverError> 
 /// (`credentials.py:166-178`). Strict on purpose: requiring the `sk-ant-api`
 /// prefix (and that it isn't JSON) keeps a raw `sk-ant-oat…` setup token from
 /// being misclassified.
-fn looks_like_api_key(credentials: &str) -> bool {
+pub fn looks_like_api_key(credentials: &str) -> bool {
     let text = credentials.trim();
     text.starts_with("sk-ant-api") && !text.starts_with('{')
 }

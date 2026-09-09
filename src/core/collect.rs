@@ -150,14 +150,10 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
             // generation, in which case the stored copy is used and written
             // back to heal the divergence.
             let live = live.take().expect("`active` is gated on a live login");
-            let live_expiry = provider.expires_at(&live);
-            let stored_expiry = stored.as_ref().and_then(|l| provider.expires_at(l));
-            let live_is_older = match (live_expiry, stored_expiry) {
-                (Some(live), Some(stored)) => live < stored,
-                // An unknown expiry on either side is no evidence of order.
-                _ => false,
-            };
-            match (live_is_older, stored, stored_fingerprint) {
+            let older = stored
+                .as_ref()
+                .is_some_and(|stored| crate::driver::live_is_older(provider, &live, stored));
+            match (older, stored, stored_fingerprint) {
                 (true, Some(stored), fingerprint) => {
                     heal_live = true;
                     (Some(stored), fingerprint)
@@ -178,7 +174,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
         let sentinel = match &login {
             _ if unreadable_active == Some(*slot) => Some(UsageStatus::Stale),
             None => Some(UsageStatus::NoCredentials),
-            Some(login) if looks_like_api_key(&login.bytes) => Some(UsageStatus::ApiKey),
+            Some(login) if provider.is_api_key(login) => Some(UsageStatus::ApiKey),
             Some(_) => None,
         };
 
@@ -322,15 +318,6 @@ fn rotation_order(slots: &ProviderSlots) -> Vec<u32> {
         .collect();
     out.extend(extra);
     out
-}
-
-/// A managed API key rather than an OAuth login: no subscription quota to
-/// fetch (`switcher.py:4604-4606`).
-fn looks_like_api_key(bytes: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(bytes) {
-        Ok(value) => value.get("claudeAiOauth").is_none() && bytes.trim().starts_with("sk-ant-"),
-        Err(_) => bytes.trim().starts_with("sk-ant-"),
-    }
 }
 
 fn entry_of<'a>(entries: &'a BTreeMap<String, Entry>, key: &str) -> &'a Entry {
@@ -671,13 +658,18 @@ fn rotatable(st: &SlotState) -> bool {
 }
 
 fn healthy(ctx: &Ctx, st: &SlotState, entry: &Entry) -> bool {
-    if !rotatable(st) {
-        return false;
-    }
-    entry
-        .decision_windows()
-        .and_then(|windows| binding_pct(windows, &ctx.settings.models))
-        .is_none_or(|pct| pct < ctx.settings.threshold)
+    rotatable(st) && within_threshold(ctx, entry.decision_windows().unwrap_or(&[]))
+}
+
+/// Whether an account's measured headroom leaves the rotation willing to land
+/// on it: its binding window is below the configured threshold.
+///
+/// Unknown headroom passes. An account nobody has measured yet is a candidate,
+/// and proving it is what the switch does — the same rule `nextCandidate` and
+/// `rotate --strategy next-available` both answer with, which is why they share
+/// this function rather than each spelling the comparison out.
+pub fn within_threshold(ctx: &Ctx, windows: &[crate::contract::Window]) -> bool {
+    binding_pct(windows, &ctx.settings.models).is_none_or(|pct| pct < ctx.settings.threshold)
 }
 
 /// The earliest moment an exhausted account becomes usable again.

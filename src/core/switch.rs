@@ -18,11 +18,11 @@
 //! is held for local I/O only.
 
 use crate::contract::{AccountView, ProviderView, UsageStatus};
-use crate::core::collect::record_slot_fingerprint;
+use crate::core::collect::{record_slot_fingerprint, within_threshold};
 use crate::core::history::{self, SlotRef, SwitchRecord};
 use crate::core::poll_policy::{binding_pct, parse_reset_ts};
-use crate::core::slots::{self, ProviderSlots, SlotsFile};
-use crate::core::store::{read_json, FileLock};
+use crate::core::slots::{self, ProviderSlots};
+use crate::core::store::FileLock;
 use crate::ctx::Ctx;
 use crate::driver::claude::usage::format_ts;
 use crate::driver::{Driver, DriverError, Login};
@@ -125,8 +125,7 @@ pub fn perform(
     trigger: &str,
 ) -> Result<SwitchResult> {
     let id = provider.id();
-    let file: SlotsFile = read_json(&ctx.home.slots_file())?;
-    let slots = file.providers.get(id).cloned().unwrap_or_default();
+    let slots = slots::load(&ctx.home, id)?;
     let meta = slots.slots.get(&target).cloned().ok_or_else(|| {
         SwapdError::new(ErrorCode::NoSuchSlot, format!("no slot {target} for {id}"))
     })?;
@@ -146,16 +145,15 @@ pub fn perform(
         })?;
 
     // Refused here, before the engine lock and before the outgoing login is
-    // touched: `write_live` rejects a managed key anyway (Claude Code holds it
-    // on a different axis), and failing there would mean saying so only after
-    // the previous login had already been backed up or stashed.
-    if target_login.bytes.trim().starts_with("sk-ant-api") {
+    // touched: `write_live` rejects some credentials (Claude: a managed key,
+    // which lives on a different axis), and failing there would mean saying so
+    // only after the previous login had already been backed up or stashed. The
+    // driver owns the question — core does not know what any engine's
+    // credentials look like.
+    if let Err(e) = provider.can_activate(&target_login) {
         return Err(SwapdError::new(
             ErrorCode::Unsupported,
-            format!(
-                "slot {target} holds a managed API key; activating Claude Code's \
-                 API-key axis is not implemented"
-            ),
+            format!("slot {target} cannot be made {id}'s live login: {e}"),
         ));
     }
 
@@ -186,9 +184,12 @@ pub fn perform(
 
     let _engine = FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT)?;
 
-    // Re-read under the lock: this is the copy that gets backed up, and it is
-    // the reason the lock exists (a refresh landing mid-swap must not hand us a
-    // superseded generation).
+    // Both re-read under the lock: the live login because it is the copy that
+    // gets backed up and the reason the lock exists (a refresh landing mid-swap
+    // must not hand us a superseded generation), and the slot table because an
+    // `add` between the resolve and here would otherwise have the back-up match
+    // against rows that no longer exist.
+    let slots = slots::load(&ctx.home, id)?;
     let live = read_live_for_switch(provider, &ctx.env)?;
     let from = match &live {
         Some(live) => Some(preserve_outgoing(
@@ -221,13 +222,24 @@ pub fn perform(
         return Err(e.into());
     }
 
-    slots::update(&ctx.home.slots_file(), |file| {
+    // Past this point the swap has LANDED: the live store holds the target and
+    // the user's next `claude` runs as it. A bookkeeping failure here (a
+    // concurrent `list` holding `slots.json.lock` past the timeout, a full
+    // disk under `history.jsonl`) is therefore a warning, not an error —
+    // reporting a switch that happened as a failure would have callers retry
+    // it, get `already-active`, and never repair the record.
+    if let Err(e) = slots::update(&ctx.home.slots_file(), |file| {
         let entry = file.providers.entry(id.to_string()).or_default();
         entry.active_slot = Some(target);
         Ok((true, ()))
-    })?;
+    }) {
+        warnings.push(format!(
+            "the switch landed but slot {target} could not be recorded as active ({e}); \
+             `swapd list` will re-derive it from the live login"
+        ));
+    }
 
-    history::append(
+    if let Err(e) = history::append(
         &ctx.home,
         &SwitchRecord {
             ts: format_ts(ctx.now()).unwrap_or_default(),
@@ -235,7 +247,9 @@ pub fn perform(
             to: to.clone(),
             trigger: trigger.to_string(),
         },
-    )?;
+    ) {
+        warnings.push(format!("the switch landed but was not logged ({e})"));
+    }
 
     Ok(SwitchResult {
         switched: true,
@@ -335,11 +349,28 @@ fn preserve_outgoing(
         return Ok(SlotRef::unmanaged(email));
     };
 
-    // The rotated token is the point: the live copy is by definition the
-    // current generation of this slot's lineage, so it replaces the stored one.
+    // The rotated token is the point: the live copy is normally the current
+    // generation of this slot's lineage, so it replaces the stored one.
+    //
+    // Normally, but not always — and the exception loses an account when it is
+    // missed. A `write_live` that failed after the collector had already
+    // persisted a rotation (Claude Code holding its credential lock is enough)
+    // leaves the stored copy one generation AHEAD of the live one, and the live
+    // one's refresh token already spent. Writing it over its successor would
+    // strand the only unspent generation, so the guard is the collector's:
+    // never adopt a login the credentials themselves say is older.
     let key = slot_key(id, slot);
     let stored = ctx.secrets.get(&key)?;
-    if stored.as_deref() != Some(live.bytes.as_str()) {
+    let stored_login = stored.clone().map(|bytes| Login { bytes });
+    if stored_login
+        .as_ref()
+        .is_some_and(|stored| crate::driver::live_is_older(provider, live, stored))
+    {
+        warnings.push(format!(
+            "slot {slot} already holds a newer generation of this account's login than the \
+             live one; the live copy was discarded rather than overwrite it"
+        ));
+    } else if stored.as_deref() != Some(live.bytes.as_str()) {
         ctx.secrets.set(&key, &live.bytes)?;
         record_slot_fingerprint(ctx, id, slot, Some(&live.fingerprint()))?;
         // A quarantine condemned the generation this slot used to hold, not the
@@ -415,7 +446,20 @@ pub fn rank(ctx: &Ctx, view: &ProviderView, strategy: Strategy, preferred: &[Str
     let rotation: Vec<&AccountView> = view
         .accounts
         .iter()
-        .filter(|a| !a.active && rotatable(a) && headroom(ctx, a).is_none_or(|h| h > 0.0))
+        .filter(|a| !a.active && rotatable(a))
+        .filter(|a| match strategy {
+            // `next-available` is the strategy `list` advertises as
+            // `nextCandidate`, so it answers with the collector's own health
+            // rule — an account over the threshold is not "available", however
+            // much of its window is technically left.
+            Strategy::NextAvailable => within_threshold(ctx, decision_windows(a)),
+            // The other two are asked for on purpose and rank PAST the
+            // threshold: `consume-first` exists to land on the account closest
+            // to its reset, and a `best` that answered "no candidate" because
+            // every account is over 90% would withhold the very account it was
+            // asked to find. Only an exhausted window is out.
+            _ => headroom(ctx, a).is_none_or(|h| h > 0.0),
+        })
         .collect();
 
     if strategy == Strategy::NextAvailable {
@@ -532,6 +576,8 @@ fn is_preferred(account: &AccountView, preferred: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::core::slots::Slot;
+    use crate::core::slots::SlotsFile;
+    use crate::core::store::read_json;
     use crate::driver::Identity;
 
     fn slot(email: &str, alias: Option<&str>) -> Slot {
@@ -658,8 +704,15 @@ mod tests {
                 uuid: None,
             })
         }
-        fn expires_at(&self, _login: &Login) -> Option<f64> {
-            None
+        /// The real drivers read the credential's stated expiry; this one does
+        /// too, so the generational guard can be driven from a test. A login
+        /// without the field answers `None`, which is what most of these tests
+        /// want (no expiry, no refresh, no ordering evidence).
+        fn expires_at(&self, login: &Login) -> Option<f64> {
+            serde_json::from_str::<serde_json::Value>(&login.bytes)
+                .ok()?
+                .pointer("/claudeAiOauth/expiresAt")?
+                .as_f64()
         }
         fn refresh(&self, _login: &Login) -> std::result::Result<Login, DriverError> {
             Err(DriverError::TokenDead)
@@ -683,6 +736,18 @@ mod tests {
         ) -> std::result::Result<crate::driver::RunProfile, DriverError> {
             Err(DriverError::Unsupported("run"))
         }
+        fn can_activate(&self, login: &Login) -> std::result::Result<(), DriverError> {
+            if self.is_api_key(login) {
+                return Err(DriverError::Invalid("api key login".to_string()));
+            }
+            Ok(())
+        }
+
+        fn is_api_key(&self, login: &Login) -> bool {
+            let text = login.bytes.trim();
+            text.starts_with("sk-ant-api") && !text.starts_with('{')
+        }
+
         fn capabilities(&self) -> crate::driver::Caps {
             crate::driver::Caps {
                 ignite: true,
@@ -799,6 +864,64 @@ mod tests {
             crate::core::history::read(&ctx.home, None).unwrap().len(),
             1
         );
+    }
+
+    /// The stored copy is a LATER generation than the live one — what a
+    /// `write_live` that failed after the collector had persisted a rotation
+    /// leaves behind. Backing the live login up over it would strand the only
+    /// unspent generation this account has.
+    #[test]
+    fn the_backup_never_overwrites_a_newer_stored_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        // Both expiries are in the future, so nothing refreshes; only their
+        // ORDER matters. The stored copy is the successor.
+        let live = dated(&login_for("one@example.com", "rt-spent"), 2_000_000_000.0);
+        let stored = dated(
+            &login_for("one@example.com", "rt-successor"),
+            2_100_000_000.0,
+        );
+        ctx.secrets.set(&slot_key("claude", 1), &stored).unwrap();
+        let stamp = Login {
+            bytes: stored.clone(),
+        }
+        .fingerprint();
+        record_slot_fingerprint(&ctx, "claude", 1, Some(&stamp)).unwrap();
+        let driver = FakeDriver::new(&live, false);
+
+        let result = perform(&ctx, &driver, 2, "manual").unwrap();
+        assert!(result.switched);
+        assert_eq!(result.from.as_ref().unwrap().slot, Some(1));
+
+        assert_eq!(
+            ctx.secrets.get(&slot_key("claude", 1)).unwrap().unwrap(),
+            stored,
+            "the newer stored generation must survive the back-up"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("newer generation")),
+            "the discarded live copy must be reported: {:?}",
+            result.warnings
+        );
+        // The fingerprint stamp belongs to the generation the slot still holds,
+        // so the back-up must not have re-stamped it either.
+        let file: SlotsFile = read_json(&ctx.home.slots_file()).unwrap();
+        assert_eq!(
+            file.providers["claude"].slots[&1].fingerprint,
+            Some(stamp),
+            "a re-stamp would have replaced it with the live login's fingerprint"
+        );
+    }
+
+    /// The same login with a stated expiry, so `expires_at` can order two of
+    /// them.
+    fn dated(login: &str, expires_at: f64) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(login).unwrap();
+        value["claudeAiOauth"]["expiresAt"] = serde_json::json!(expires_at);
+        value.to_string()
     }
 
     #[test]

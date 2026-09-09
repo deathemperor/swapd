@@ -261,6 +261,39 @@ pub trait Driver: Send + Sync {
     fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
     fn capabilities(&self) -> Caps; // ignite, add_token, prefer, refresh…
+    /// Whether this login can be made the live one at all, asked *before* any
+    /// side effect.
+    ///
+    /// `write_live` refuses some credentials (Claude: anything that is not an
+    /// OAuth object, because a managed key lives on a different axis). Learning
+    /// that only from `write_live` would mean discovering it after the outgoing
+    /// login had already been backed up or stashed, so `switch` asks first. No
+    /// default: an engine that cannot answer would silently inherit "yes".
+    fn can_activate(&self, login: &Login) -> Result<(), DriverError>;
+    /// Whether this credential is a managed API key rather than a subscription
+    /// login: one definition of the question for the collector's sentinel,
+    /// `add`'s capture refusal, `add-token`'s kind detection and `import`'s
+    /// validation, which had five spellings of it between them.
+    fn is_api_key(&self, login: &Login) -> bool;
+}
+
+/// Whether `live` is provably an OLDER generation of a lineage than `stored`.
+///
+/// Claude's refresh tokens are single-use, so writing a spent generation over
+/// its successor strands the successor: the next refresh POSTs a token the
+/// endpoint has already consumed and the account reads as dead. Both the
+/// collector's adopt (a `write_live` that failed after the rotation was
+/// persisted) and `switch`'s back-up of the outgoing login have to ask this,
+/// and one answer keeps them from drifting apart.
+///
+/// An unknown expiry on either side is no evidence of order, so it answers
+/// `false`: the caller's normal rule (the live copy is the current one) stands
+/// unless the credentials themselves say otherwise.
+pub fn live_is_older(driver: &dyn Driver, live: &Login, stored: &Login) -> bool {
+    match (driver.expires_at(live), driver.expires_at(stored)) {
+        (Some(live), Some(stored)) => live < stored,
+        _ => false,
+    }
 }
 
 /// All known provider drivers.

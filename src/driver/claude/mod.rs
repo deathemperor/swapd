@@ -127,6 +127,17 @@ impl Driver for ClaudeDriver {
     }
 
     /// Claude Code supports every verb swapd has.
+    /// Claude Code's live login is its OAuth item; a managed `sk-ant-api…` key
+    /// is a different axis (`ANTHROPIC_API_KEY` / the approved-key list) that
+    /// `write_live` deliberately refuses, so the same gate answers here.
+    fn can_activate(&self, login: &Login) -> Result<(), DriverError> {
+        live::require_oauth_login(&login.bytes)
+    }
+
+    fn is_api_key(&self, login: &Login) -> bool {
+        live::looks_like_api_key(&login.bytes)
+    }
+
     fn capabilities(&self) -> Caps {
         Caps {
             ignite: true,

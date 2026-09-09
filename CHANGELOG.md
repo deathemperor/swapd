@@ -2,6 +2,7 @@
 
 ## 0.1.0 — unreleased
 
+- add --slot n moves an account that already has a slot instead of duplicating it (#3)
 - list --json says why the active slot is missing (`activeUnreadable`: switch-in-progress, keychain-unavailable, cli-busy) and auto reports `no-switch{switch-in-progress}` instead of no-active-account (#8)
 - list waits 1 s for a switch to land before degrading, not 5 s (#8)
 - `list`/`refresh`: the JSON contract, `--json` on every verb, `schemaVersion` 1.

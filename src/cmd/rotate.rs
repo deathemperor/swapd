@@ -26,8 +26,10 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, strategy: Strategy) -> Result<Switc
     // account that is already spent. The pass respects the stored poll plans,
     // so a rotate costs at most the fetches those plans already wanted.
     let cursor = collect(ctx, provider, &CollectOpts::default())?;
-    let preferred: Vec<String> = Vec::new();
-    let ranked = switch::rank(ctx, &cursor, strategy, &preferred)?;
+    // `settings.json`'s pinned accounts (`<provider>.preferred`): they win
+    // among the candidates a strategy's own gates already admit, never past
+    // them (cswap's `preferred`, settings.py:88).
+    let ranked = switch::rank(ctx, &cursor, strategy, &ctx.settings.preferred)?;
 
     // The whole ranking, not just its head: a candidate whose credential turns
     // out to be dead is exactly the case rotation exists for, and giving up on

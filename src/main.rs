@@ -88,6 +88,11 @@ enum Command {
         #[arg(long)]
         strategy: Option<String>,
     },
+    /// Read or change the `settings.json` knobs.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// The switch log, newest last.
     History {
         /// Show only the most recent `n`.
@@ -96,8 +101,20 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Every key: its value, whether it is set, and its default.
+    List,
+    /// One key, as `<provider>.<key>`.
+    Get { key: String },
+    /// Set one key. Out-of-range and mistyped values are refused, never clamped.
+    Set { key: String, value: String },
+    /// Drop one key, so its default applies again.
+    Unset { key: String },
+}
+
 /// The provider a single-provider verb operates on.
-const DEFAULT_PROVIDER: &str = "claude";
+pub const DEFAULT_PROVIDER: &str = "claude";
 
 #[derive(Serialize)]
 struct VersionOutput {
@@ -224,6 +241,16 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             let out = cmd::rotate::run(&ctx, driver.as_ref(), strategy)?;
             emit(&out, cli.json, || cmd::switch::print_human(&out))
+        }
+        Command::Config { action } => {
+            let ctx = ctx::Ctx::from_env()?;
+            let out = match action {
+                ConfigAction::List => cmd::config::list(&ctx, cli.provider.as_deref())?,
+                ConfigAction::Get { key } => cmd::config::get(&ctx, key)?,
+                ConfigAction::Set { key, value } => cmd::config::set(&ctx, key, value)?,
+                ConfigAction::Unset { key } => cmd::config::unset(&ctx, key)?,
+            };
+            emit(&out, cli.json, || cmd::config::print_human(&out))
         }
         Command::History { limit } => {
             let ctx = ctx::Ctx::from_env()?;

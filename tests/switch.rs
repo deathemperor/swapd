@@ -672,6 +672,28 @@ fn rotate_fixture() -> Fixture {
 /// `next-available` answers with the collector's own health rule, so it skips
 /// an account `list` would not have called `nextCandidate` either.
 #[test]
+fn rotate_lands_on_a_preferred_account_first() {
+    // Slot 3 resets soonest, so plain consume-first takes it (the test above).
+    // `claude.preferred` names slot 2's email: a pinned account wins among the
+    // candidates the strategy's own gates already admit.
+    let fx = rotate_fixture();
+    write(
+        &fx.home.path().join("settings.json"),
+        &json!({
+            "schemaVersion": 1,
+            "providers": {"claude": {"preferred": "TWO@example.com"}},
+        })
+        .to_string(),
+    );
+
+    let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
+    assert_eq!(
+        out["to"]["slot"], 2,
+        "the pinned account outranks the reset"
+    );
+}
+
+#[test]
 fn rotate_next_available_skips_an_account_over_the_threshold() {
     let fx = rotate_fixture();
     // Slot 2 is next in rotation order after the active slot 1, but it is at

@@ -3,6 +3,7 @@
 
 pub mod add;
 pub mod add_token;
+pub mod config;
 pub mod history;
 pub mod import;
 pub mod list;

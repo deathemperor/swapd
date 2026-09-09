@@ -5,7 +5,7 @@
 //! not), so a single `list` pass reads the environment once and every layer
 //! below sees the same view of it.
 
-use crate::core::settings::Settings;
+use crate::core::settings::{self, Settings};
 use crate::core::usage_store::UsageStore;
 use crate::driver::Env;
 use crate::errors::Result;
@@ -28,11 +28,15 @@ impl Ctx {
         let secrets = secrets::default_secrets(&home);
         let env = Env::current(&home);
         let store = UsageStore::new(&home.usage_file());
+        // One provider today, so one section is read. A multi-provider `list`
+        // would want the policy of the provider it is collecting; that waits
+        // for a per-provider view of the context.
+        let settings = settings::load(&home, crate::DEFAULT_PROVIDER);
         Ok(Ctx {
             home,
             secrets,
             clock: Box::new(now_s),
-            settings: Settings::default(),
+            settings,
             env,
             store,
         })

@@ -62,11 +62,18 @@ fn main() {
                 e.exit();
             }
             let json = std::env::args().any(|a| a == "--json");
-            let first_line = e.to_string().lines().next().unwrap_or_default().to_string();
-            let message = first_line
-                .strip_prefix("error: ")
-                .unwrap_or(&first_line)
-                .to_string();
+            let message = if matches!(
+                e.kind(),
+                ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                "missing subcommand".to_string()
+            } else {
+                let first_line = e.to_string().lines().next().unwrap_or_default().to_string();
+                first_line
+                    .strip_prefix("error: ")
+                    .unwrap_or(&first_line)
+                    .to_string()
+            };
             output::emit_error(&SwapdError::new(ErrorCode::InvalidInput, message), json);
             std::process::exit(1);
         }
@@ -103,7 +110,7 @@ fn version(json: bool) -> Result<()> {
 }
 
 fn doctor(json: bool) -> Result<()> {
-    let home = Home::resolve();
+    let home = Home::resolve()?;
     let (installed, path) = locate_claude();
     let providers = vec![ProviderStatus {
         provider: "claude".to_string(),

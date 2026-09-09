@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::errors::Result;
+use crate::errors::{ErrorCode, Result, SwapdError};
 
 /// Resolves and owns the swapd data directory ("home").
 pub struct Home {
@@ -14,36 +14,39 @@ impl Home {
     /// Resolve the data dir: `$SWAPD_HOME` if set; else the platform default
     /// (macOS `~/.swapd`, Linux `${XDG_DATA_HOME:-~/.local/share}/swapd`,
     /// Windows `%APPDATA%\swapd`).
-    pub fn resolve() -> Self {
+    pub fn resolve() -> Result<Self> {
         if let Ok(dir) = std::env::var("SWAPD_HOME") {
-            return Self {
+            return Ok(Self {
                 root: PathBuf::from(dir),
-            };
+            });
         }
-        Self {
-            root: Self::default_root(),
-        }
+        Ok(Self {
+            root: Self::default_root()?,
+        })
     }
 
     #[cfg(target_os = "windows")]
-    fn default_root() -> PathBuf {
-        let appdata = std::env::var("APPDATA").expect("%APPDATA% must be set on Windows");
-        PathBuf::from(appdata).join("swapd")
+    fn default_root() -> Result<PathBuf> {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| SwapdError::new(ErrorCode::Io, "%APPDATA% is not set"))?;
+        Ok(PathBuf::from(appdata).join("swapd"))
     }
 
     #[cfg(target_os = "linux")]
-    fn default_root() -> PathBuf {
+    fn default_root() -> Result<PathBuf> {
         if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-            return PathBuf::from(xdg).join("swapd");
+            return Ok(PathBuf::from(xdg).join("swapd"));
         }
-        let home = std::env::var("HOME").expect("$HOME must be set on Linux");
-        PathBuf::from(home).join(".local/share/swapd")
+        let home = std::env::var("HOME")
+            .map_err(|_| SwapdError::new(ErrorCode::Io, "$HOME is not set"))?;
+        Ok(PathBuf::from(home).join(".local/share/swapd"))
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    fn default_root() -> PathBuf {
-        let home = std::env::var("HOME").expect("$HOME must be set on macOS");
-        PathBuf::from(home).join(".swapd")
+    fn default_root() -> Result<PathBuf> {
+        let home = std::env::var("HOME")
+            .map_err(|_| SwapdError::new(ErrorCode::Io, "$HOME is not set"))?;
+        Ok(PathBuf::from(home).join(".swapd"))
     }
 
     pub fn slots_file(&self) -> PathBuf {

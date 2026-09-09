@@ -1,0 +1,64 @@
+---
+source: tests/list_refresh.rs
+expression: payload
+---
+{
+  "providers": [
+    {
+      "accounts": [
+        {
+          "active": false,
+          "ageSeconds": "[age]",
+          "alias": "one",
+          "disabled": false,
+          "email": "one@example.com",
+          "fetchedAt": "[fetched-at]",
+          "organizationName": "Org One",
+          "organizationUuid": "org-1",
+          "preferred": false,
+          "slot": 1,
+          "usageStatus": "ok",
+          "windows": [
+            {
+              "kind": "5h",
+              "pct": 12.0,
+              "resetsAt": "2026-09-09T05:59:59Z"
+            },
+            {
+              "kind": "7d",
+              "pct": 34.0
+            }
+          ]
+        },
+        {
+          "active": false,
+          "ageSeconds": "[age]",
+          "alias": "two",
+          "disabled": false,
+          "email": "two@example.com",
+          "fetchedAt": "[fetched-at]",
+          "organizationName": "Org Two",
+          "organizationUuid": "org-2",
+          "preferred": false,
+          "slot": 2,
+          "usageStatus": "ok",
+          "windows": [
+            {
+              "kind": "5h",
+              "pct": 56.0,
+              "resetsAt": "2026-09-09T05:59:59Z"
+            },
+            {
+              "kind": "7d",
+              "pct": 7.0
+            }
+          ]
+        }
+      ],
+      "installed": "[installed]",
+      "nextCandidate": 1,
+      "provider": "claude"
+    }
+  ],
+  "schemaVersion": 1
+}

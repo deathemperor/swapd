@@ -23,5 +23,5 @@ unicode-normalization = "0.1"
 assert_cmd = "2"
 httpmock = "0.7"
 tempfile = "3"
-insta = { version = "1", features = ["json"] }
+insta = { version = "1", features = ["json", "redactions"] }
 predicates = "3"

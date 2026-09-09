@@ -184,14 +184,17 @@ pub struct Entry {
     pub claim_until: Option<f64>,
 }
 
-// Task 9's collector and `list` verb read every accessor below.
-#[allow(dead_code)]
 impl Entry {
     /// Fresh enough to serve without fetching (`usage_store.py:307`).
+    // The collector asks `reserve` instead, which re-checks this under the lock;
+    // the auto engine's own eligibility pass reads it directly.
+    #[allow(dead_code)]
     pub fn fresh(&self, now: f64) -> bool {
         self.fetched_at.is_some_and(|f| (now - f) <= SERVE_TTL_S)
     }
 
+    // Same: `reserve` gates on it, the auto engine reports it.
+    #[allow(dead_code)]
     pub fn in_backoff(&self, now: f64) -> bool {
         self.backoff_until.is_some_and(|b| now < b)
     }
@@ -222,6 +225,8 @@ impl Entry {
     }
 
     /// Whether another collector's bounded fetch lease is still live.
+    // Read by the auto engine; the collector's own claims come from `reserve`.
+    #[allow(dead_code)]
     pub fn claimed(&self, now: f64) -> bool {
         live_claim(self.claim_until, now)
     }
@@ -276,7 +281,7 @@ fn live_claim(claim_until: Option<f64>, now: f64) -> bool {
 /// shorter learned interval. Detect that impossible shape structurally,
 /// independent of the current model selection, so changing scoped models cannot
 /// leave an otherwise usable account parked until the old reset.
-// Task 9's scheduler passes this to its repair pass.
+// The scheduler (Task 12) passes this to its repair pass.
 #[allow(dead_code)]
 pub fn plan_oversleeps_interval(entry: &Entry, now: f64) -> bool {
     let Some(next_poll_at) = entry.next_poll_at else {
@@ -297,7 +302,7 @@ pub fn plan_oversleeps_interval(entry: &Entry, now: f64) -> bool {
 /// quarantined; a perpetually failing account can't monopolize the slot,
 /// because its backoff removes it from the due set between attempts. Shared by
 /// every surface so all pick the same single alternate to poll per pass.
-// Task 9's auto engine picks its candidate through this.
+// The auto engine (Task 12) picks its candidate through this.
 #[allow(dead_code)]
 pub fn due_candidate(
     candidates: &[String],
@@ -494,8 +499,6 @@ pub struct UsageStore {
 /// How long to wait for the table's lock before giving up.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
-// Task 9's collector drives every method here.
-#[allow(dead_code)]
 impl UsageStore {
     /// The store at `path` (`Home::usage_file()`), on the system clock.
     pub fn new(path: &Path) -> Self {
@@ -512,6 +515,7 @@ impl UsageStore {
     }
 
     /// The store with an injected clock and jitter source (tests, replay).
+    #[allow(dead_code)]
     pub fn with_clock(
         path: &Path,
         clock: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -804,6 +808,8 @@ impl UsageStore {
     /// (`usage_store.py:1185-1211`): the strikes — and the failure state riding
     /// with them — no longer reflect reality, and the account must become
     /// fetch-eligible so the next pass can prove the new token good.
+    // The re-login path (Task 10) is what lifts a quarantine.
+    #[allow(dead_code)]
     pub fn clear_dead(&self, key: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut rows = self.read_rows()?;

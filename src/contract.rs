@@ -3,8 +3,6 @@
 
 use serde::{Deserialize, Serialize};
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ListPayload {
@@ -12,8 +10,6 @@ pub struct ListPayload {
     pub providers: Vec<ProviderView>,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderView {
@@ -28,8 +24,6 @@ pub struct ProviderView {
     pub accounts: Vec<AccountView>,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NextRecovery {
@@ -37,8 +31,6 @@ pub struct NextRecovery {
     pub at: String,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountView {
@@ -65,8 +57,6 @@ pub struct AccountView {
     pub last_good: Option<LastGood>,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LastGood {
@@ -75,8 +65,6 @@ pub struct LastGood {
     pub windows: Vec<Window>,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UsageStatus {
@@ -89,8 +77,6 @@ pub enum UsageStatus {
     Unsupported,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Window {
@@ -110,8 +96,6 @@ pub struct Window {
     pub currency: Option<String>,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WindowKind {
@@ -125,8 +109,6 @@ pub enum WindowKind {
     Spend,
 }
 
-// Built by Task 8/11's `list` verb, which is not implemented yet.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Pace {

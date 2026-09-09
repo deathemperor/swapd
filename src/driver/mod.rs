@@ -21,8 +21,6 @@ impl Login {
     /// Port of oauth.py:40-58: sha256 of `claudeAiOauth.refreshToken` when
     /// present and non-empty, else sha256 of the raw bytes; empty bytes
     /// fingerprint to "".
-    // Called by fingerprint tests below; Task 6's driver calls it on live logins.
-    #[allow(dead_code)]
     pub fn fingerprint(&self) -> String {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.bytes) {
             if let Some(token) = value
@@ -118,7 +116,8 @@ impl From<DriverError> for SwapdError {
 
 /// The process environment a driver operates under: swapd's home dir plus
 /// the process env captured once at startup.
-// Constructed by Task 6/8 call sites (`Env::current`); nothing calls it yet.
+// `home` is read by the driver's profile paths (Task 13's `run`), not by the
+// collector.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct Env {
@@ -127,8 +126,6 @@ pub struct Env {
 }
 
 impl Env {
-    // Nothing calls this yet; Task 6/8 build an `Env` before invoking a driver.
-    #[allow(dead_code)]
     pub fn current(home: &Home) -> Env {
         Env {
             home: home.root.clone(),
@@ -251,14 +248,10 @@ pub trait Driver: Send + Sync {
 }
 
 /// All known provider drivers.
-// Consumed by Task 8's verbs; the tests below exercise it meanwhile.
-#[allow(dead_code)]
 pub fn registry() -> Vec<Box<dyn Driver>> {
     vec![Box::new(claude::live::ClaudeDriver::default_for_platform())]
 }
 
-// Consumed by Task 8's verbs.
-#[allow(dead_code)]
 pub fn by_id(id: &str) -> Option<Box<dyn Driver>> {
     registry().into_iter().find(|d| d.id() == id)
 }

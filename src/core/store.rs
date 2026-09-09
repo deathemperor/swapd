@@ -9,8 +9,6 @@ use serde::Serialize;
 use crate::errors::{ErrorCode, Result, SwapdError};
 
 // Not consumed by a verb yet; later tasks (login, use, ls, rm, history) read
-// through this.
-#[allow(dead_code)]
 /// Read `path` as JSON, returning `T::default()` if the file doesn't exist.
 pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read(path) {
@@ -20,9 +18,6 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     }
 }
 
-// Not consumed by a verb yet; later tasks (login, use, ls, rm, history) write
-// through this.
-#[allow(dead_code)]
 /// Serialize `value` to `path` atomically: write to a tmp file in the same
 /// directory, then rename over the target. `0600` on unix. The parent
 /// directory must already exist (callers run `Home::ensure()` first); a
@@ -54,13 +49,11 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 // Not consumed by a verb yet; later tasks (login, use) take this before
 // mutating store files.
-#[allow(dead_code)]
 /// An advisory lock on `<path>.lock`, held for the lifetime of this value.
 pub struct FileLock {
     _file: fs::File,
 }
 
-#[allow(dead_code)]
 impl FileLock {
     /// Acquire an exclusive lock on `<path>.lock`, waiting up to `timeout`.
     /// Returns `ErrorCode::Locked` if the timeout elapses first.

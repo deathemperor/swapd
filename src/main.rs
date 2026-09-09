@@ -1,5 +1,7 @@
+mod cmd;
 mod contract;
 mod core;
+mod ctx;
 mod driver;
 mod errors;
 mod http;
@@ -22,9 +24,9 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Provider to operate on.
-    #[arg(long, global = true, default_value = "claude")]
-    provider: String,
+    /// Provider to operate on. Unset lists every known provider.
+    #[arg(long, global = true)]
+    provider: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -36,7 +38,18 @@ enum Command {
     Version,
     /// Check the local environment for problems.
     Doctor,
+    /// List every account, its usage and the rotation.
+    List,
+    /// Fetch usage now, then list.
+    Refresh {
+        /// Fetch this slot past the serve TTL and its poll plan.
+        #[arg(long)]
+        slot: Option<u32>,
+    },
 }
+
+/// The provider a single-provider verb operates on.
+const DEFAULT_PROVIDER: &str = "claude";
 
 #[derive(Serialize)]
 struct VersionOutput {
@@ -99,7 +112,25 @@ fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Version => version(cli.json),
         Command::Doctor => doctor(cli.json),
+        Command::List => {
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(&cmd::list::run(&ctx, cli.provider.as_deref())?, cli.json)
+        }
+        Command::Refresh { slot } => {
+            let ctx = ctx::Ctx::from_env()?;
+            let provider = cli.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
+            emit_list(&cmd::refresh::run(&ctx, provider, *slot)?, cli.json)
+        }
     }
+}
+
+fn emit_list(payload: &contract::ListPayload, json: bool) -> Result<()> {
+    if json {
+        output::emit_json(payload);
+    } else {
+        cmd::list::print_human(payload);
+    }
+    Ok(())
 }
 
 fn version(json: bool) -> Result<()> {

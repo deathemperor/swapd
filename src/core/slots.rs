@@ -2,9 +2,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-// Not constructed by a verb yet; later tasks (login, use, ls, rm) read and
-// write slots.json through this.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SlotsFile {
@@ -47,8 +44,8 @@ pub struct Slot {
     pub fingerprint: Option<String>, // "sha256:…" of the stored login
 }
 
-// Not consumed by a verb yet; the slots verbs (login, use, ls, rm) in later
-// tasks call these.
+// The collector only reads slots; the mutating helpers wait for the slots verbs
+// (login, use, ls, rm).
 #[allow(dead_code)]
 impl ProviderSlots {
     pub fn next_free(&self) -> u32 {

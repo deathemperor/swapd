@@ -10,25 +10,18 @@ use crate::paths::Home;
 use crate::security_cli::RealSecurity;
 use crate::security_cli::SecurityCli;
 
-// Not wired into a verb yet; `SecuritySecrets` (below) uses this once login/use exist.
-#[allow(dead_code)]
 const SERVICE: &str = "swapd";
 
-// Not wired into a verb yet; later tasks (login, use) call through this trait.
-#[allow(dead_code)]
 pub trait Secrets: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>>;
     fn set(&self, key: &str, value: &str) -> Result<()>;
     fn delete(&self, key: &str) -> Result<()>;
 }
 
-// Not wired into a verb yet; later tasks (login, use) read/write credentials through this.
-#[allow(dead_code)]
 pub struct SecuritySecrets {
     cli: Arc<dyn SecurityCli>,
 }
 
-#[allow(dead_code)]
 impl SecuritySecrets {
     pub fn new(cli: Arc<dyn SecurityCli>) -> Self {
         Self { cli }
@@ -53,13 +46,10 @@ impl Secrets for SecuritySecrets {
     }
 }
 
-// Not wired into a verb yet; later tasks (login, use) read/write credentials through this.
-#[allow(dead_code)]
 pub struct FileSecrets {
     dir: PathBuf,
 }
 
-#[allow(dead_code)]
 impl FileSecrets {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -130,8 +120,6 @@ impl Secrets for FileSecrets {
     }
 }
 
-// Not wired into a verb yet; `SWAPD_SECRETS=memory` (tests, CI) selects this.
-#[allow(dead_code)]
 pub struct MemorySecrets(Mutex<HashMap<String, String>>);
 
 impl MemorySecrets {
@@ -173,15 +161,12 @@ impl Secrets for MemorySecrets {
 /// reports `primary`'s result while not degraded, `fallback`'s once degraded. A
 /// successful `set` on `primary` also clears any stale copy in `fallback` left by an
 /// earlier degraded run, ignoring that delete's result.
-// Not wired into a verb yet; `default_secrets` builds one for the macOS default.
-#[allow(dead_code)]
 pub struct StickySecrets {
     primary: Box<dyn Secrets>,
     fallback: Box<dyn Secrets>,
     degraded: AtomicBool,
 }
 
-#[allow(dead_code)]
 impl StickySecrets {
     pub fn new(primary: Box<dyn Secrets>, fallback: Box<dyn Secrets>) -> Self {
         Self {
@@ -254,7 +239,6 @@ impl Secrets for StickySecrets {
 /// `Sticky(Security, File)`, elsewhere `File`. An unrecognized (non-empty, non-`file`,
 /// non-`memory`) value also falls back to `File` — never silently to the keychain.
 // Not wired into a verb yet; later tasks (login, use) call this to build their store.
-#[allow(dead_code)]
 pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
     secrets_for(home, std::env::var("SWAPD_SECRETS").ok().as_deref())
 }
@@ -265,7 +249,6 @@ pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
 /// could let `platform_default` run and, on macOS, write a test value into the real
 /// login keychain).
 // Not wired into a verb yet; `default_secrets` (above) and tests call this directly.
-#[allow(dead_code)]
 pub fn secrets_for(home: &Home, mode: Option<&str>) -> Box<dyn Secrets> {
     match mode {
         Some("file") => Box::new(FileSecrets::new(home.credentials_dir())),
@@ -288,8 +271,6 @@ fn platform_default(home: &Home) -> Box<dyn Secrets> {
     Box::new(FileSecrets::new(home.credentials_dir()))
 }
 
-// Not wired into a verb yet; later tasks (login, use) build keychain/file keys with this.
-#[allow(dead_code)]
 pub fn slot_key(provider: &str, slot: u32) -> String {
     format!("{provider}:{slot}")
 }

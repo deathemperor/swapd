@@ -63,10 +63,6 @@ const SHARED_CREDENTIAL_KEYS: [&str; 5] = [
 ///
 /// A value, not a `cfg`: tests build `Keychain(FakeSecurity)` on every OS so
 /// Linux CI covers the keychain logic too.
-// One variant is unconstructed on either platform (`default_for_platform`
-// picks by `cfg`), so both need the allow; the tests build `Keychain` on every
-// OS.
-#[allow(dead_code)]
 pub enum LiveStore {
     Keychain(Arc<dyn SecurityCli>),
     File,
@@ -101,19 +97,13 @@ impl ClaudeDriver {
 
     /// macOS keeps the live credential in the login keychain; every other
     /// platform in `<config_home>/.credentials.json`. Endpoints are the
-    /// production ones (`SWAPD_URL_*`-overridable).
+    /// production ones (`SWAPD_URL_*`-overridable), and `SWAPD_LIVE_STORE`
+    /// overrides the store the same way.
+    ///
+    /// The one place either variable is read: a constructed driver holds
+    /// values, never an environment.
     pub fn default_for_platform() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self::new(
-                LiveStore::Keychain(Arc::new(RealSecurity)),
-                Endpoints::from_env(),
-            )
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Self::new(LiveStore::File, Endpoints::from_env())
-        }
+        Self::new(live_store_from_env(), Endpoints::from_env())
     }
 
     /// Claude Code's live login for this environment, as an envelope (see the
@@ -123,8 +113,6 @@ impl ClaudeDriver {
     /// `KeychainUnavailable` when the backend errored on every attempt for a
     /// service — an unreadable keychain stops the walk, since it is a property
     /// of the keychain and not of the item.
-    // Task 9's collector also uses it (the active slot is the one whose
-    // fingerprint matches this login's).
     pub fn read_live(&self, env: &Env) -> Result<Login, DriverError> {
         let raw = self.read_live_raw(env)?.ok_or(DriverError::NoLogin)?;
         Ok(Login {
@@ -288,6 +276,29 @@ impl ClaudeDriver {
         if let Ok(path) = paths::config_json(env) {
             let _ = write_json_atomic(&path, &Value::Object(config));
         }
+    }
+}
+
+/// `SWAPD_LIVE_STORE` = `file` | `keychain` overrides the platform default;
+/// unset (or anything else) is the platform's own.
+///
+/// The suite needs `file` for one reason: the assert_cmd tests drive the real
+/// binary, and on macOS the platform default would run `security` against the
+/// developer's own login keychain — reading a real credential the tests must
+/// never touch. `keychain` off macOS has no backend and falls back to the file
+/// store rather than pretending.
+fn live_store_from_env() -> LiveStore {
+    let mode = std::env::var("SWAPD_LIVE_STORE").ok();
+    if mode.as_deref() == Some("file") {
+        return LiveStore::File;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        LiveStore::Keychain(Arc::new(RealSecurity))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        LiveStore::File
     }
 }
 
@@ -599,8 +610,8 @@ pub fn prepare_for_activation(target: &str, live: Option<&str>) -> Result<String
 }
 
 /// The identity `~/.claude.json` currently advertises (`switcher.py:3505-3508`).
-// Consumed by Task 7's `identity()`, which prefers the config identity and
-// falls back to the OAuth profile endpoint.
+// The slots verbs (Task 10) name an account by it; `identity()` reads the
+// login's own envelope instead.
 #[allow(dead_code)]
 pub fn read_config_identity(env: &Env) -> Option<Identity> {
     let config = read_config(env).ok()??;
@@ -608,9 +619,6 @@ pub fn read_config_identity(env: &Env) -> Option<Identity> {
 }
 
 /// An `Identity` from an `oauthAccount` object.
-// Also consumed by Task 7's `identity(login)`, which falls back to the
-// envelope's own `oauthAccount` when the config has none.
-#[allow(dead_code)]
 pub fn identity_from_oauth_account(value: &Value) -> Option<Identity> {
     let oauth = value.as_object()?;
     let text = |key: &str| {

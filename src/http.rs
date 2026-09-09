@@ -11,14 +11,9 @@ pub fn agent(timeout_s: u64) -> ureq::Agent {
 }
 
 /// Base URL for a named upstream, overridable via `SWAPD_URL_<NAME>` (with
-/// `-` folded to `_`) for tests to point at a local mock server.
-pub fn base_url(name: &str) -> String {
-    base_url_from(name, |k| std::env::var(k).ok())
-}
-
-/// `base_url`'s logic with the env lookup injected, so tests can exercise
-/// the override path without mutating real process env (racy/unsound
-/// under parallel test threads).
+/// `-` folded to `_`). The env lookup is injected rather than read from
+/// `std::env` here: every driver is built from its own `Env`, never the
+/// process environment, so callers pass a closure over `Env::vars`.
 pub fn base_url_from(name: &str, get: impl Fn(&str) -> Option<String>) -> String {
     let env_key = format!("SWAPD_URL_{}", name.to_uppercase().replace('-', "_"));
     if let Some(v) = get(&env_key) {
@@ -42,13 +37,22 @@ mod tests {
 
     #[test]
     fn base_url_defaults() {
-        assert_eq!(base_url("anthropic-api"), "https://api.anthropic.com");
-        assert_eq!(base_url("platform"), "https://platform.claude.com");
+        assert_eq!(
+            base_url_from("anthropic-api", |_| None),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            base_url_from("platform", |_| None),
+            "https://platform.claude.com"
+        );
     }
 
     #[test]
     fn base_url_unknown_name_returns_unchanged() {
-        assert_eq!(base_url("mystery-provider"), "mystery-provider");
+        assert_eq!(
+            base_url_from("mystery-provider", |_| None),
+            "mystery-provider"
+        );
     }
 
     #[test]

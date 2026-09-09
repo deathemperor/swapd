@@ -71,6 +71,11 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<IgniteOutput> 
     let rotated = outcome.rotated.is_some();
     if let Some(login) = &outcome.rotated {
         super::persist_login(ctx, id, slot, login)?;
+        // Only now. The profile's seed marker records what the STORE holds, so
+        // moving it before the persist would put it ahead of the store, and the
+        // next launch would read the profile as a slot re-pointed at another
+        // account and seed the older generation over the rotation.
+        driver.commit_profile(&ctx.env, slot, login)?;
     }
     if outcome.exit_code != 0 {
         return Err(SwapdError::new(

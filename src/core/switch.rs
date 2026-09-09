@@ -858,6 +858,14 @@ mod tests {
         ) -> std::result::Result<crate::driver::RunProfile, DriverError> {
             Err(DriverError::Unsupported("run"))
         }
+        fn commit_profile(
+            &self,
+            _env: &crate::driver::Env,
+            _slot: u32,
+            _login: &Login,
+        ) -> std::result::Result<(), DriverError> {
+            Ok(())
+        }
         fn forget_profile(
             &self,
             _env: &crate::driver::Env,

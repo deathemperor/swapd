@@ -119,6 +119,10 @@ impl Driver for ClaudeDriver {
         run::run_profile(self, env, slot, login)
     }
 
+    fn commit_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError> {
+        run::commit_profile(env, slot, login)
+    }
+
     fn forget_profile(&self, env: &Env, slot: u32) -> Result<(), DriverError> {
         run::forget_profile(self, env, slot)
     }

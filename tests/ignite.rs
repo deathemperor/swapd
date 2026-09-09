@@ -125,6 +125,13 @@ impl Fixture {
         self.home.path().join("profiles/claude/1")
     }
 
+    /// The profile's seed marker: the fingerprint of the generation swapd's
+    /// STORE holds for this slot, which is what keeps a later launch from
+    /// seeding an older copy over a rotation.
+    fn marker(&self) -> String {
+        std::fs::read_to_string(self.profile().join(".swapd-seeded")).unwrap()
+    }
+
     fn witness_path(&self) -> PathBuf {
         self.bin.path().join("witness")
     }
@@ -394,6 +401,8 @@ fn ignite_runs_igniter_then_forces_refresh() {
         fx.slots()["providers"]["claude"]["slots"]["1"]["fingerprint"],
         fingerprint_of("rt-1b")
     );
+    // ...and only then did the profile's marker follow it.
+    assert_eq!(fx.marker(), fingerprint_of("rt-1b"));
 
     // The window the run just opened is only visible in a fetch made after it,
     // and that fetch went out as the rotated token.
@@ -514,12 +523,13 @@ fn run_passes_argv_through_the_profile_and_propagates_the_exit_code() {
     assert_eq!(fx.witness_line("apikey"), "[]");
 
     // The rotation the child made inside the profile was read back and stored,
-    // even though the run failed.
+    // even though the run failed — and the marker followed the store.
     assert!(fx.stored_login().contains("rt-1b"));
     assert_eq!(
         fx.slots()["providers"]["claude"]["slots"]["1"]["fingerprint"],
         fingerprint_of("rt-1b")
     );
+    assert_eq!(fx.marker(), fingerprint_of("rt-1b"));
     // `run` measures nothing: it is the user's own session, wearing an account.
     usage.assert_hits(0);
     // And the live login is untouched — that is the whole point of a profile.
@@ -652,7 +662,7 @@ fn run_with_an_ambient_config_dir_keeps_the_profile_and_warns() {
 }
 
 #[test]
-fn run_reports_a_failed_persist_and_still_propagates_the_exit_code() {
+fn a_rotation_survives_a_failed_persist_and_lands_on_the_next_run() {
     use std::os::unix::fs::PermissionsExt;
 
     let fx = Fixture::new();
@@ -674,23 +684,36 @@ fn run_reports_a_failed_persist_and_still_propagates_the_exit_code() {
     assert_eq!(out.status.code(), Some(7));
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(said.contains("could not store it"), "stderr was: {said}");
-    // And the message does not tell the user to re-run: the read-back already
-    // moved the profile's seed marker to the new generation, so the next run
-    // would re-seed the older stored copy over the rotation. It states where
-    // the rotation is stranded instead.
-    assert!(
-        said.contains("one generation behind the profile"),
-        "stderr was: {said}"
-    );
     assert!(
         said.contains(fx.profile().to_str().unwrap()),
         "stderr was: {said}"
     );
-    assert!(!said.contains("again"), "stderr was: {said}");
+
+    // The state that makes the advice sound: the store is still on the old
+    // generation, the profile holds the new one, and the marker names what the
+    // STORE holds — not what the profile does.
     assert!(fx.stored_login().contains("rt-1"));
     assert!(
         std::fs::read_to_string(fx.profile().join(".credentials.json"))
             .unwrap()
             .contains("rt-1b")
     );
+    assert_eq!(fx.marker(), fingerprint_of("rt-1"));
+
+    // So the next run does NOT re-seed the older copy over it: the same stored
+    // login goes in, the profile keeps the rotation, and the read-back lands it
+    // for real this time.
+    assert!(
+        said.contains("run `swapd run 1` again"),
+        "stderr was: {said}"
+    );
+    let out = fx.cmd().args(["run", "1", "--"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert!(fx.stored_login().contains("rt-1b"));
+    assert_eq!(
+        fx.slots()["providers"]["claude"]["slots"]["1"]["fingerprint"],
+        fingerprint_of("rt-1b")
+    );
+    // And only now, with the store holding it, does the marker move.
+    assert_eq!(fx.marker(), fingerprint_of("rt-1b"));
 }

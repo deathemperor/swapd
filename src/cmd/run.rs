@@ -105,28 +105,41 @@ pub fn run(
     // rotation into `exit 1` would lie about the run and hide the code a script
     // is branching on, so the loss is said out loud on stderr instead.
     if let Some(read_back) = &profile.read_back {
-        let stored = read_back()
-            .map_err(SwapdError::from)
-            .and_then(|rotated| match rotated {
-                Some(rotated) => super::persist_login(ctx, id, slot, &rotated),
-                None => Ok(()),
-            });
-        if let Err(e) = stored {
-            // Facts only, and deliberately no "try again": the read-back has
-            // already advanced the profile's seed marker to the new generation,
-            // so the next run of this slot sees a marker that disagrees with the
-            // login it is handed and re-seeds the stored (older) copy over the
-            // rotation. Telling the user to re-run would be telling them to
-            // destroy it.
-            eprintln!(
-                "warning: the CLI rotated slot {slot}'s login and swapd could not store it \
-                 ({e}); the store is now one generation behind the profile at {}, and the \
-                 next run of this slot will re-seed the stored one over it",
-                profile.dir.display()
-            );
+        match read_back().map_err(SwapdError::from) {
+            Err(e) => stranded(slot, &profile.dir, &e.message),
+            Ok(None) => {}
+            Ok(Some(rotated)) => match super::persist_login(ctx, id, slot, &rotated) {
+                Err(e) => stranded(slot, &profile.dir, &e.message),
+                // Only after the store has it: the marker says what the STORE
+                // holds, and a marker ahead of the store is what makes the next
+                // launch seed the older generation over the rotation.
+                Ok(()) => {
+                    if let Err(e) = driver.commit_profile(&ctx.env, slot, &rotated) {
+                        eprintln!(
+                            "warning: slot {slot}'s rotated login was stored, but the profile \
+                             at {} could not be marked ({e}); the next run re-seeds the stored \
+                             copy, which is that same rotation",
+                            profile.dir.display()
+                        );
+                    }
+                }
+            },
         }
     }
     Ok(exit_code(&status))
+}
+
+/// Say that the CLI's rotation is in the profile and nowhere else.
+///
+/// It is not lost: the marker still names the generation the store holds, so the
+/// profile is not re-seeded and the next run reads the same rotation back —
+/// which is why re-running is the right advice here and not a way to destroy it.
+fn stranded(slot: u32, dir: &std::path::Path, why: &str) {
+    eprintln!(
+        "warning: the CLI rotated slot {slot}'s login and swapd could not store it ({why}); \
+         the profile at {} still holds it — run `swapd run {slot}` again to pick it up",
+        dir.display()
+    );
 }
 
 /// The `CLAUDE_CONFIG_DIR`-style override the user already has exported, if any.

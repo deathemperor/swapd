@@ -413,6 +413,14 @@ fn write_marker(dir: &Path, fingerprint: &str) -> Result<(), DriverError> {
 }
 
 /// The profile's credential if Claude Code rotated past `baseline`, else `None`.
+///
+/// Reports the rotation and *nothing else*: the marker is deliberately left
+/// where it is, because it records what the CALLER has stored, and at this point
+/// the caller has stored nothing. Advancing it here would put it ahead of the
+/// store the moment a persist failed, and a marker ahead of the store is exactly
+/// what makes the next launch read the profile as "re-pointed at another
+/// account" and re-seed the older generation over the rotation — losing it for
+/// good. `commit_profile` moves it, once the store has the login.
 fn rotated_login(
     driver: &ClaudeDriver,
     env: &Env,
@@ -422,12 +430,20 @@ fn rotated_login(
     let Some(login) = driver.read_profile_login(env, slot)? else {
         return Ok(None);
     };
-    let fingerprint = login.fingerprint();
-    if fingerprint == baseline {
+    if login.fingerprint() == baseline {
         return Ok(None);
     }
-    write_marker(&profile_dir(env, slot), &fingerprint)?;
     Ok(Some(login))
+}
+
+/// Record that `login` is now what the caller's store holds for this slot.
+///
+/// The second half of a read-back, and it runs only after the persist has
+/// succeeded. Until it does, the marker still names the generation the store
+/// has, so the profile keeps the newer one and the next run hands it back again
+/// — the rotation survives a failed persist instead of being seeded over.
+pub fn commit_profile(env: &Env, slot: u32, login: &Login) -> Result<(), DriverError> {
+    write_marker(&profile_dir(env, slot), &login.fingerprint())
 }
 
 impl ClaudeDriver {
@@ -1250,17 +1266,35 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         let rotated = outcome.rotated.expect("rotated");
         assert!(rotated.bytes.contains("rt-rotated"));
-        // The marker moved with it, so the next launch does not overwrite the
-        // new generation with the stored (spent) one.
+        // The marker has NOT moved: it records what the caller's store holds,
+        // and the caller has not stored anything yet. Moving it here would put
+        // it ahead of the store the moment a persist failed.
         let dir = env.home.join("profiles/claude/8");
+        assert_eq!(
+            fs::read_to_string(dir.join(SEED_MARKER)).unwrap(),
+            login().fingerprint()
+        );
+
+        // So an unpersisted rotation is not lost. The same (older) login goes
+        // back in, the profile is NOT re-seeded over, and the read-back offers
+        // the rotation again — which is what makes a failed persist recoverable.
+        write_noop_claude(&bin.join("claude"));
+        let again = ignite(&driver, &env, 8, &login()).unwrap();
+        assert!(again
+            .rotated
+            .expect("offered again")
+            .bytes
+            .contains("rt-rotated"));
+        assert!(fs::read_to_string(dir.join(".credentials.json"))
+            .unwrap()
+            .contains("rt-rotated"));
+
+        // Once the caller HAS stored it, it says so, and the marker follows.
+        commit_profile(&env, 8, &rotated).unwrap();
         assert_eq!(
             fs::read_to_string(dir.join(SEED_MARKER)).unwrap(),
             rotated.fingerprint()
         );
-
-        // The caller persists what it was handed and igniting again with it
-        // rotates nothing — and, crucially, does not re-seed over the profile.
-        write_noop_claude(&bin.join("claude"));
         assert!(ignite(&driver, &env, 8, &rotated)
             .unwrap()
             .rotated
@@ -1305,12 +1339,13 @@ mod tests {
         assert_eq!(outcome.exit_code, 2);
         let rotated = outcome.rotated.expect("rotated despite the failure");
         assert!(rotated.bytes.contains("rt-rotated"));
-        // And the marker moved, so a retry does not seed the spent token back
-        // over the generation the profile now holds.
-        assert_eq!(
-            fs::read_to_string(env.home.join("profiles/claude/5").join(SEED_MARKER)).unwrap(),
-            rotated.fingerprint()
-        );
+        // The marker stays on the generation the store holds until the caller
+        // has stored this one; a retry before that reads the rotation back
+        // rather than seeding the spent token over it.
+        let marker = env.home.join("profiles/claude/5").join(SEED_MARKER);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), login().fingerprint());
+        commit_profile(&env, 5, &rotated).unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), rotated.fingerprint());
     }
 
     #[cfg(unix)]

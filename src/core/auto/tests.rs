@@ -178,6 +178,15 @@ impl Driver for FakeDriver {
         Err(DriverError::Unsupported("run"))
     }
 
+    fn commit_profile(
+        &self,
+        _env: &Env,
+        _slot: u32,
+        _login: &Login,
+    ) -> std::result::Result<(), DriverError> {
+        Ok(())
+    }
+
     fn forget_profile(&self, _env: &Env, _slot: u32) -> std::result::Result<(), DriverError> {
         Ok(())
     }

@@ -259,6 +259,17 @@ pub trait Driver: Send + Sync {
     /// produced no exit status at all — a timeout, a signal — is `Err`.
     fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
+    /// Record that `login` is what the caller's store now holds for this slot,
+    /// after a `read_back`/`ignite` rotation has been persisted.
+    ///
+    /// Split from the read-back on purpose. A driver that marked the profile as
+    /// it handed the rotation over would be asserting something only the caller
+    /// can know — that the login was stored — and a persist that then failed
+    /// would leave the mark ahead of the store, which is how the *older*
+    /// generation ends up seeded over the newer one on the next run. So the
+    /// caller says when, and until it does the profile keeps the rotation and
+    /// offers it again.
+    fn commit_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError>;
     /// Delete whatever the slot's run profile left *outside* its directory, so
     /// `remove` can forget an account completely.
     ///

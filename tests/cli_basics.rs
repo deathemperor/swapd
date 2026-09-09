@@ -59,6 +59,29 @@ fn doctor_without_home_or_swapd_home_is_a_json_error_not_a_panic() {
     assert_eq!(v["error"]["code"], "io");
 }
 
+/// Belt-and-braces for the CI macOS runner: `default_secrets` must honour
+/// `SWAPD_SECRETS=file` (the CI job sets it too) so a run through the real
+/// binary never falls through to the platform default and touches the
+/// developer's login keychain. Every other suite already relies on this
+/// same wiring; this test names the guard explicitly.
+#[test]
+fn add_token_with_swapd_secrets_file_never_touches_the_login_keychain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("swapd")
+        .unwrap()
+        .env("SWAPD_HOME", tmp.path())
+        .env("SWAPD_SECRETS", "file")
+        .args(["add-token", "-", "--json"])
+        .write_stdin("sk-ant-api03-secret-key\n")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("credentials/claude_1")).unwrap(),
+        "sk-ant-api03-secret-key"
+    );
+}
+
 #[test]
 fn missing_subcommand_is_a_json_error_with_fixed_message() {
     let out = Command::cargo_bin("swapd")

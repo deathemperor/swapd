@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match Cargo.toml version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag v$tag_version does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            targets: "aarch64-apple-darwin x86_64-apple-darwin"
+            artifact: macos
+          - runner: ubuntu-24.04
+            targets: "x86_64-unknown-linux-gnu"
+            artifact: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            targets: "aarch64-unknown-linux-gnu"
+            artifact: linux-aarch64
+          - runner: windows-2022
+            targets: "x86_64-pc-windows-msvc"
+            artifact: windows
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Add targets
+        run: |
+          for t in ${{ matrix.targets }}; do
+            rustup target add "$t"
+          done
+      - name: Build
+        run: |
+          for t in ${{ matrix.targets }}; do
+            cargo build --release --target "$t"
+          done
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for t in ${{ matrix.targets }}; do
+            stage="swapd-${version}-${t}"
+            mkdir -p "$stage"
+            if [[ "$t" == *windows* ]]; then
+              bin="target/${t}/release/swapd.exe"
+            else
+              bin="target/${t}/release/swapd"
+            fi
+            cp "$bin" "$stage/"
+            cp LICENSE README.md "$stage/"
+            if [[ "$t" == *windows* ]]; then
+              archive="${stage}.zip"
+              7z a "$archive" "$stage" >/dev/null
+            else
+              archive="${stage}.tar.gz"
+              tar czf "$archive" "$stage"
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$archive" > "${archive}.sha256"
+            else
+              shasum -a 256 "$archive" > "${archive}.sha256"
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swapd-${{ matrix.artifact }}
+          path: |
+            swapd-*.tar.gz
+            swapd-*.zip
+            swapd-*.sha256
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract release notes from CHANGELOG.md
+        run: awk '/^## /{c++} c==1' CHANGELOG.md > body.md
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file body.md \
+            dist/*

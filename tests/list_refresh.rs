@@ -256,8 +256,10 @@ fn fingerprint_of(refresh_token: &str) -> String {
 }
 
 /// Restores a directory's mode however the test ends.
+#[cfg(unix)]
 struct Mode(std::path::PathBuf, u32);
 
+#[cfg(unix)]
 impl Drop for Mode {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;

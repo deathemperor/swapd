@@ -1,6 +1,9 @@
 pub mod collect;
+pub mod history;
+pub mod import;
 pub mod poll_policy;
 pub mod settings;
 pub mod slots;
 pub mod store;
+pub mod switch;
 pub mod usage_store;

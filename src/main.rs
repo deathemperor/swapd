@@ -46,6 +46,54 @@ enum Command {
         #[arg(long)]
         slot: Option<u32>,
     },
+    /// Capture the login the CLI is holding right now into a slot.
+    Add {
+        /// Store it in this slot instead of the account's own (or the next free one).
+        #[arg(long)]
+        slot: Option<u32>,
+        /// Short name to reach this account by.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Overwrite a slot that holds a different account.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Register a raw OAuth setup token or API key read from stdin.
+    AddToken {
+        /// Must be `-`: the token is read from stdin, never from argv.
+        source: String,
+        #[arg(long)]
+        slot: Option<u32>,
+        /// Address to file the account under, instead of `<kind>-<slot>@token.local`.
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        alias: Option<String>,
+        /// Overwrite a slot that holds a different account.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import accounts from an export file (`-` for stdin).
+    Import {
+        path: String,
+        /// Overwrite slots that hold a different account.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Make an account the live login, by slot number, alias or email.
+    Switch { ident: String },
+    /// Switch to the next account a strategy picks.
+    Rotate {
+        /// `consume-first`, `best` or `next-available`.
+        #[arg(long)]
+        strategy: Option<String>,
+    },
+    /// The switch log, newest last.
+    History {
+        /// Show only the most recent `n`.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 /// The provider a single-provider verb operates on.
@@ -120,17 +168,91 @@ fn run(cli: &Cli) -> Result<()> {
             emit_list(&cmd::list::run(&ctx, &drivers)?, cli.json)
         }
         Command::Refresh { slot } => {
-            let provider = cli.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
-            let driver = driver::by_id(provider).ok_or_else(|| {
-                SwapdError::new(
-                    ErrorCode::InvalidInput,
-                    format!("unknown provider: {provider}"),
-                )
-            })?;
+            let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
             emit_list(&cmd::refresh::run(&ctx, driver.as_ref(), *slot)?, cli.json)
         }
+        Command::Add { slot, alias, force } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let opts = cmd::add::AddOpts {
+                slot: *slot,
+                alias: alias.clone(),
+                force: *force,
+            };
+            let out = cmd::add::run(&ctx, driver.as_ref(), &opts)?;
+            emit(&out, cli.json, || cmd::add::print_human(&out))
+        }
+        Command::AddToken {
+            source,
+            slot,
+            email,
+            alias,
+            force,
+        } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let opts = cmd::add_token::AddTokenOpts {
+                slot: *slot,
+                email: email.clone(),
+                alias: alias.clone(),
+                force: *force,
+            };
+            let out = cmd::add_token::run(&ctx, driver.as_ref(), source, &opts)?;
+            emit(&out, cli.json, || cmd::add::print_human(&out))
+        }
+        Command::Import { path, force } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::import::run(&ctx, driver.as_ref(), path, *force)?;
+            emit(&out, cli.json, || cmd::import::print_human(&out))
+        }
+        Command::Switch { ident } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::switch::run(&ctx, driver.as_ref(), ident)?;
+            emit(&out, cli.json, || cmd::switch::print_human(&out))
+        }
+        Command::Rotate { strategy } => {
+            // Parsed before the data dir is created: a bad strategy is a
+            // rejected command, and a rejected command leaves nothing behind.
+            let strategy = match strategy {
+                Some(name) => core::switch::Strategy::parse(name)?,
+                None => cmd::rotate::DEFAULT_STRATEGY,
+            };
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::rotate::run(&ctx, driver.as_ref(), strategy)?;
+            emit(&out, cli.json, || cmd::switch::print_human(&out))
+        }
+        Command::History { limit } => {
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::history::run(&ctx, *limit)?;
+            emit(&out, cli.json, || cmd::history::print_human(&out))
+        }
     }
+}
+
+/// The driver a single-provider verb runs against. Resolved before
+/// `Ctx::from_env()`, which creates the data dir: a rejected command must not
+/// leave one behind.
+fn single_driver(cli: &Cli) -> Result<Box<dyn driver::Driver>> {
+    let provider = cli.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
+    driver::by_id(provider).ok_or_else(|| {
+        SwapdError::new(
+            ErrorCode::InvalidInput,
+            format!("unknown provider: {provider}"),
+        )
+    })
+}
+
+fn emit<T: Serialize>(payload: &T, json: bool, human: impl FnOnce()) -> Result<()> {
+    if json {
+        output::emit_json(payload);
+    } else {
+        human();
+    }
+    Ok(())
 }
 
 fn emit_list(payload: &contract::ListPayload, json: bool) -> Result<()> {

@@ -61,8 +61,18 @@ impl Home {
         self.root.join("settings.json")
     }
 
+    /// The switch log. JSONL: it is only ever appended to (see `core::history`).
     pub fn history_file(&self) -> PathBuf {
-        self.root.join("history.json")
+        self.root.join("history.jsonl")
+    }
+
+    /// The base path whose `.lock` sibling — `engine.lock` — fences a whole
+    /// switch: the live read, the back-up of the outgoing login, `write_live`,
+    /// and the `slots.json` update that records the landing. `FileLock` locks
+    /// `<path>.lock`, so this is the file the lock is *named* after rather than
+    /// one anything writes.
+    pub fn engine_lock_base(&self) -> PathBuf {
+        self.root.join("engine")
     }
 
     pub fn auto_state_file(&self) -> PathBuf {

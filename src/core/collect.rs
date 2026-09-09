@@ -17,12 +17,11 @@
 //!  7. the rotation's next candidate and the earliest recovery.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use crate::contract::{AccountView, LastGood, NextRecovery, ProviderView, UsageStatus, Window};
 use crate::core::poll_policy::{binding_pct, limiting_reset_ts};
-use crate::core::slots::{ProviderSlots, Slot, SlotsFile};
-use crate::core::store::{read_json, write_json_atomic, FileLock};
+use crate::core::slots::{self, ProviderSlots, Slot, SlotsFile};
+use crate::core::store::read_json;
 use crate::core::usage_store::{Entry, STALE_OK_S};
 use crate::ctx::Ctx;
 use crate::driver::claude::usage::format_ts;
@@ -34,10 +33,6 @@ use crate::secrets::slot_key;
 /// the accounts are independent, so the cap is about being a good citizen of
 /// the upstream, not about throughput.
 const MAX_FETCH_THREADS: usize = 4;
-
-/// How long to wait for `slots.json`'s lock when a live rotation has to be
-/// written back to it.
-const SLOTS_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a caller wants fetched this pass, on top of what the store's plans say.
 #[derive(Default)]
@@ -351,28 +346,27 @@ fn entry_of<'a>(entries: &'a BTreeMap<String, Entry>, key: &str) -> &'a Entry {
 /// compares against it), so leaving it pointing at a generation the CLI has
 /// already rotated past would make the quarantine unhealable on one side and
 /// invisible on the other.
-fn record_slot_fingerprint(
+pub fn record_slot_fingerprint(
     ctx: &Ctx,
     provider: &str,
     slot: u32,
     fingerprint: Option<&str>,
 ) -> Result<()> {
-    let path = ctx.home.slots_file();
-    let _lock = FileLock::acquire(&path, SLOTS_LOCK_TIMEOUT)?;
-    let mut file: SlotsFile = read_json(&path)?;
-    let Some(entry) = file
-        .providers
-        .get_mut(provider)
-        .and_then(|p| p.slots.get_mut(&slot))
-    else {
-        return Ok(());
-    };
-    let fingerprint = fingerprint.map(str::to_string);
-    if entry.fingerprint == fingerprint {
-        return Ok(());
-    }
-    entry.fingerprint = fingerprint;
-    write_json_atomic(&path, &file)
+    slots::update(&ctx.home.slots_file(), |file| {
+        let Some(entry) = file
+            .providers
+            .get_mut(provider)
+            .and_then(|p| p.slots.get_mut(&slot))
+        else {
+            return Ok((false, ()));
+        };
+        let fingerprint = fingerprint.map(str::to_string);
+        if entry.fingerprint == fingerprint {
+            return Ok((false, ()));
+        }
+        entry.fingerprint = fingerprint;
+        Ok((true, ()))
+    })
 }
 
 /// Run the claimed fetches on at most `MAX_FETCH_THREADS` threads, returning the

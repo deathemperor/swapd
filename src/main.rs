@@ -1,3 +1,4 @@
+mod core;
 mod errors;
 mod output;
 mod paths;

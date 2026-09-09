@@ -348,7 +348,7 @@ fn round1(value: f64) -> f64 {
 
 /// A POSIX timestamp as `2026-09-15T10:59:59Z` — cswap's
 /// `isoformat(timespec="seconds").replace("+00:00", "Z")`.
-fn format_ts(ts: f64) -> Option<String> {
+pub fn format_ts(ts: f64) -> Option<String> {
     let seconds = if ts.is_finite() { ts.floor() as i64 } else { 0 };
     OffsetDateTime::from_unix_timestamp(seconds)
         .ok()?

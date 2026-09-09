@@ -79,6 +79,15 @@ impl Home {
         self.root.join("auto-state.json")
     }
 
+    /// The base path whose `.lock` sibling — `auto.lock` — is the auto
+    /// engine's MUTEX: one daemon per data dir, held for the daemon's whole
+    /// lifetime (cswap's `autoswitch_engine.lock`). Deliberately not
+    /// `engine.lock`, which fences one switch and must stay free between
+    /// ticks so a manual `swapd switch` still works while `auto` runs.
+    pub fn auto_lock_base(&self) -> PathBuf {
+        self.root.join("auto")
+    }
+
     pub fn credentials_dir(&self) -> PathBuf {
         self.root.join("credentials")
     }

@@ -4,6 +4,7 @@
 pub mod add;
 pub mod add_token;
 pub mod alias;
+pub mod auto;
 pub mod config;
 pub mod export;
 pub mod history;

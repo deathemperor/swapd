@@ -82,6 +82,8 @@ enum Command {
     },
     /// Make an account the live login, by slot number, alias or email.
     Switch { ident: String },
+    /// Run the switching daemon: poll usage, switch when policy says to.
+    Auto,
     /// Switch to the next account a strategy picks.
     Rotate {
         /// `consume-first`, `best` or `next-available`.
@@ -272,6 +274,17 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             let out = cmd::switch::run(&ctx, driver.as_ref(), ident)?;
             emit(&out, cli.json, || cmd::switch::print_human(&out))
+        }
+        Command::Auto => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            // The refusal is an EVENT on the stream, not an error envelope: a
+            // supervisor reading the stream must not have to parse two shapes.
+            let code = cmd::auto::run(ctx, driver.as_ref(), cli.json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::Rotate { strategy } => {
             // Parsed before the data dir is created: a bad strategy is a

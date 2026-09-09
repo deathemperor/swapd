@@ -1,4 +1,6 @@
+pub mod auto;
 pub mod collect;
+pub mod events;
 pub mod history;
 pub mod import;
 pub mod poll_policy;

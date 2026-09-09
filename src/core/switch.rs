@@ -604,8 +604,9 @@ fn seven_day_reset(account: &AccountView) -> Option<f64> {
 }
 
 /// The slot's own `preferred` flag, or a settings list naming it by number,
-/// alias or email.
-fn is_preferred(account: &AccountView, preferred: &[String]) -> bool {
+/// alias or email. Shared with the auto engine, which asks the same question
+/// of the active account and of every candidate.
+pub fn is_preferred(account: &AccountView, preferred: &[String]) -> bool {
     account.preferred
         || preferred.iter().any(|name| {
             let name = name.to_lowercase();

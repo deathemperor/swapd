@@ -188,7 +188,6 @@ impl Entry {
     /// Fresh enough to serve without fetching (`usage_store.py:307`).
     // The collector asks `reserve` instead, which re-checks this under the lock;
     // the auto engine's own eligibility pass reads it directly.
-    #[allow(dead_code)]
     pub fn fresh(&self, now: f64) -> bool {
         self.fetched_at.is_some_and(|f| (now - f) <= SERVE_TTL_S)
     }

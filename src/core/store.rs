@@ -96,6 +96,23 @@ impl FileLock {
             _file: rw.into_inner(),
         })
     }
+
+    /// Leave a breadcrumb in the lock file itself (the auto daemon writes its
+    /// pid there, cswap `autoswitch.py:2874`).
+    ///
+    /// Best-effort and deliberately silent: the flock is the authority, the
+    /// content is only for a human running `cat auto.lock`, and a failed write
+    /// must never keep a daemon that holds the lock from running. Written
+    /// through the handle that HOLDS the lock — a second handle would take a
+    /// second (Windows: conflicting) range lock on the same file.
+    pub fn note(&self, text: &str) {
+        use std::io::{Seek as _, SeekFrom};
+        let mut file = &self._file;
+        let _ = file.set_len(0);
+        let _ = file.seek(SeekFrom::Start(0));
+        let _ = file.write_all(text.as_bytes());
+        let _ = file.flush();
+    }
 }
 
 #[cfg(test)]

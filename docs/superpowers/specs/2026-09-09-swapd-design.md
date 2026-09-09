@@ -179,8 +179,8 @@ pub trait Driver: Send + Sync {
     fn identity(&self, login: &Login) -> Result<Identity, DriverError>; // email, org, plan
     fn refresh(&self, login: &Login) -> Result<Login, DriverError>;     // TokenDead on invalid_grant
     fn usage(&self, login: &Login) -> Result<Usage, DriverError>;       // windows[]; Throttled{retry_after}
-    fn ignite(&self, login: &Login) -> Result<(), DriverError>;         // one minimal request
-    fn run_env(&self, login: &Login) -> Result<RunProfile, DriverError>; // per-process profile; Drop cleans up
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<(), DriverError>;      // one minimal request as this login
+    fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
     fn capabilities(&self) -> Caps;                                     // ignite, add_token, prefer, refresh…
 }
 ```

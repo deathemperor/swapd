@@ -281,3 +281,53 @@ fn export_reports_an_unreadable_unclaimed_secret_without_a_credential() {
         "warning must name the id: {stderr}"
     );
 }
+
+/// `export` is per-provider: the manifest is shared across every provider,
+/// so a `claude` export must never carry another provider's stash — its
+/// credential bytes included.
+#[test]
+fn export_carries_only_its_own_providers_unclaimed_entries() {
+    let fx = Fixture::new();
+    fx.write_slot(1, "kept@example.com", "sk-ant-api03-kept-key");
+
+    let mut entries = serde_json::Map::new();
+    entries.insert(
+        "1757000000-aaa11111".to_string(),
+        entry(
+            "claude:unclaimed-1757000000-aaa11111",
+            "stray@example.com",
+            1_757_000_000,
+        ),
+    );
+    entries.insert(
+        "1757000100-ddd44444".to_string(),
+        json!({
+            "provider": "other",
+            "stashedAt": 1_757_000_100u64,
+            "email": "foreigner@example.com",
+            "fingerprint": "sha256:cafebabe",
+            "reason": "switch: live login matched no slot",
+            "secretKey": "other:unclaimed-1757000100-ddd44444",
+        }),
+    );
+    fx.write_unclaimed(Value::Object(entries));
+    fx.write_secret(
+        "claude:unclaimed-1757000000-aaa11111",
+        r#"{"claudeAiOauth":{"refreshToken":"rt-stray"}}"#,
+    );
+    fx.write_secret(
+        "other:unclaimed-1757000100-ddd44444",
+        "other-provider-bytes",
+    );
+
+    let raw = fx.stdout_raw(&["export", "-", "--json"]);
+    assert!(!raw.contains("other-provider-bytes"), "{raw}");
+    assert!(!raw.contains("foreigner@example.com"), "{raw}");
+    assert!(!raw.contains("1757000100-ddd44444"), "{raw}");
+
+    let envelope: Value = serde_json::from_str(&raw).unwrap();
+    let unclaimed = envelope["unclaimed"].as_array().unwrap();
+    assert_eq!(unclaimed.len(), 1, "{unclaimed:?}");
+    assert_eq!(unclaimed[0]["id"], "1757000000-aaa11111");
+    assert_eq!(unclaimed[0]["provider"], "claude");
+}

@@ -153,7 +153,15 @@ pub fn run(
     // stashed rather than placed, silently. An entry whose secret cannot be
     // read is still listed — the row itself is evidence the stash happened —
     // but without `credential`, and with a warning naming which one.
-    let unclaimed_entries = unclaimed::list(ctx)?;
+    // Filtered to this export's own provider: the manifest is shared across
+    // every provider, and a claude export must never carry another
+    // provider's stash — inert today with `claude` the only one, but a
+    // second provider would otherwise leak its credential bytes into a
+    // backup that names itself `claude`'s.
+    let unclaimed_entries: Vec<_> = unclaimed::list(ctx)?
+        .into_iter()
+        .filter(|(_, entry)| entry.provider == id)
+        .collect();
     let mut unclaimed_out: Vec<Value> = Vec::with_capacity(unclaimed_entries.len());
     for (entry_id, entry) in unclaimed_entries {
         let mut row = Map::new();

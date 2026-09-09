@@ -29,7 +29,13 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, ident: &str) -> Result<SwitchOutput
     // must not depend on the network being up.
     let slots = slots::load(&ctx.home, provider.id())?;
     let target = switch::resolve(&slots, provider.id(), ident)?;
-    Ok(view(switch::perform(ctx, provider, target, "manual")?))
+    Ok(view(switch::perform(
+        ctx,
+        provider,
+        target,
+        "manual",
+        switch::Freshen::ON_DEMAND,
+    )?))
 }
 
 pub fn view(result: SwitchResult) -> SwitchOutput {

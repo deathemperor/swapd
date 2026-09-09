@@ -114,6 +114,37 @@ pub fn resolve(slots: &ProviderSlots, provider: &str, ident: &str) -> Result<u32
     }
 }
 
+/// How hard a switch tries to hand its target a token that will still be valid
+/// after it lands (cswap `_freshen_target`, `autoswitch.py:905-910`).
+#[derive(Clone, Copy)]
+pub struct Freshen {
+    /// Refresh the target when its token expires within this many seconds.
+    pub buffer_s: f64,
+    /// Whether a refresh that could not happen aborts the switch.
+    pub required: bool,
+}
+
+impl Freshen {
+    /// A person naming one account: refresh only what is already expired, and
+    /// land it even if the refresh failed. Claude Code refreshes on first use,
+    /// and refusing over a flaky network would strand them on the account they
+    /// asked to leave.
+    pub const ON_DEMAND: Freshen = Freshen {
+        buffer_s: 0.0,
+        required: false,
+    };
+    /// The daemon: ten minutes of margin (cswap's `FRESHEN_BUFFER_MS`, twice
+    /// Claude Code's own 5-minute refresh buffer, so the CLI's post-lock
+    /// "abort the refresh if it is not expired yet" re-read still holds after
+    /// the swap), and a refresh it could not do means try the next candidate —
+    /// landing a login that is about to expire, on a lineage that may be dead,
+    /// costs the user a broken session where the engine had alternatives.
+    pub const AUTO: Freshen = Freshen {
+        buffer_s: 600.0,
+        required: true,
+    };
+}
+
 /// Make `target` the live login.
 ///
 /// `trigger` names the author of the switch in the history log (`manual`,
@@ -123,6 +154,7 @@ pub fn perform(
     provider: &dyn Driver,
     target: u32,
     trigger: &str,
+    freshen: Freshen,
 ) -> Result<SwitchResult> {
     let id = provider.id();
     let slots = slots::load(&ctx.home, id)?;
@@ -179,8 +211,15 @@ pub fn perform(
     // anyway, and the refresh writes a single-use rotation that must be
     // persisted before it can be spent.
     let mut warnings = Vec::new();
-    let target_login =
-        refresh_if_expired(ctx, provider, target, &key, target_login, &mut warnings)?;
+    let target_login = refresh_if_stale(
+        ctx,
+        provider,
+        target,
+        &key,
+        target_login,
+        freshen,
+        &mut warnings,
+    )?;
 
     let _engine = FileLock::acquire(&ctx.home.engine_lock_base(), slots::LOCK_TIMEOUT)?;
 
@@ -275,25 +314,31 @@ fn read_live_for_switch(provider: &dyn Driver, env: &crate::driver::Env) -> Resu
     }
 }
 
-/// Refresh an expired target before the locks, persisting the rotation.
+/// Refresh a target that is expired — or about to be — before the locks,
+/// persisting the rotation.
 ///
-/// A dead refresh token is fatal — landing it would make the next request fail
-/// as an authentication error the user cannot read. Any other failure is not:
-/// the login is merely stale, Claude Code refreshes it itself on first use, and
-/// refusing to switch over a transient network fault would be worse than
-/// switching.
-fn refresh_if_expired(
+/// A dead refresh token is fatal to this candidate either way: landing it would
+/// make the next request fail as an authentication error the user cannot read.
+/// What a merely-failed refresh means depends on who asked (`Freshen`): the
+/// daemon has other candidates and skips this one, a person naming an account
+/// gets it anyway with a warning.
+fn refresh_if_stale(
     ctx: &Ctx,
     provider: &dyn Driver,
     slot: u32,
     key: &str,
     login: Login,
+    freshen: Freshen,
     warnings: &mut Vec<String>,
 ) -> Result<Login> {
-    let expired = provider
+    // The buffer, not the bare expiry: a token with four minutes left lands as
+    // one the CLI must refresh mid-request, and if that lineage is dead the
+    // user is stranded on a broken active login instead of watching the engine
+    // quarantine the slot and take the next candidate.
+    let stale = provider
         .expires_at(&login)
-        .is_some_and(|expires_at| expires_at < ctx.now());
-    if !expired {
+        .is_some_and(|expires_at| expires_at < ctx.now() + freshen.buffer_s);
+    if !stale {
         return Ok(login);
     }
     match provider.refresh(&login) {
@@ -308,6 +353,14 @@ fn refresh_if_expired(
         Err(DriverError::TokenDead) => Err(SwapdError::new(
             ErrorCode::TokenDead,
             format!("slot {slot}'s login is expired and its refresh token was rejected; log in again and run `swapd add`"),
+        )),
+        Err(e) if freshen.required => Err(SwapdError::new(
+            ErrorCode::RefreshDenied,
+            format!(
+                "slot {slot}'s login expires within {:.0} minutes and could not be \
+                 refreshed ({e}); leaving it where it is",
+                freshen.buffer_s / 60.0
+            ),
         )),
         Err(e) => {
             warnings.push(format!(
@@ -694,6 +747,17 @@ mod tests {
         live: std::sync::Mutex<Option<String>>,
         fail_write: bool,
         writes: std::sync::Mutex<Vec<String>>,
+        refreshes: Refreshes,
+        refreshed: std::sync::Mutex<Vec<String>>,
+    }
+
+    /// What this driver's token endpoint does when a switch asks it to freshen
+    /// a login: reject the lineage, fail transiently, or rotate it.
+    #[derive(Clone, Copy)]
+    enum Refreshes {
+        Dead,
+        Transiently,
+        Rotates,
     }
 
     impl FakeDriver {
@@ -702,7 +766,14 @@ mod tests {
                 live: std::sync::Mutex::new(Some(live.to_string())),
                 fail_write,
                 writes: std::sync::Mutex::new(Vec::new()),
+                refreshes: Refreshes::Dead,
+                refreshed: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn refreshing(mut self, refreshes: Refreshes) -> Self {
+            self.refreshes = refreshes;
+            self
         }
     }
 
@@ -758,8 +829,15 @@ mod tests {
                 .pointer("/claudeAiOauth/expiresAt")?
                 .as_f64()
         }
-        fn refresh(&self, _login: &Login) -> std::result::Result<Login, DriverError> {
-            Err(DriverError::TokenDead)
+        fn refresh(&self, login: &Login) -> std::result::Result<Login, DriverError> {
+            self.refreshed.lock().unwrap().push(login.bytes.clone());
+            match self.refreshes {
+                Refreshes::Dead => Err(DriverError::TokenDead),
+                Refreshes::Transiently => Err(DriverError::Http("refresh: http-503".to_string())),
+                Refreshes::Rotates => Ok(Login {
+                    bytes: login.bytes.replace("rt-", "rt-next-"),
+                }),
+            }
         }
         fn usage(&self, _login: &Login) -> std::result::Result<crate::driver::Usage, DriverError> {
             Err(DriverError::Unsupported("usage"))
@@ -863,7 +941,7 @@ mod tests {
 
         // Matched rather than `unwrap_err`: `SwitchResult` has no `Debug`, so
         // nothing it carries can reach a panic message.
-        match perform(&ctx, &driver, 2, "manual") {
+        match perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND) {
             Err(e) => assert_eq!(e.code, ErrorCode::InvalidInput),
             Ok(_) => panic!("a refused write must fail the switch"),
         }
@@ -897,7 +975,7 @@ mod tests {
         let ctx = two_slots(dir.path());
         let driver = FakeDriver::new(&login_for("one@example.com", "rt-rotated"), false);
 
-        let result = perform(&ctx, &driver, 2, "manual").unwrap();
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
         assert!(result.switched);
         assert_eq!(result.from.as_ref().unwrap().slot, Some(1));
         assert_eq!(result.to.slot, Some(2));
@@ -939,7 +1017,7 @@ mod tests {
         record_slot_fingerprint(&ctx, "claude", 1, Some(&stamp)).unwrap();
         let driver = FakeDriver::new(&live, false);
 
-        let result = perform(&ctx, &driver, 2, "manual").unwrap();
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
         assert!(result.switched);
         assert_eq!(result.from.as_ref().unwrap().slot, Some(1));
 
@@ -983,7 +1061,7 @@ mod tests {
             .unwrap();
         let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false);
 
-        match perform(&ctx, &driver, 2, "manual") {
+        match perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND) {
             Err(e) => assert_eq!(e.code, ErrorCode::Unsupported),
             Ok(_) => panic!("the managed-key axis is not implemented; the switch must fail"),
         }
@@ -1018,7 +1096,7 @@ mod tests {
         std::fs::remove_file(&lock).unwrap();
         std::fs::create_dir_all(&lock).unwrap();
 
-        let result = perform(&ctx, &driver, 2, "manual").unwrap();
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
         assert!(result.switched, "the live store holds the target");
         assert_eq!(
             driver.live.lock().unwrap().clone().unwrap(),
@@ -1040,13 +1118,96 @@ mod tests {
         );
     }
 
+    /// The daemon lands a target that is *about* to expire only after
+    /// refreshing it: Claude Code refreshes with five minutes of margin, so a
+    /// token four minutes from expiry is one the CLI must rotate mid-request —
+    /// and if that lineage is dead the user is stranded, where the engine could
+    /// have quarantined the slot and taken the next candidate. A person naming
+    /// the account gets it as it is, because for them there is no next
+    /// candidate.
+    #[test]
+    fn the_auto_engine_freshens_a_target_that_expires_within_the_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        // Four minutes of life left: not expired, inside the ten-minute buffer.
+        let soon = dated(&login_for("two@example.com", "rt-2"), ctx.now() + 240.0);
+        ctx.secrets.set(&slot_key("claude", 2), &soon).unwrap();
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false)
+            .refreshing(Refreshes::Rotates);
+
+        let result = perform(&ctx, &driver, 2, "auto", Freshen::AUTO).unwrap();
+        assert!(result.switched);
+        assert_eq!(driver.refreshed.lock().unwrap().len(), 1);
+        // The rotation is persisted before it can be spent, and it is the
+        // rotated login that lands.
+        let stored = ctx.secrets.get(&slot_key("claude", 2)).unwrap().unwrap();
+        assert!(stored.contains("rt-next-2"), "{stored}");
+        assert_eq!(driver.live.lock().unwrap().clone().unwrap(), stored);
+
+        // The same target, asked for by a person: untouched, and it still lands.
+        let ctx = two_slots(dir.path());
+        ctx.secrets.set(&slot_key("claude", 2), &soon).unwrap();
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false)
+            .refreshing(Refreshes::Rotates);
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
+        assert!(result.switched);
+        assert!(
+            driver.refreshed.lock().unwrap().is_empty(),
+            "a manual switch refreshes only what is already expired"
+        );
+    }
+
+    /// A refresh the daemon asked for and could not get is a reason to try
+    /// another candidate, not to land a login that expires in four minutes:
+    /// `RefreshDenied` is the code the engine skips on, and nothing may have
+    /// happened to the live store by then.
+    #[test]
+    fn a_required_freshen_that_fails_transiently_refuses_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        let soon = dated(&login_for("two@example.com", "rt-2"), ctx.now() + 240.0);
+        ctx.secrets.set(&slot_key("claude", 2), &soon).unwrap();
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false)
+            .refreshing(Refreshes::Transiently);
+
+        match perform(&ctx, &driver, 2, "auto", Freshen::AUTO) {
+            Err(e) => assert_eq!(e.code, ErrorCode::RefreshDenied),
+            Ok(_) => panic!("a target that could not be freshened must not land"),
+        }
+        assert!(
+            driver.writes.lock().unwrap().is_empty(),
+            "the refusal happens before the live store is touched"
+        );
+        assert_eq!(
+            ctx.secrets.get(&slot_key("claude", 2)).unwrap().unwrap(),
+            soon
+        );
+
+        // The same failure on a manual switch: the user gets the account they
+        // named, and a warning saying the login is stale.
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"), false)
+            .refreshing(Refreshes::Transiently);
+        let expired = dated(&login_for("two@example.com", "rt-2"), ctx.now() - 1.0);
+        ctx.secrets.set(&slot_key("claude", 2), &expired).unwrap();
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
+        assert!(result.switched);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be refreshed")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
     #[test]
     fn switching_to_the_live_account_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = two_slots(dir.path());
         let driver = FakeDriver::new(&login_for("two@example.com", "rt-2"), false);
 
-        let result = perform(&ctx, &driver, 2, "manual").unwrap();
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
         assert!(!result.switched);
         assert_eq!(result.reason.as_deref(), Some("already-active"));
         assert!(

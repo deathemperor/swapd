@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{AccountView, ProviderView, UsageStatus, Window};
 use crate::core::collect::{collect, CollectOpts};
-use crate::core::events::{window_label, Emit, Event};
+use crate::core::events::{pct_label, window_label, Emit, Event};
 use crate::core::history::SlotRef;
 use crate::core::poll_policy::{
     self, binding_pct, limiting_reset_ts, parse_reset_ts, ESCALATION_MARGIN_PCT, RESET_SLACK_S,
@@ -358,12 +358,18 @@ impl<'a> AutoEngine<'a> {
         // Kept apart, and never ranked: cswap lands on a metered API-key
         // account as a last resort, but swapd's driver refuses to make a
         // managed key the live login, so the engine says so instead of
-        // offering a target that would fail.
-        let api_key_candidates: Vec<u32> = candidates
-            .iter()
-            .copied()
-            .filter(|slot| account_of(&view, *slot).is_some_and(is_api_key))
-            .collect();
+        // offering a target that would fail. Opt-in, like cswap's own last
+        // resort — with the flag off a managed key is not a candidate at all,
+        // and must not stand in the way of `no-candidates`.
+        let api_key_candidates: Vec<u32> = if settings.include_api_key_accounts {
+            candidates
+                .iter()
+                .copied()
+                .filter(|slot| account_of(&view, *slot).is_some_and(is_api_key))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         if trigger == "consume-first" && oauth_candidates.is_empty() && active_headroom.is_some() {
             // A healthy account with no peer to compare against — the same
@@ -446,7 +452,13 @@ impl<'a> AutoEngine<'a> {
             let email = account_of(&view, target)
                 .map(|a| a.email.clone())
                 .unwrap_or_default();
-            match switch::perform(&self.ctx, self.driver, target, trigger) {
+            match switch::perform(
+                &self.ctx,
+                self.driver,
+                target,
+                trigger,
+                switch::Freshen::AUTO,
+            ) {
                 Ok(result) if result.switched => {
                     // The live login has already changed. Bookkeeping that
                     // fails after that point is a warning, not an error —
@@ -495,7 +507,11 @@ impl<'a> AutoEngine<'a> {
                 }
                 // `can_activate` refused it (a managed API key cannot be made
                 // the live login in phase 1).
-                Err(e) if e.code == ErrorCode::Unsupported => unsupported = Some(e.message),
+                Err(e) if e.code == ErrorCode::Unsupported => {
+                    // The FIRST cause is kept, not the last: it is the
+                    // best-ranked candidate's, and so the most actionable.
+                    unsupported.get_or_insert(e.message);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -593,7 +609,11 @@ impl<'a> AutoEngine<'a> {
             if !consume_first {
                 self.emit(Event::NoSwitch {
                     reason: "below-threshold".to_string(),
-                    detail: format!("{utilization:.10}% < {:.10}%", settings.threshold),
+                    detail: format!(
+                        "{}% < {}%",
+                        pct_label(utilization),
+                        pct_label(settings.threshold)
+                    ),
                 });
                 return Classified::Hold(TickOutcome::NoAction);
             }
@@ -638,8 +658,15 @@ impl<'a> AutoEngine<'a> {
     ) -> TickOutcome {
         // cswap's last resort is to land on a metered API-key account. swapd
         // cannot: the driver refuses to make a managed key the live login, so
-        // saying why beats offering a target that would fail.
-        if !api_key_candidates.is_empty() && trigger != "consume-first" {
+        // saying why beats offering a target that would fail. Only when they
+        // are the ONLY candidates, though: with an OAuth peer in the fleet the
+        // real story is `no-comparison`, `no-qualifying-candidate` or
+        // `all-exhausted`, and each of those carries a cadence of its own that
+        // the blanket `unsupported` was suppressing.
+        if oauth_candidates.is_empty()
+            && !api_key_candidates.is_empty()
+            && trigger != "consume-first"
+        {
             self.emit(Event::NoSwitch {
                 reason: "unsupported".to_string(),
                 detail: format!(
@@ -1646,7 +1673,11 @@ fn left_at_limit_holds(departure: &Departure, now: f64) -> bool {
 /// rather than masquerading as "back immediately".
 fn binding_recovery_ts(windows: &[Window], models: &[String], now: f64) -> f64 {
     let relevant = relevant(windows, models);
-    let Some(binding) = relevant.iter().max_by(|a, b| a.pct.total_cmp(&b.pct)) else {
+    // The FIRST maximal window, as Python's `max` returns (Rust's `max_by`
+    // returns the last): with a 5h and a 7d window tied — routine in the
+    // all-exhausted regime this function exists for — the two would otherwise
+    // schedule around different resets.
+    let Some(binding) = relevant.iter().rev().max_by(|a, b| a.pct.total_cmp(&b.pct)) else {
         return f64::INFINITY;
     };
     match parse_reset_ts(binding.resets_at.as_deref()) {

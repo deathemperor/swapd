@@ -266,6 +266,15 @@ impl Board {
         .unwrap();
     }
 
+    /// Add a slot whose stored credential is a managed API key — an account
+    /// the driver refuses to make the live login.
+    fn seed_api_key(&self, slot: u32, email: &str) {
+        self.seed(slot, email, &format!("rt-{slot}"), T0 + 86_400.0);
+        self.secrets()
+            .set(&slot_key("claude", slot), "sk-ant-api03-managed")
+            .unwrap();
+    }
+
     /// A context on this board's home, secrets and clock. Built per tick, the
     /// way a cron-driven `--once` run would: everything a tick must remember
     /// is in `auto-state.json`, and nothing here may depend on process memory.
@@ -711,6 +720,226 @@ fn all_exhausted_emits_earliest_reset() {
     let sleep = board.last("sleep").unwrap();
     assert_eq!(sleep["seconds"], MAX_SLEEP_S);
     assert_eq!(sleep["until"], format_ts(T0 + MAX_SLEEP_S).unwrap());
+}
+
+/// A managed API-key slot in the fleet is not a candidate at default settings,
+/// and must not stand between the engine and the reason it is actually stuck:
+/// with `unsupported` in the way, a fleet with one API-key slot could never
+/// report `all-exhausted`, never take its bounded reset-aware sleep, and would
+/// poll at full cadence through a whole reset window.
+#[test]
+fn an_api_key_peer_never_hides_all_exhausted() {
+    let board = Board::new();
+    board.seed_api_key(3, "keyed@example.com");
+    for email in ["one@example.com", "two@example.com"] {
+        board.driver.set_usage(
+            email,
+            vec![window(WindowKind::FiveHour, 100.0, T0 + 3600.0)],
+        );
+    }
+
+    assert_eq!(board.tick(), TickOutcome::Blocked);
+
+    let exhausted = board.last("all-exhausted").unwrap();
+    assert_eq!(
+        exhausted["earliestResetAt"],
+        format_ts(T0 + 3600.0).unwrap()
+    );
+    assert!(
+        board.last("no-switch").is_none(),
+        "the API-key slot is not a candidate at all: {:?}",
+        board.kinds()
+    );
+}
+
+/// With no OAuth peer left, the API-key slot IS the whole story — and which
+/// story depends on the flag. Off: it is not a candidate, so there are none.
+/// On: it is the only candidate, and swapd cannot land on it, so it says so.
+#[test]
+fn an_api_key_slot_alone_is_no_candidates_until_it_is_opted_in() {
+    let board = Board::new();
+    // Slot 2 is the only peer, and it is a managed key.
+    board.seed_api_key(2, "keyed@example.com");
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(95.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::Blocked);
+    assert_eq!(board.last("no-switch").unwrap()["reason"], "no-candidates");
+
+    set(&board, "includeApiKeyAccounts", Value::Bool(true));
+    board.advance(400.0);
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(95.0, board.now(), 3600.0));
+    assert_eq!(board.tick(), TickOutcome::Blocked);
+    let refused = board.last("no-switch").unwrap();
+    assert_eq!(refused["reason"], "unsupported");
+    assert!(
+        refused["detail"].as_str().unwrap().contains("slots 2"),
+        "{refused}"
+    );
+}
+
+/// When the active account and every peer are over the threshold there is no
+/// "land somewhere healthy" left, and the goal becomes soonest back. The
+/// account with the MOST headroom is deliberately not the one taken.
+#[test]
+fn with_everything_above_the_threshold_the_soonest_back_wins() {
+    let board = Board::new();
+    board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+    // Active: 4% left, back in four hours.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(96.0, T0, 4.0 * 3600.0));
+    // Slot 2: less headroom than slot 3, but back in half an hour.
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(95.0, T0, 1800.0));
+    // Slot 3: the most headroom of the three, and back last.
+    board
+        .driver
+        .set_usage("three@example.com", usage_at(91.0, T0, 3.0 * 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    let switched = board.last("switch").unwrap();
+    assert_eq!(
+        switched["to"]["number"], 2,
+        "ranked by headroom this would be slot 3"
+    );
+}
+
+/// A spent active account with only a near-spent peer: the ratio margin refuses
+/// every candidate, and without the one-way fallback the engine would park in
+/// that band reporting `no-qualifying-candidate` while a usable account sat
+/// there resetting sooner.
+#[test]
+fn a_spent_active_falls_back_to_the_only_thing_left() {
+    let board = Board::new();
+    // 3% left, back in six hours — past the recovery horizon, so the ranking
+    // is on headroom and 5% does not beat 3% by the 2x margin.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(97.0, T0, 6.0 * 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(95.0, T0, 5.0 * 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    assert_eq!(board.last("switch").unwrap()["to"]["number"], 2);
+}
+
+/// consume-first's three ways of doing nothing, in the order a user meets
+/// them: an active account whose weekly reset nobody has reported, a fleet
+/// where nothing resets sooner, and a target whose measurement is too old to
+/// act on. The last one matters most — consume-first decides BELOW the
+/// threshold, where a stored number can be a full candidate interval old.
+#[test]
+fn consume_first_holds_on_unknown_resets_later_resets_and_stale_usage() {
+    let board = Board::new();
+    set(&board, "strategy", Value::from("consume-first"));
+    // No weekly reset reported for the active account.
+    board.driver.set_usage(
+        "one@example.com",
+        vec![
+            window(WindowKind::FiveHour, 50.0, T0 + 3600.0),
+            Window {
+                kind: WindowKind::SevenDay,
+                name: None,
+                pct: 25.0,
+                resets_at: None,
+                pace: None,
+                used: None,
+                limit: None,
+                currency: None,
+            },
+        ],
+    );
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    assert_eq!(board.last("no-switch").unwrap()["reason"], "reset-unknown");
+
+    // Now the active account's weekly window resets first: nothing to trade up
+    // to, whatever the peer's headroom.
+    board.advance(400.0);
+    let now = board.now();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, now, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, now, 7200.0));
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    assert_eq!(
+        board.last("no-switch").unwrap()["reason"],
+        "already-consuming-soonest"
+    );
+
+    // And a peer that DOES reset sooner, whose measurement is a little too old
+    // to act on: consume-first decides BELOW the threshold, where a stored
+    // number can be a whole candidate interval stale, so the commit waits for
+    // a fresh one instead of sliding onto a guess. (The ranking still trusts
+    // the measurement — it is inside the store's decision bound — which is
+    // exactly the gap this gate covers.)
+    board.advance(400.0);
+    let now = board.now();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, now, 7200.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, now, 3600.0));
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    let held = board.last("no-switch").unwrap();
+    assert_eq!(held["reason"], "stale-usage", "{:?}", board.kinds());
+    assert_eq!(board.live_email(), "one@example.com");
+}
+
+/// An active token that expired while the CLI was idle is not a failing
+/// account: Claude Code refreshes it on first use, so there is no quota burn
+/// and nothing to switch for. The engine crawls instead of spending failover
+/// ticks on it.
+#[test]
+fn an_expired_active_token_idle_holds_instead_of_failing_over() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    // The CLI's live login expires while nobody is using it. The next tick is
+    // inside the active account's plan, so nothing refreshes it: the collector
+    // reports the expiry rather than a measurement.
+    *board.driver.live.lock().unwrap() = Some(login("one@example.com", "rt-1", T0 - 1.0));
+    board.advance(10.0);
+    let (outcome, delay) = board.tick_and_schedule();
+    assert_eq!(outcome, TickOutcome::NoAction);
+    let held = board.last("no-switch").unwrap();
+    assert_eq!(held["reason"], "active-idle", "{:?}", board.kinds());
+    assert_eq!(delay, 300.0, "an idle hold crawls instead of polling");
+    assert!(
+        board.last("switch").is_none(),
+        "an idle CLI is not a reason to move the user's account"
+    );
+}
+
+/// Python's `max` keeps the FIRST maximal element and Rust's `max_by` the
+/// last, and two windows at the same pct is routine the moment an account is
+/// spent — so this one line decides whether the engine schedules around the 5h
+/// reset (as cswap does) or the weekly one, and with it the recovery tier, the
+/// recovery release and every hysteresis on that axis.
+#[test]
+fn a_tie_between_windows_binds_on_the_first_one() {
+    let tied = vec![
+        window(WindowKind::FiveHour, 100.0, T0 + 3600.0),
+        window(WindowKind::SevenDay, 100.0, T0 + 86_400.0),
+    ];
+    assert_eq!(binding_recovery_ts(&tied, &[], T0), T0 + 3600.0);
 }
 
 #[test]

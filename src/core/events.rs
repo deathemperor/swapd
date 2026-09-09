@@ -277,7 +277,7 @@ impl Emit {
 
 /// A percentage as configured rather than as rounded: `85.555555` stays
 /// itself and `99.9` never renders as a lying `100` (cswap `pct_label`).
-fn pct_label(value: f64) -> String {
+pub(crate) fn pct_label(value: f64) -> String {
     let text = format!("{value:.10}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
     text.to_string()

@@ -39,7 +39,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, strategy: Strategy) -> Result<Switc
     // nothing about the candidate's credential aborts.
     let mut warnings: Vec<String> = Vec::new();
     for target in ranked {
-        match switch::perform(ctx, provider, target, "rotate") {
+        match switch::perform(ctx, provider, target, "rotate", switch::Freshen::ON_DEMAND) {
             Ok(result) if result.switched => {
                 let mut out = view(result);
                 warnings.append(&mut out.warnings);

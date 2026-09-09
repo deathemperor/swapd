@@ -88,10 +88,12 @@ pub fn load(home: &crate::paths::Home, provider: &str) -> Result<ProviderSlots> 
 /// `slots.json`'s lock.
 ///
 /// `decide` sees the provider's table as it stands *inside* the lock and
-/// answers with the slot to write, its row, the credential, and whatever the
-/// caller wants to report (`created`, the resolved email). Deciding outside the
-/// lock and writing inside it is a check-then-act: two concurrent `add`s both
-/// compute the same `next_free()` and the second silently overwrites the
+/// answers with the slot to write, its row, the credential, the OTHER slot to
+/// vacate (when this capture is `add --slot n` MOVING an account that already
+/// owns a different slot, rather than duplicating it there), and whatever the
+/// caller wants to report (`created`, the resolved email). Deciding outside
+/// the lock and writing inside it is a check-then-act: two concurrent `add`s
+/// both compute the same `next_free()` and the second silently overwrites the
 /// first's row.
 ///
 /// What lands is a trio, as in cswap (`add_account`, `add_account_from_token`
@@ -104,8 +106,12 @@ pub fn load(home: &crate::paths::Home, provider: &str) -> Result<ProviderSlots> 
 /// The secret is written BEFORE the row (a row pointing at bytes that never
 /// landed is a slot that cannot authenticate, while bytes without a row are
 /// merely unreferenced) and inside the lock, because the slot number it is
-/// keyed by is only decided there. `clear_dead` stays outside it, so the usage
-/// store's lock is never nested inside `slots.json`'s.
+/// keyed by is only decided there. The vacated slot's row is removed in the
+/// SAME lock cycle (so a concurrent `list` never observes the account sitting
+/// in both slots at once), but its secret and usage-store rows follow outside
+/// the lock, exactly like `clear_dead` — a crash between the two leaves the
+/// account owning only the new slot with its old secret still around, which
+/// the next `add` simply overwrites again, never a lost account.
 ///
 /// `activate` records the slot as the provider's active one in the same cycle,
 /// for the verb whose write IS the live login (`add`).
@@ -113,23 +119,34 @@ pub fn claim<T>(
     ctx: &Ctx,
     provider: &str,
     activate: bool,
-    decide: impl FnOnce(&ProviderSlots) -> Result<(u32, Slot, Login, T)>,
-) -> Result<(u32, T)> {
-    let (n, extra) = update(&ctx.home.slots_file(), |file| {
+    decide: impl FnOnce(&ProviderSlots) -> Result<(u32, Slot, Login, Option<u32>, T)>,
+) -> Result<(u32, Option<u32>, T)> {
+    let (n, vacated, extra) = update(&ctx.home.slots_file(), |file| {
         let existing = file.providers.entry(provider.to_string()).or_default();
-        let (n, mut meta, login, extra) = decide(existing)?;
+        let (n, mut meta, login, vacate, extra) = decide(existing)?;
         ctx.secrets
             .set(&crate::secrets::slot_key(provider, n), &login.bytes)?;
         meta.fingerprint = Some(login.fingerprint());
         existing.insert(n, meta);
+        let vacated = vacate.filter(|m| *m != n);
+        if let Some(m) = vacated {
+            existing.remove(m);
+        }
         if activate {
             existing.active_slot = Some(n);
         }
-        Ok((true, (n, extra)))
+        Ok((true, (n, vacated, extra)))
     })?;
+    if let Some(m) = vacated {
+        ctx.secrets.delete(&crate::secrets::slot_key(provider, m))?;
+        ctx.store.relocate(
+            &crate::secrets::slot_key(provider, m),
+            &crate::secrets::slot_key(provider, n),
+        )?;
+    }
     ctx.store
         .clear_dead(&crate::secrets::slot_key(provider, n))?;
-    Ok((n, extra))
+    Ok((n, vacated, extra))
 }
 
 /// Whether `identity` is the account `slot` holds.

@@ -811,6 +811,29 @@ impl UsageStore {
         self.write_rows(rows)
     }
 
+    /// Move `from`'s row to `to` (`add --slot n` moving an account that
+    /// already owns a different slot): the account's measurement history,
+    /// failure backoff and dead-token strikes follow it to the new slot
+    /// number rather than starting cold, and `from`'s row is not left behind
+    /// as an orphan under a slot number nothing points at any more.
+    ///
+    /// A row already at `to` (a `--force` overwrite's occupant) is replaced
+    /// wholesale, same as `reserve`'s identity mismatch case: it belonged to
+    /// the account that `to` no longer holds. A missing `from` row is not an
+    /// error — there is nothing to carry — and skips the write.
+    pub fn relocate(&self, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let _lock = self.lock()?;
+        let mut rows = self.read_rows()?;
+        let Some(row) = rows.remove(from) else {
+            return Ok(());
+        };
+        rows.insert(to.to_string(), row);
+        self.write_rows(rows)
+    }
+
     pub fn clear_dead(&self, key: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut rows = self.read_rows()?;

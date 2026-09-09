@@ -864,8 +864,20 @@ impl<'a> AutoEngine<'a> {
     /// picked it up; it is caught instead where it matters, by
     /// `switch::perform`, which re-reads the live login itself before it
     /// commits and reports `already-active` rather than landing on a picture
-    /// this tick has stopped describing. What each pass fetches, and the order
-    /// the decisions are made in, is unchanged.
+    /// this tick has stopped describing.
+    ///
+    /// One window widens from one pass to one tick: Claude Code refreshing its
+    /// OWN login mid-tick is outside `core::refresh`'s compare-and-swap, which
+    /// is on the SLOT's stored secret and so only orders swapd's refreshers
+    /// against each other. A later phase can therefore POST the generation the
+    /// CLI has just spent and earn one `invalid_grant` — a dead-strike and
+    /// `relogin-required` on a healthy account. It heals itself: the next
+    /// tick's `prepare` adopts the live generation and `clear_dead`s the row
+    /// it just rewrote. The same race exists per-pass on main; preparing once
+    /// makes its window a tick instead of a pass, and both are seconds wide.
+    ///
+    /// What each pass fetches, and the order the decisions are made in, is
+    /// unchanged.
     fn collect_scheduled(
         &mut self,
         settings: &Settings,

@@ -171,9 +171,14 @@ pub struct Prepared {
     keys: Vec<(String, String, String)>,
     /// The usage table as of the last read: the preamble's, replaced by every
     /// `execute` that actually fetched. A pass that fetches nothing serves from
-    /// this copy, which is sound because the only writer in between is
-    /// `reserve`, and nothing a view is built from — `account_view`,
-    /// `next_candidate`, `next_recovery`, `Entry::token_dead` — reads a claim.
+    /// this copy rather than re-reading, which costs no freshness THIS process
+    /// could have seen: its own only writer in between is `reserve`, and
+    /// nothing a view is built from — `account_view`, `next_candidate`,
+    /// `next_recovery`, `Entry::token_dead` — reads a claim. Another swapd
+    /// process can of course write the table meanwhile; what it can add is a
+    /// strike, and `reserve` gates on the raw strike count under the table's
+    /// own lock, so a row struck between two passes is refused a claim rather
+    /// than fetched on this copy's word.
     entries: BTreeMap<String, Entry>,
     /// The slot whose credential this pass cannot see (an unreadable keychain,
     /// a switch in flight, a busy CLI), if any.
@@ -186,7 +191,12 @@ pub struct Prepared {
 /// One whole pass: the preamble, then one fetch set over it.
 pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<ProviderView> {
     let mut prepared = prepare(ctx, provider, opts.lock_wait)?;
-    execute(ctx, provider, &mut prepared, &opts.into())
+    // The `Prepared` dies with the view, so the successor re-read has no reader:
+    // it would be one keychain read per fetched slot for a value nothing looks
+    // at — a doubling of `refresh`'s per-slot secret cost — and, worse, a
+    // failure point after every row has already been written, which would fail
+    // `list`/`refresh` on a fault that used to be impossible past the preamble.
+    execute_inner(ctx, provider, &mut prepared, &opts.into(), false)
 }
 
 /// Steps 1–3: the live login, every slot's credential, and the stored table
@@ -435,6 +445,26 @@ pub fn execute(
     prepared: &mut Prepared,
     opts: &FetchOpts,
 ) -> Result<ProviderView> {
+    execute_inner(ctx, provider, prepared, opts, true)
+}
+
+/// `execute`, plus whether the `Prepared` is worth carrying forward.
+///
+/// `adopt_successors` is false for exactly one caller — `collect`, which drops
+/// the `Prepared` with the view it returns. Re-reading a credential nobody will
+/// read back is not free: it is one secret store read per FETCHED slot (one
+/// `/usr/bin/security` spawn each on macOS, on the path this whole split exists
+/// to make cheaper), and it moves a fallible read to after the fetches have
+/// been recorded, where a transient keychain fault would fail a verb whose work
+/// is already done. A caller that keeps the `Prepared` needs the re-read and
+/// pays for it; one that does not, does not.
+fn execute_inner(
+    ctx: &Ctx,
+    provider: &dyn Driver,
+    prepared: &mut Prepared,
+    opts: &FetchOpts,
+    adopt_successors: bool,
+) -> Result<ProviderView> {
     let id = provider.id();
     // Marked up and thrown away: see `SlotState::for_pass`.
     let mut states: Vec<SlotState> = prepared.states.iter().map(SlotState::for_pass).collect();
@@ -508,21 +538,23 @@ pub fn execute(
         // 7. The successors, for the slots this pass claimed — see
         //    `adopt_successor`. Strictly after the marking above, which is
         //    about the generation that was just SPENT.
-        let Prepared {
-            states: base,
-            entries,
-            unreadable_active,
-            ..
-        } = &mut *prepared;
-        for (i, live_synced) in fetched {
-            adopt_successor(
-                ctx,
-                provider,
-                &mut base[i],
+        if adopt_successors {
+            let Prepared {
+                states: base,
                 entries,
-                *unreadable_active,
-                live_synced,
-            )?;
+                unreadable_active,
+                ..
+            } = &mut *prepared;
+            for (i, live_synced) in fetched {
+                adopt_successor(
+                    ctx,
+                    provider,
+                    &mut base[i],
+                    entries,
+                    *unreadable_active,
+                    live_synced,
+                )?;
+            }
         }
     }
 

@@ -2,8 +2,9 @@ mod errors;
 mod output;
 mod paths;
 
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
-use errors::Result;
+use errors::{ErrorCode, Result, SwapdError};
 use paths::Home;
 use serde::Serialize;
 use std::path::Path;
@@ -54,7 +55,22 @@ struct ProviderStatus {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit();
+            }
+            let json = std::env::args().any(|a| a == "--json");
+            let first_line = e.to_string().lines().next().unwrap_or_default().to_string();
+            let message = first_line
+                .strip_prefix("error: ")
+                .unwrap_or(&first_line)
+                .to_string();
+            output::emit_error(&SwapdError::new(ErrorCode::InvalidInput, message), json);
+            std::process::exit(1);
+        }
+    };
     let json = cli.json;
     let result = run(&cli);
     match result {

@@ -15,11 +15,15 @@ fn version_json_has_schema_and_version() {
 
 #[test]
 fn unknown_verb_is_a_json_error_with_exit_1() {
-    Command::cargo_bin("swapd")
+    let out = Command::cargo_bin("swapd")
         .unwrap()
         .args(["frobnicate", "--json"])
-        .assert()
-        .failure();
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schemaVersion"], 1);
+    assert_eq!(v["error"]["code"], "invalid-input");
 }
 
 #[test]

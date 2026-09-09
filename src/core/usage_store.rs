@@ -19,6 +19,7 @@
 //!
 //! Rows hold windows and timestamps only — never a token, never a credential.
 
+use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -98,10 +99,8 @@ pub const PERMANENT_AUTH_ERRORS: [&str; 2] = ["invalid_grant", "no_refresh_token
 /// Anthropic's weekly window resets on a fixed per-account slot.
 const WEEK_S: f64 = 7.0 * 24.0 * 3600.0;
 
-/// Whether `kind` proves the stored credential is dead rather than throttled —
-/// i.e. whether the caller should follow the failure with `record_token_dead`.
-// Task 9's collector classifies each fetch outcome through this.
-#[allow(dead_code)]
+/// Whether `kind` proves the stored credential is permanently unusable rather
+/// than merely throttled — i.e. whether the failure also strikes the token.
 pub fn is_permanent_auth_error(kind: &str) -> bool {
     PERMANENT_AUTH_ERRORS.contains(&kind)
 }
@@ -639,27 +638,27 @@ impl UsageStore {
         let mut rows = self.read_rows()?;
         let mut won = BTreeMap::new();
         for (key, email, org) in keys {
-            match rows.get(key) {
-                Some(row) if matches(row, email, org) => {
-                    if !row_eligible(row, now, respect_plans, force) {
+            let fresh = || Row {
+                email: email.clone(),
+                org: org.clone(),
+                ..Row::default()
+            };
+            let row = match rows.entry(key.clone()) {
+                MapEntry::Occupied(slot) if matches(slot.get(), email, org) => {
+                    if !row_eligible(slot.get(), now, respect_plans, force) {
                         continue;
                     }
+                    slot.into_mut()
                 }
                 // A row for another identity is the previous account's:
                 // replace it wholesale rather than inherit its measurement,
                 // its plan or its strikes.
-                _ => {
-                    rows.insert(
-                        key.clone(),
-                        Row {
-                            email: email.clone(),
-                            org: org.clone(),
-                            ..Row::default()
-                        },
-                    );
+                MapEntry::Occupied(mut slot) => {
+                    slot.insert(fresh());
+                    slot.into_mut()
                 }
-            }
-            let row = rows.get_mut(key).expect("row present");
+                MapEntry::Vacant(slot) => slot.insert(fresh()),
+            };
             let claim_id = new_claim_id();
             row.last_attempt_at = Some(now);
             row.claim_id = Some(claim_id.clone());
@@ -676,8 +675,10 @@ impl UsageStore {
     /// (`usage_store.py:1096-1166`). A late writer whose lease was replaced is
     /// ignored without touching the newer row.
     ///
-    /// Writes `last_good`/`fetched_at`, commits the new poll plan in the same
-    /// transaction (so no collector can slip into a record→replan gap), and
+    /// Writes `last_good`/`fetched_at` (an empty `windows` clears the stored
+    /// measurement: the fetch succeeded and reported nothing), commits the new
+    /// poll plan in the same transaction (so no collector can slip into a
+    /// record→replan gap), and
     /// clears the error, the backoff and the dead-token strikes — a success
     /// proves the token alive. `last_429_at` survives: the planner keeps the
     /// cadence floored while the saturated window ages out.
@@ -726,7 +727,14 @@ impl UsageStore {
         // what the endpoint actually reported.
         let mut stored = windows;
         carry_weekly_reset(&mut stored, &previous, now);
-        row.last_good = Some(stored);
+        // A response carrying no window data is a successful fetch of nothing
+        // (cswap's `lastGood = None`): the row is fresh, and its headroom is
+        // unknown rather than the previous, now-superseded measurement.
+        row.last_good = if stored.is_empty() {
+            None
+        } else {
+            Some(stored)
+        };
         row.fetched_at = Some(now);
         row.last_attempt_at = Some(now);
         row.next_poll_at = Some(next_poll_at);
@@ -743,17 +751,26 @@ impl UsageStore {
     /// Never touches `last_good`/`fetched_at` — stale-on-error — so a failing
     /// account keeps its last measurement while its trust ages out.
     ///
-    /// `kind` is the classified error (`"http-429"`, `"timeout"`, ...);
+    /// `kind` is the classified error (`"http-429"`, `"timeout"`, ...) and
     /// `retry_after` the server's header when it sent one. A permanent auth
-    /// error additionally takes `record_token_dead` (see
-    /// `is_permanent_auth_error`): a transient failure is no evidence the
-    /// token is dead, and must not touch the strike count either way.
+    /// error (`is_permanent_auth_error`) additionally strikes the credential
+    /// generation `struck_fp` was taken from: at `AUTH_DEAD_STRIKES` the
+    /// account is quarantined, fetched no more until a success or a credential
+    /// rewrite. A transient error is no evidence the token is alive *or* dead
+    /// and leaves the strike count untouched.
+    ///
+    /// The strike lives here, inside the fence, rather than in a call of its
+    /// own: unfenced it would let a writer whose lease has already been
+    /// replaced quarantine the row (and drop the live holder's claim, so that
+    /// holder's success would be rejected in turn) — recoverable only by hand,
+    /// through `clear_dead`.
     pub fn record_failure(
         &self,
         key: &str,
         claim: &str,
         kind: &str,
         retry_after: Option<f64>,
+        struck_fp: Option<&str>,
     ) -> Result<()> {
         let now = self.now();
         let _lock = self.lock()?;
@@ -772,24 +789,13 @@ impl UsageStore {
         }
         row.backoff_until =
             Some(now + failure_backoff_s(row.consecutive_failures, retry_after, rate_limited));
-        release_claim(row);
-        self.write_rows(rows)
-    }
-
-    /// Strike the credential generation `fingerprint` for a permanent auth
-    /// failure (`usage_store.py:1129-1136`). At `AUTH_DEAD_STRIKES` the account
-    /// is quarantined: no more fetches until a success or a credential rewrite.
-    ///
-    /// Unfenced, unlike the outcome writers: the verdict is about the stored
-    /// credential, which the fingerprint identifies on its own.
-    pub fn record_token_dead(&self, key: &str, fingerprint: &str) -> Result<()> {
-        let _lock = self.lock()?;
-        let mut rows = self.read_rows()?;
-        let Some(row) = rows.get_mut(key) else {
-            return Ok(());
-        };
-        row.auth_dead_strikes += 1;
-        row.dead_fingerprint = Some(fingerprint.to_string());
+        if is_permanent_auth_error(kind) {
+            row.auth_dead_strikes += 1;
+            // Always overwritten, never merged: a strike recorded with no
+            // fingerprint must bind unconditionally rather than inherit an
+            // earlier, already-healed one.
+            row.dead_fingerprint = struck_fp.map(str::to_string);
+        }
         release_claim(row);
         self.write_rows(rows)
     }
@@ -989,7 +995,7 @@ mod tests {
         assert_eq!(entry(&store).last_good, None);
         // A failure is fenced the same way.
         store
-            .record_failure("claude:1", &stale, "timeout", None)
+            .record_failure("claude:1", &stale, "timeout", None, None)
             .unwrap();
         assert_eq!(entry(&store).consecutive_failures, 0);
 
@@ -1011,7 +1017,7 @@ mod tests {
         // `Retry-After: 0` is the saturated-budget edge: wait EDGE_BACKOFF_S.
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         store
-            .record_failure("claude:1", &claim, "http-429", Some(0.0))
+            .record_failure("claude:1", &claim, "http-429", Some(0.0), None)
             .unwrap();
         let e = entry(&store);
         assert_eq!(e.backoff_until, Some(T0 + EDGE_BACKOFF_S));
@@ -1025,7 +1031,7 @@ mod tests {
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         let now = store.now();
         store
-            .record_failure("claude:1", &claim, "http-429", Some(120.0))
+            .record_failure("claude:1", &claim, "http-429", Some(120.0), None)
             .unwrap();
         assert_eq!(entry(&store).backoff_until, Some(now + 120.0));
 
@@ -1034,7 +1040,7 @@ mod tests {
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         let now = store.now();
         store
-            .record_failure("claude:1", &claim, "http-429", Some(3600.0))
+            .record_failure("claude:1", &claim, "http-429", Some(3600.0), None)
             .unwrap();
         assert_eq!(entry(&store).backoff_until, Some(now + 4500.0));
     }
@@ -1079,20 +1085,27 @@ mod tests {
         let clock = TestClock::new();
         let store = store(&dir, &clock);
 
+        // A permanent auth error strikes the credential generation it was
+        // POSTed with, inside the same fenced write as the failure itself.
+        assert!(is_permanent_auth_error("invalid_grant"));
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         store
-            .record_failure("claude:1", &claim, "invalid_grant", None)
+            .record_failure(
+                "claude:1",
+                &claim,
+                "invalid_grant",
+                None,
+                Some("sha256:fp-old"),
+            )
             .unwrap();
-        assert!(is_permanent_auth_error("invalid_grant"));
-        store.record_token_dead("claude:1", "fp-old").unwrap();
 
         let e = entry(&store);
         assert_eq!(e.auth_dead_strikes, AUTH_DEAD_STRIKES);
         assert!(e.token_dead(None));
         // The strike condemns the generation it was POSTed with: a replaced
         // credential fingerprints differently and is not quarantined.
-        assert!(e.token_dead(Some("fp-old")));
-        assert!(!e.token_dead(Some("fp-new")));
+        assert!(e.token_dead(Some("sha256:fp-old")));
+        assert!(!e.token_dead(Some("sha256:fp-new")));
 
         // Quarantined: no fetches, not even forced ones, once the backoff
         // itself has lapsed.
@@ -1108,6 +1121,84 @@ mod tests {
         assert_eq!(e.consecutive_failures, 0);
         assert_eq!(e.last_error, None);
         assert_eq!(store.reserve(&ident(), false, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transient_failure_never_strikes_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        // Even handed a fingerprint, a transient error is no evidence the
+        // token is alive *or* dead and must not condemn it.
+        for kind in ["timeout", "http-429", "network"] {
+            clock.advance(BACKOFF_CAP_S + 1.0);
+            let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
+            store
+                .record_failure("claude:1", &claim, kind, None, Some("sha256:fp"))
+                .unwrap();
+            let e = entry(&store);
+            assert_eq!(e.auth_dead_strikes, 0, "{kind} struck the token");
+            assert_eq!(e.dead_fingerprint, None);
+            assert!(!e.token_dead(None));
+        }
+    }
+
+    #[test]
+    fn stale_writer_cannot_strike_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        let stale = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
+        // The lease expires; another collector takes the row.
+        clock.advance(CLAIM_TTL_S + 1.0);
+        let live = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
+
+        // The late writer's verdict is dropped: quarantining the row here
+        // would need a manual `clear_dead` to undo...
+        store
+            .record_failure(
+                "claude:1",
+                &stale,
+                "invalid_grant",
+                None,
+                Some("sha256:fp-old"),
+            )
+            .unwrap();
+        let e = entry(&store);
+        assert_eq!(e.auth_dead_strikes, 0);
+        assert_eq!(e.dead_fingerprint, None);
+        // ...and it must not drop the live holder's claim either, or that
+        // holder's own outcome would be rejected in turn.
+        assert!(e.claimed(store.now()));
+        store
+            .record_success("claude:1", &live, five(10.0), true, 80.0, &[])
+            .unwrap();
+        assert_eq!(entry(&store).last_good, Some(five(10.0)));
+    }
+
+    #[test]
+    fn a_success_with_no_window_data_clears_the_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        fetch_ok(&store, five(10.0));
+        assert_eq!(
+            entry(&store).decision_windows(),
+            Some(five(10.0).as_slice())
+        );
+
+        // A successful fetch that reported nothing: the row is fresh, and its
+        // headroom is unknown rather than the superseded measurement.
+        clock.advance(MIN_INTERVAL_S + 1.0);
+        fetch_ok(&store, vec![]);
+        let e = entry(&store);
+        assert_eq!(e.last_good, None);
+        assert_eq!(e.fetched_at, Some(store.now()));
+        assert!(e.fresh(store.now()));
+        assert_eq!(e.decision_windows(), None);
     }
 
     #[test]
@@ -1149,7 +1240,7 @@ mod tests {
 
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         store
-            .record_failure("claude:1", &claim, "timeout", None)
+            .record_failure("claude:1", &claim, "timeout", None, None)
             .unwrap();
         clock.advance(60.0);
 
@@ -1183,7 +1274,7 @@ mod tests {
         // the first post-block success could see it.
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         store
-            .record_failure("claude:1", &claim, "http-429", Some(3600.0))
+            .record_failure("claude:1", &claim, "http-429", Some(3600.0), None)
             .unwrap();
         let backoff_end = T0 + 4500.0;
         clock.set(backoff_end + 1.0);
@@ -1286,7 +1377,7 @@ mod tests {
         // data.
         let claim = store.reserve(&ident(), false, false).unwrap()["claude:1"].clone();
         store
-            .record_failure("claude:1", &claim, "timeout", None)
+            .record_failure("claude:1", &claim, "timeout", None, None)
             .unwrap();
         let e = entry(&store);
         assert!(e.trust_extended);

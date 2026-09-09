@@ -44,6 +44,9 @@ struct FakeDriver {
     /// Every account `usage()` was called for, in order — the endpoint's
     /// budget is per-request, so the schedule is only testable by counting.
     usage_calls: Mutex<Vec<String>>,
+    /// How many times the collector's preamble read the live login. One per
+    /// `prepare`, which is what says how many preambles a tick ran.
+    live_reads: Mutex<usize>,
 }
 
 impl FakeDriver {
@@ -54,7 +57,13 @@ impl FakeDriver {
             dead: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             usage_calls: Mutex::new(Vec::new()),
+            live_reads: Mutex::new(0),
         }
+    }
+
+    /// The preambles since the last call.
+    fn take_live_reads(&self) -> usize {
+        std::mem::take(&mut *self.live_reads.lock().unwrap())
     }
 
     /// Make this account's usage endpoint fail (an account with no row in the
@@ -106,6 +115,10 @@ impl Driver for FakeDriver {
             Some(bytes) => Ok(Login { bytes }),
             None => Err(DriverError::NoLogin),
         }
+    }
+    fn read_live_locked(&self, env: &Env) -> std::result::Result<Login, DriverError> {
+        *self.live_reads.lock().unwrap() += 1;
+        self.read_live(env)
     }
     fn write_live(&self, _env: &Env, login: &Login) -> std::result::Result<(), DriverError> {
         self.writes.lock().unwrap().push(login.bytes.clone());
@@ -214,6 +227,33 @@ impl Driver for FakeDriver {
     }
 }
 
+/// The board's secret store, counting every read.
+///
+/// What the preamble costs is not an implementation detail: on macOS each
+/// `get` is one `/usr/bin/security` spawn, so a tick that reads every slot's
+/// secret once per fetch pass costs several times what one that reads them
+/// once does. The count is the behaviour.
+struct CountingSecrets {
+    inner: Box<dyn Secrets>,
+    gets: Arc<Mutex<Vec<String>>>,
+}
+
+impl Secrets for CountingSecrets {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        self.gets.lock().unwrap().push(key.to_string());
+        self.inner.get(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<()> {
+        self.inner.set(key, value)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key)
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+}
+
 // -- the board ---------------------------------------------------------------
 
 /// A seeded fleet: a temp home, a fake provider, one clock and the event log.
@@ -222,6 +262,8 @@ struct Board {
     clock: Arc<Mutex<f64>>,
     driver: FakeDriver,
     events: Rc<RefCell<Vec<Value>>>,
+    /// Every secret key the ticks read, in order.
+    secret_gets: Arc<Mutex<Vec<String>>>,
 }
 
 impl Board {
@@ -232,6 +274,7 @@ impl Board {
             clock: Arc::new(Mutex::new(T0)),
             driver: FakeDriver::new(&login("one@example.com", "rt-1", T0 + 86_400.0)),
             events: Rc::new(RefCell::new(Vec::new())),
+            secret_gets: Arc::new(Mutex::new(Vec::new())),
         };
         Home {
             root: board.dir.path().to_path_buf(),
@@ -313,7 +356,10 @@ impl Board {
                 vars: Default::default(),
             },
             home,
-            secrets: self.secrets(),
+            secrets: Box::new(CountingSecrets {
+                inner: self.secrets(),
+                gets: self.secret_gets.clone(),
+            }),
             clock: Box::new(move || *b.lock().unwrap()),
             settings: Default::default(),
             store,
@@ -342,6 +388,11 @@ impl Board {
         let outcome = engine.tick();
         let delay = engine.schedule(outcome, || 0.5);
         (outcome, delay)
+    }
+
+    /// The secret keys read since the last call.
+    fn take_secret_gets(&self) -> Vec<String> {
+        std::mem::take(&mut *self.secret_gets.lock().unwrap())
     }
 
     fn advance(&self, seconds: f64) {
@@ -1305,4 +1356,67 @@ fn leaving_slot_one() -> Board {
         .driver
         .set_usage("three@example.com", usage_at(80.0, T0, 3600.0));
     board
+}
+
+/// The preamble is the expensive half of a collection pass — `engine.lock`,
+/// the live login, one secret read per slot — and a tick runs up to three fetch
+/// passes over numbers that cannot have changed between them. So it runs once,
+/// no matter how many phases the schedule ends up spending.
+#[test]
+fn one_tick_prepares_once() {
+    let board = Board::new();
+    board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+    board.seed(4, "four@example.com", "rt-4", T0 + 86_400.0);
+    // 80% used against a 90% threshold and a 15-point escalation margin: inside
+    // the band, so the tick escalates to the whole fleet — and still below it,
+    // so nothing switches and the live login cannot move under the tick.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(80.0, T0, 3600.0));
+    for email in ["two@example.com", "three@example.com", "four@example.com"] {
+        board.driver.set_usage(email, usage_at(10.0, T0, 3600.0));
+    }
+    board.driver.take_live_reads();
+    board.take_secret_gets();
+
+    assert_eq!(board.tick(), TickOutcome::NoAction, "{:?}", board.kinds());
+
+    // Phase A serves from the store, phase B fetches the active account and the
+    // stalest due candidate, and the escalation fetches the other two.
+    assert_eq!(board.driver.take_usage_calls().len(), 4);
+    assert_eq!(
+        board.driver.take_live_reads(),
+        1,
+        "three fetch passes, one preamble"
+    );
+    let gets = board.take_secret_gets();
+    for slot in 1..=4 {
+        assert_eq!(
+            gets.iter()
+                .filter(|key| **key == slot_key("claude", slot))
+                .count(),
+            2,
+            "slot {slot}: one preamble read, plus the successor re-read it \
+             earned by being fetched: {gets:?}"
+        );
+    }
+    assert_eq!(gets.len(), 8, "{gets:?}");
+}
+
+/// The one thing a `Prepared` may not outlive is a switch: it names the active
+/// account, and after a consume-first commit that is somebody else. Every pass
+/// on that path prepares again.
+#[test]
+fn a_switch_tick_re_prepares() {
+    let board = stale_consume_first_pick();
+    board.driver.take_live_reads();
+
+    assert_eq!(board.tick(), TickOutcome::Switched, "{:?}", board.kinds());
+
+    assert_eq!(
+        board.driver.take_live_reads(),
+        2,
+        "the two-phase commit's re-measure reads the live login again"
+    );
+    assert_eq!(board.live_email(), "two@example.com");
 }

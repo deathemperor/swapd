@@ -15,7 +15,6 @@ use clap::{Parser, Subcommand};
 use errors::{ErrorCode, Result, SwapdError};
 use paths::Home;
 use serde::Serialize;
-use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "swapd", version)]
@@ -306,7 +305,7 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             // The child's code is the verb's: `swapd run` is a wrapper, and a
             // wrapper that flattens exit codes breaks every script around it.
-            let code = cmd::run::run(&ctx, driver.as_ref(), ident, args)?;
+            let code = cmd::run::run(&ctx, driver.as_ref(), ident, args, cli.json)?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -465,7 +464,7 @@ fn version(json: bool) -> Result<()> {
 
 fn doctor(json: bool) -> Result<()> {
     let home = Home::resolve()?;
-    let (installed, path) = locate_claude();
+    let (installed, path) = locate_claude(&home);
     let providers = vec![ProviderStatus {
         provider: "claude".to_string(),
         installed,
@@ -490,20 +489,13 @@ fn doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Find the `claude` binary on PATH or in a set of well-known install locations.
+/// Find the `claude` binary this environment would run.
 ///
-/// One lookup, shared with the Claude driver's `installed()` and its igniter
-/// (`driver::claude::run::find_claude`), so doctor cannot disagree with what a
-/// run would actually execute.
-fn locate_claude() -> (bool, Option<String>) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    match driver::claude::run::find_claude(
-        std::env::var(driver::claude::run::CLI_OVERRIDE_ENV)
-            .ok()
-            .as_deref(),
-        std::env::var("PATH").ok().as_deref(),
-        Path::new(&home),
-    ) {
+/// The same `resolve_cli` the driver's `installed()` and its igniter use, fed
+/// the same kind of `Env`, so doctor cannot disagree with what a run would
+/// actually execute.
+fn locate_claude(home: &Home) -> (bool, Option<String>) {
+    match driver::claude::run::resolve_cli(&driver::Env::current(home)) {
         Some(path) => (true, Some(path.to_string_lossy().into_owned())),
         None => (false, None),
     }

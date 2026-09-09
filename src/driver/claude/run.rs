@@ -117,6 +117,33 @@ pub fn find_claude(
     candidate_paths(home).into_iter().find(|p| is_executable(p))
 }
 
+/// The `claude` binary this environment would run.
+///
+/// The single resolver: `installed()`, the igniter and `doctor` all come
+/// through here with the same `Env`, so they cannot disagree about which binary
+/// a run would execute — a driver that reports "installed" and then fails with
+/// `NotInstalled` turns a synthesized environment into a mystery.
+///
+/// `SWAPD_CLAUDE_CLI` comes from the `Env` alone (naming a binary is a
+/// statement about *this* run). `PATH` falls back to the process's, because an
+/// `Env` assembled by hand — a test context, a caller building one field at a
+/// time — has no `PATH` to speak of, and answering "not installed" for a
+/// machine that plainly has the CLI would be a worse lie than looking one level
+/// out. A missing `HOME` only costs the `$HOME`-relative candidates.
+pub fn resolve_cli(env: &Env) -> Option<PathBuf> {
+    let path_var = env
+        .vars
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok());
+    let home = paths::home(env).unwrap_or_default();
+    find_claude(
+        env.vars.get(CLI_OVERRIDE_ENV).map(String::as_str),
+        path_var.as_deref(),
+        &home,
+    )
+}
+
 /// An existing file we could actually exec. A non-executable `claude` on `PATH`
 /// (a stray text file, a half-finished install, a `claude` *directory*) must not
 /// shadow a real one further along it — reporting "installed" for something that
@@ -571,12 +598,7 @@ pub fn ignite(
     let profile = run_profile(driver, env, slot, login)?;
     let path_var = env.vars.get("PATH").map(String::as_str);
     let home = paths::home(env)?;
-    let binary = find_claude(
-        env.vars.get(CLI_OVERRIDE_ENV).map(String::as_str),
-        path_var,
-        &home,
-    )
-    .ok_or(DriverError::NotInstalled)?;
+    let binary = resolve_cli(env).ok_or(DriverError::NotInstalled)?;
 
     // An empty directory of swapd's own: `claude` scans its working directory
     // for project files (and records the run against that project), and the

@@ -98,7 +98,7 @@ impl Driver for FakeDriver {
     fn id(&self) -> &'static str {
         "claude"
     }
-    fn installed(&self) -> Option<std::path::PathBuf> {
+    fn installed(&self, _env: &Env) -> Option<std::path::PathBuf> {
         None
     }
     fn read_live(&self, _env: &Env) -> std::result::Result<Login, DriverError> {

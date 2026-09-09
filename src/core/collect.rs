@@ -304,7 +304,7 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
 
     Ok(ProviderView {
         provider: id.to_string(),
-        installed: provider.installed().is_some(),
+        installed: provider.installed(&ctx.env).is_some(),
         active_slot: states.iter().find(|st| st.active).map(|st| st.slot),
         next_candidate: next_candidate(ctx, &states, &entries),
         next_recovery: next_recovery(ctx, &states, &entries),

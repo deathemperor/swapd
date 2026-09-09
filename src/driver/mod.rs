@@ -163,10 +163,9 @@ pub struct RunProfile {
     /// driver's `AUTH_OVERRIDE_ENV_VARS`).
     pub unset: Vec<String>,
     /// The profile's own directory. Nothing *runs* in it — `ignite` uses an
-    /// empty cwd of swapd's own and `run` inherits the user's — so it is here
-    /// for a caller that wants to report or inspect the profile, and the
-    /// driver's own tests are what read it today.
-    #[allow(dead_code)]
+    /// empty cwd of swapd's own and `run` inherits the user's — so it is what a
+    /// caller reports rather than what it runs in: `run` names it when a
+    /// rotation is stranded there.
     pub dir: PathBuf,
     /// Reads the profile's credential back after the child exits, answering
     /// `Some(login)` when the CLI rotated it in place.
@@ -217,7 +216,13 @@ pub struct Caps {
 
 pub trait Driver: Send + Sync {
     fn id(&self) -> &'static str; // "claude"
-    fn installed(&self) -> Option<PathBuf>; // the CLI on this machine
+    /// The CLI on this machine, as *this* environment would resolve it.
+    ///
+    /// Takes the `Env` rather than reading the process's, so the answer a
+    /// status verb prints is the answer a run would get. The two used to be
+    /// separate reads that agreed only because `Env::current` captures the
+    /// process env.
+    fn installed(&self, env: &Env) -> Option<PathBuf>;
     /// The CLI's live login for the current environment.
     fn read_live(&self, env: &Env) -> Result<Login, DriverError>;
     /// Replace it, under the CLI's own locks; preserve state the login

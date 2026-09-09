@@ -462,7 +462,7 @@ fn stash_key(provider: &str, now: f64, login: &Login) -> String {
 
 /// The slot a login belongs to: identity (email + org) first, fingerprint
 /// second for a login that carries no identity of its own.
-fn match_slot(provider: &dyn Driver, slots: &ProviderSlots, login: &Login) -> Option<u32> {
+pub fn match_slot(provider: &dyn Driver, slots: &ProviderSlots, login: &Login) -> Option<u32> {
     if let Some(identity) = provider.identity_offline(login) {
         let email = identity.email.to_lowercase();
         if !email.is_empty() {
@@ -781,7 +781,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "claude"
         }
-        fn installed(&self) -> Option<std::path::PathBuf> {
+        fn installed(&self, _env: &crate::driver::Env) -> Option<std::path::PathBuf> {
             None
         }
         fn read_live(&self, _env: &crate::driver::Env) -> std::result::Result<Login, DriverError> {

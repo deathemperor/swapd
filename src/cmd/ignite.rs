@@ -53,7 +53,7 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<IgniteOutput> 
     // Asked before the profile is seeded and — more importantly — before the
     // login is refreshed: a refresh token is single-use, so spending one for a
     // run that cannot happen costs the account a generation for nothing.
-    if driver.installed().is_none() {
+    if driver.installed(&ctx.env).is_none() {
         return Err(SwapdError::new(
             ErrorCode::ProviderNotInstalled,
             format!("{id} is not installed"),

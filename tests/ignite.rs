@@ -152,7 +152,7 @@ impl Fixture {
         script.push_str("  printf 'apikey:[%s]\\n' \"$ANTHROPIC_API_KEY\"\n");
         script.push_str("  printf 'cwd:%s\\n' \"$PWD\"\n");
         script.push_str(
-            "  printf 'seeded:%s\\n' \"$(cat \"$CLAUDE_CONFIG_DIR/.credentials.json\")\"\n",
+            "  printf 'seeded:%s\\n' \"$(cat \"$CLAUDE_CONFIG_DIR/.credentials.json\" 2>/dev/null)\"\n",
         );
         script.push_str(&format!("}} > '{}'\n", self.witness_path().display()));
         if stub.rotate {
@@ -197,6 +197,16 @@ impl Fixture {
         cmd
     }
 
+    fn run(&self, args: &[&str]) -> Value {
+        let out = self.cmd().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
     /// Run expecting failure; returns the parsed error envelope.
     fn run_err(&self, args: &[&str]) -> Value {
         let out = self.cmd().args(args).output().unwrap();
@@ -207,6 +217,93 @@ impl Fixture {
     fn slots(&self) -> Value {
         serde_json::from_str(&std::fs::read_to_string(self.home.path().join("slots.json")).unwrap())
             .unwrap()
+    }
+
+    /// Give the board a second account, so a forced pass has something it is
+    /// visibly not fetching.
+    fn write_second_slot(&self) {
+        let mut slots = self.slots();
+        slots["providers"]["claude"]["order"] = json!([1, 2]);
+        slots["providers"]["claude"]["slots"]["2"] = json!({
+            "email": "two@example.com",
+            "organizationUuid": "org-2",
+            "organizationName": "Org Two",
+            "alias": "two",
+        });
+        write(&self.home.path().join("slots.json"), &slots.to_string());
+        write(
+            &self.home.path().join("credentials/claude_2"),
+            &json!({
+                "claudeAiOauth": {
+                    "accessToken": "tok-2",
+                    "refreshToken": "rt-2",
+                    "expiresAt": NOT_EXPIRED_MS,
+                    "scopes": ["user:inference"],
+                },
+                "oauthAccount": {
+                    "emailAddress": "two@example.com",
+                    "organizationUuid": "org-2",
+                    "organizationName": "Org Two",
+                },
+            })
+            .to_string(),
+        );
+    }
+
+    /// A measurement taken `age_s` ago — the shape a successful pass leaves
+    /// behind, and inside the serve TTL when it is fresh.
+    fn write_usage_row(&self, slot: u32, email: &str, org: &str, age_s: f64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        write(
+            &self.home.path().join("usage.json"),
+            &json!({
+                "schemaVersion": 2,
+                "rows": { format!("claude:{slot}"): {
+                    "email": email,
+                    "org": org,
+                    "lastGood": [{"kind": "5h", "pct": 3.0, "resetsAt": "2026-09-09T05:59:59Z"}],
+                    "fetchedAt": now - age_s,
+                    "consecutiveFailures": 0,
+                    "authDeadStrikes": 0,
+                }},
+            })
+            .to_string(),
+        );
+    }
+
+    /// Claude Code's own live login, and the `~/.claude.json` identity it
+    /// advertises for it.
+    fn write_live_login(&self, email: &str, org: &str) {
+        write(
+            &self.claude_home.path().join(".claude/.credentials.json"),
+            &json!({
+                "claudeAiOauth": {
+                    "accessToken": "tok-live",
+                    "refreshToken": "rt-live",
+                    "expiresAt": NOT_EXPIRED_MS,
+                    "scopes": ["user:inference"],
+                },
+            })
+            .to_string(),
+        );
+        write(
+            &self.claude_home.path().join(".claude.json"),
+            &json!({
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "organizationUuid": org,
+                    "organizationName": "Org One",
+                },
+            })
+            .to_string(),
+        );
+    }
+
+    fn live_credential(&self) -> String {
+        std::fs::read_to_string(self.claude_home.path().join(".claude/.credentials.json")).unwrap()
     }
 }
 
@@ -233,6 +330,12 @@ fn fingerprint_of(refresh_token: &str) -> String {
 #[test]
 fn ignite_runs_igniter_then_forces_refresh() {
     let fx = Fixture::new();
+    // A second account, and a measurement for slot 1 taken seconds ago. Without
+    // `force_slots` this pass would serve slot 1 from the table and fetch slot
+    // 2, which has none — so the hit counts below prove the force, and prove it
+    // is a force of exactly one slot.
+    fx.write_second_slot();
+    fx.write_usage_row(1, "one@example.com", "org-1", 5.0);
     // The real shape of a run: `claude` refreshes its own token first, in the
     // profile, and tells nobody.
     fx.write_stub(Stub {
@@ -245,6 +348,17 @@ fn ignite_runs_igniter_then_forces_refresh() {
     // merely that a collect happened.
     let spent = fx.usage_mock("tok-1", usage_body(1.0, 2.0));
     let rotated = fx.usage_mock("tok-1b", usage_body(12.0, 34.0));
+    let other = fx.usage_mock("tok-2", usage_body(56.0, 7.0));
+
+    // The baseline this test turns on: a plain pass serves slot 1 from the
+    // table (inside the serve TTL) and fetches only the sibling.
+    let listed = fx.run(&["list", "--json"]);
+    assert_eq!(
+        listed["providers"][0]["accounts"][0]["windows"][0]["pct"],
+        3.0
+    );
+    spent.assert_hits(0);
+    other.assert_hits(1);
 
     let out = fx
         .cmd()
@@ -285,11 +399,15 @@ fn ignite_runs_igniter_then_forces_refresh() {
     // and that fetch went out as the rotated token.
     rotated.assert_hits(1);
     spent.assert_hits(0);
+    // Past the serve TTL for the named slot, and only for it: the sibling's
+    // endpoint stayed at the hit count the baseline pass left it on.
+    other.assert_hits(1);
     assert_eq!(out["ignited"]["slot"], 1);
     assert_eq!(out["ignited"]["rotated"], true);
     assert!(out["ignited"]["at"].as_str().unwrap().ends_with('Z'));
     // The payload is `list`'s, so one call both ignites and reports the board.
     assert_eq!(out["schemaVersion"], 1);
+    assert_eq!(out["providers"][0]["accounts"].as_array().unwrap().len(), 2);
     let account = &out["providers"][0]["accounts"][0];
     assert_eq!(account["slot"], 1);
     assert_eq!(account["usageStatus"], "ok");
@@ -455,4 +573,124 @@ fn run_and_ignite_refuse_an_unknown_account() {
     }
     // Nothing was launched for an account that does not exist.
     assert!(!fx.witness_path().exists());
+}
+
+#[test]
+fn run_on_the_live_account_takes_the_ambient_fast_path() {
+    let fx = Fixture::new();
+    // The live login IS slot 1's account. cswap's same-account fast path
+    // (`session.py:536-551`): making a second copy of this credential is how
+    // the two drift — the profile's rotation spends the generation `~/.claude`
+    // still holds, and the user's next plain `claude` is logged out.
+    fx.write_live_login("one@example.com", "org-1");
+    fx.write_stub(Stub {
+        exit: 5,
+        ..Stub::new()
+    });
+
+    let out = fx
+        .cmd()
+        .args(["run", "one", "--", "--model", "opus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+
+    // The CLI ran with the ambient environment: no config dir was imposed on
+    // it, so it read the live login exactly as a plain `claude` would.
+    assert_eq!(fx.witness_line("argv"), "--model opus");
+    assert_eq!(fx.witness_line("config"), "");
+    assert_eq!(fx.witness_line("secure"), "");
+    // ...and no profile was built for it at all.
+    assert!(!fx.profile().exists());
+    // Nothing was written on either side: no second copy to drift, and the
+    // live credential is the CLI's own to rotate.
+    assert!(fx.stored_login().contains("rt-1"));
+    assert!(fx.live_credential().contains("rt-live"));
+
+    // Said out loud, on stderr, so the user knows why this run looks different.
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("already the live login"),
+        "stderr was: {said}"
+    );
+    // The child owns stdout; swapd puts nothing on it.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn run_with_an_ambient_config_dir_keeps_the_profile_and_warns() {
+    let fx = Fixture::new();
+    // Same live login as above, so the fast path would fire — except the user
+    // already points the CLI somewhere of their own, and "the live login" is
+    // then not what a plain run would use (`session.py:528-536`).
+    fx.write_live_login("one@example.com", "org-1");
+    fx.write_stub(Stub::new());
+    let ambient = fx.claude_home.path().join("their-own-dir");
+    std::fs::create_dir_all(&ambient).unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["run", "1", "--"])
+        .env("CLAUDE_CONFIG_DIR", &ambient)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    // The profile route, not the fast path.
+    assert_eq!(fx.witness_line("config"), fx.profile().to_str().unwrap());
+    assert!(fx.profile().exists());
+    // And the override is announced rather than done silently.
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("CLAUDE_CONFIG_DIR is set"),
+        "stderr was: {said}"
+    );
+    assert!(
+        !said.contains("already the live login"),
+        "stderr was: {said}"
+    );
+}
+
+#[test]
+fn run_reports_a_failed_persist_and_still_propagates_the_exit_code() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    fx.write_stub(Stub {
+        exit: 7,
+        rotate: true,
+        ..Stub::new()
+    });
+    // The stored login can be read (so the profile is seeded and the child
+    // runs) but not written: this is the failure that happens AFTER the child
+    // has exited, with its code already decided.
+    let saved = std::fs::metadata(fx.credential()).unwrap().permissions();
+    std::fs::set_permissions(fx.credential(), std::fs::Permissions::from_mode(0o400)).unwrap();
+    let out = fx.cmd().args(["run", "1", "--"]).output().unwrap();
+    std::fs::set_permissions(fx.credential(), saved).unwrap();
+
+    // The child is gone and its code is the answer to the command the user
+    // gave; a swapd-side failure to store the rotation must not overwrite it.
+    assert_eq!(out.status.code(), Some(7));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("could not store it"), "stderr was: {said}");
+    // And the message does not tell the user to re-run: the read-back already
+    // moved the profile's seed marker to the new generation, so the next run
+    // would re-seed the older stored copy over the rotation. It states where
+    // the rotation is stranded instead.
+    assert!(
+        said.contains("one generation behind the profile"),
+        "stderr was: {said}"
+    );
+    assert!(
+        said.contains(fx.profile().to_str().unwrap()),
+        "stderr was: {said}"
+    );
+    assert!(!said.contains("again"), "stderr was: {said}");
+    assert!(fx.stored_login().contains("rt-1"));
+    assert!(
+        std::fs::read_to_string(fx.profile().join(".credentials.json"))
+            .unwrap()
+            .contains("rt-1b")
+    );
 }

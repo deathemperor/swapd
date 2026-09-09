@@ -29,19 +29,10 @@ impl Driver for ClaudeDriver {
         "claude"
     }
 
-    /// The `claude` binary, if this machine has one.
-    ///
-    /// The single process-environment read the driver makes: `installed()` takes
-    /// no `Env`, so `SWAPD_CLAUDE_CLI`, `PATH` and `HOME` come from the process
-    /// here (the ruling's explicit exception). Everything else goes through
-    /// `Env`.
-    fn installed(&self) -> Option<PathBuf> {
-        let home = std::env::var("HOME").unwrap_or_default();
-        run::find_claude(
-            std::env::var(run::CLI_OVERRIDE_ENV).ok().as_deref(),
-            std::env::var("PATH").ok().as_deref(),
-            std::path::Path::new(&home),
-        )
+    /// The `claude` binary, if this environment has one — the same lookup the
+    /// igniter makes, from the same `Env`.
+    fn installed(&self, env: &Env) -> Option<PathBuf> {
+        run::resolve_cli(env)
     }
 
     fn read_live(&self, env: &Env) -> Result<Login, DriverError> {

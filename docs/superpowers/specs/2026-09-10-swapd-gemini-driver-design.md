@@ -15,7 +15,7 @@ user's real `~/.gemini` beyond key names.
 | 1 igniter may cost money | **1a**: a metered call is acceptable *as the igniter*; the usage call is the igniter | §6, §7 |
 | 2 swapd-owned locks | **yes**: `read_live_locked`/`write_live` take a swapd-owned mkdir lock next to the CLI's credential file | §3 |
 | 3 identity without network | Gemini has `google_accounts.json`; nothing to decide | §4 |
-| 4 ordering | **Gemini first** (simplest store), ahead of Codex; the spec's §11 order is amended | — |
+| 4 ordering | **Gemini first** (simplest store), ahead of Codex — an assumption; the spec's §11 order would need amending | — |
 | 9 quota window | **from `resetTime` only**, no hardcoded window; buckets map to `WindowKind::Scoped` named by `modelId` | §5 |
 | 10 fixtures | captured by the user from a throwaway login on a throwaway `GEMINI_CLI_HOME`, structure only | §9 |
 
@@ -105,8 +105,8 @@ for `export --full`), `None` when absent.
 `oauth_creds.json`; they live in env vars and `settings.json`
 `security.auth.selectedType`, which swapd reads only to refuse
 (`selectedType != "oauth-personal"` → `NoLogin` with reason
-`auth-type-not-oauth`; a new `ErrorCode` string, same `NoLogin`
-class).
+`auth-type-not-oauth`; a new reason string, same `NoLogin` class —
+listed as the contract addition in §8).
 
 ## 4. Identity and fingerprint
 
@@ -155,9 +155,9 @@ Bucket → window mapping: one `Window` per bucket, `kind: Scoped`,
 × (1 − remainingFraction)` or from `remainingAmount`/limit when the
 server sends amounts, `resets_at: resetTime` (RFC 3339, as-is).
 `used`/`limit` only when `remainingAmount` came with a known limit;
-never invented. Pace is computed by core from `resets_at` as for
-Claude's windows only when the window has a start — Gemini buckets
-have none, so `pace: None`. The Infinitus adapter already renders
+never invented. Pace is the driver's to compute (the Claude driver
+does it in `usage::windows_at` from the window's start); Gemini
+buckets have no start, so the Gemini driver leaves `pace: None`. The Infinitus adapter already renders
 `Scoped` windows by name (Claude's `opus` / `sonnet` scoped windows
 use the same path).
 
@@ -227,8 +227,11 @@ token-shaped credential a user could paste (the pair is two files);
    validation picks it up for free.
 3. `paths.rs`: `refresh_lock_base` / `credentials_dir` / `profiles_dir`
    already take the provider; nothing new.
-4. `contract`: no new fields. `activeUnreadable` reasons are reused
-   (`switch-in-progress`, `cli-busy` when `.swapd-live.lock` is held).
+4. `contract`: no new fields; one new `NoLogin` reason string,
+   `auth-type-not-oauth` (§3). `activeUnreadable` reasons are reused:
+   a held `.swapd-live.lock` is swapd's own lock, so it reports
+   `switch-in-progress`; `cli-busy` stays reserved for a CLI-owned
+   lock (#8's definition), of which Gemini has none.
 5. `Endpoints`: two new names, `GOOGLE_OAUTH` and `CLOUDCODE`,
    with `SWAPD_URL_*` overrides.
 6. Infinitus adapter (`SwapdEngine`): one more `EngineFleet` for

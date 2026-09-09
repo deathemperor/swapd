@@ -177,7 +177,9 @@ fn candidate_paths(home: &Path) -> Vec<PathBuf> {
         .iter()
         .map(|c| {
             let path = Path::new(c);
-            let path = if path.is_absolute() {
+            // `has_root`, not `is_absolute`: on Windows a drive-less `/opt/…`
+            // is not absolute, and `join` would graft it onto the home's drive.
+            let path = if path.has_root() {
                 path.to_path_buf()
             } else {
                 home.join(path)

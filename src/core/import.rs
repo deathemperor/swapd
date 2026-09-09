@@ -1,8 +1,10 @@
 //! Reading an export back in.
 //!
 //! Port of cswap `import_accounts` (`transfer.py:316`), plus swapd's own
-//! envelope (`{"format":"swapd/1"}`, which Task 11's `export` writes). Both
-//! carry the same per-account shape, so one reader serves them.
+//! envelope (`{"format":"swapd/1"}`, which `cmd::export` writes). Both carry
+//! the same per-account shape, so one reader serves them; they differ only in
+//! where the list hangs — cswap's is flat and always Claude's, swapd's is
+//! grouped per provider (see `accounts_for`).
 //!
 //! Two passes, as cswap has: everything is validated before anything is
 //! written, so a malformed account late in the file cannot leave the ones
@@ -66,11 +68,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
         .ok_or_else(|| invalid("export file must be a JSON object"))?;
     check_format(envelope)?;
 
-    let accounts = envelope
-        .get("accounts")
-        .and_then(Value::as_array)
-        .filter(|list| !list.is_empty())
-        .ok_or_else(|| invalid("export file has no accounts to import"))?;
+    let (accounts, active_slot) = accounts_for(envelope, id)?;
 
     // Pass 1: validate. Nothing below this point may fail on the file's
     // contents — only on the environment (disk, keychain).
@@ -215,7 +213,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
     Ok(ImportResult {
         imported,
         skipped,
-        active_slot: active_slot(envelope),
+        active_slot,
     })
 }
 
@@ -251,6 +249,43 @@ fn check_format(envelope: &Map<String, Value>) -> Result<()> {
             "not an export: expected a 'format' or 'version' member",
         )),
     }
+}
+
+/// The accounts this provider's import reads, and the slot the envelope calls
+/// active.
+///
+/// cswap's envelope carries one flat `accounts` list, which is always Claude's;
+/// swapd's own groups them per provider (spec §9), because one export covers
+/// every engine the machine has. A `providers` array with no section for this
+/// provider is named as such rather than reported as "no accounts": the file is
+/// fine, it is simply about somebody else.
+fn accounts_for<'a>(
+    envelope: &'a Map<String, Value>,
+    provider: &str,
+) -> Result<(&'a Vec<Value>, Option<u32>)> {
+    if let Some(flat) = envelope.get("accounts").and_then(Value::as_array) {
+        return non_empty(flat).map(|accounts| (accounts, active_slot(envelope)));
+    }
+    let section = envelope
+        .get("providers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("export file has no accounts to import"))?
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|p| p.get("provider").and_then(Value::as_str) == Some(provider))
+        .ok_or_else(|| invalid(format!("export file carries no {provider} accounts")))?;
+    let accounts = section
+        .get("accounts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid(format!("the {provider} section has no accounts")))?;
+    Ok((non_empty(accounts)?, active_slot(section)))
+}
+
+fn non_empty(accounts: &Vec<Value>) -> Result<&Vec<Value>> {
+    if accounts.is_empty() {
+        return Err(invalid("export file has no accounts to import"));
+    }
+    Ok(accounts)
 }
 
 /// The envelope's active slot, under either spelling.
@@ -384,6 +419,35 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
         let err = check_format(json!({"nothing": true}).as_object().unwrap()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn a_providers_envelope_is_read_per_provider() {
+        // swapd's own export groups accounts per provider; the flat cswap list
+        // is always Claude's.
+        let mine = json!({
+            "format": "swapd/1",
+            "providers": [{"provider": "claude", "activeSlot": 2, "accounts": [{"slot": 2}]}],
+        });
+        let (accounts, active) = accounts_for(mine.as_object().unwrap(), "claude").unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(active, Some(2));
+
+        let theirs = json!({
+            "format": "swapd/1",
+            "providers": [{"provider": "codex", "accounts": [{"slot": 1}]}],
+        });
+        let err = accounts_for(theirs.as_object().unwrap(), "claude").unwrap_err();
+        assert!(
+            err.message.contains("no claude accounts"),
+            "{}",
+            err.message
+        );
+
+        let cswap = json!({"version": 1, "activeAccountNumber": 3, "accounts": [{"slot": 3}]});
+        let (accounts, active) = accounts_for(cswap.as_object().unwrap(), "claude").unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(active, Some(3));
     }
 
     #[test]

@@ -779,6 +779,12 @@ mod tests {
         ) -> std::result::Result<crate::driver::RunProfile, DriverError> {
             Err(DriverError::Unsupported("run"))
         }
+        fn live_config_text(
+            &self,
+            _env: &crate::driver::Env,
+        ) -> std::result::Result<Option<String>, DriverError> {
+            Ok(None)
+        }
         fn can_activate(&self, login: &Login) -> std::result::Result<(), DriverError> {
             if self.is_api_key(login) {
                 return Err(DriverError::Invalid("api key login".to_string()));

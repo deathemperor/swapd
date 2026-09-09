@@ -260,6 +260,14 @@ pub trait Driver: Send + Sync {
     /// produced no exit status at all — a timeout, a signal — is `Err`.
     fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
+    /// The CLI's own config file for the live login, as text — `None` when the
+    /// CLI keeps no such file or it is not there.
+    ///
+    /// `export --full` is a same-machine backup, and the config is the half of
+    /// the login state that does not live in the credential (Claude Code's
+    /// `~/.claude.json`). Where it is is the engine's business, so the question
+    /// is asked here rather than by reaching into a driver's paths.
+    fn live_config_text(&self, env: &Env) -> Result<Option<String>, DriverError>;
     fn capabilities(&self) -> Caps; // ignite, add_token, prefer, refresh…
     /// Whether this login can be made the live one at all, asked *before* any
     /// side effect.

@@ -126,6 +126,18 @@ impl Driver for ClaudeDriver {
         run::run_profile(self, env, slot, login)
     }
 
+    /// `~/.claude.json` (or the legacy `<config dir>/.config.json`), through
+    /// the same resolver every other read uses — so `$CLAUDE_CONFIG_DIR` is
+    /// honoured here exactly as Claude Code honours it.
+    fn live_config_text(&self, env: &Env) -> Result<Option<String>, DriverError> {
+        let path = paths::config_json(env)?;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DriverError::Io(e)),
+        }
+    }
+
     /// Claude Code supports every verb swapd has.
     /// Claude Code's live login is its OAuth item; a managed `sk-ant-api…` key
     /// is a different axis (`ANTHROPIC_API_KEY` / the approved-key list) that

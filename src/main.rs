@@ -88,6 +88,49 @@ enum Command {
         #[arg(long)]
         strategy: Option<String>,
     },
+    /// Set or clear a slot's short name.
+    Alias {
+        ident: String,
+        name: Option<String>,
+        /// Clear the alias instead of setting one.
+        #[arg(long)]
+        unset: bool,
+    },
+    /// Set or clear a slot's icon.
+    Icon {
+        ident: String,
+        icon: Option<String>,
+        /// Clear the icon instead of setting one.
+        #[arg(long)]
+        unset: bool,
+    },
+    /// Pin (`on`) or unpin (`off`) an account the rotation lands on first.
+    Prefer { ident: String, state: String },
+    /// Take an account out of the rotation, keeping its login.
+    Hold { ident: String },
+    /// Put a held account back into the rotation.
+    Unhold { ident: String },
+    /// Set the rotation order: every slot, exactly once.
+    Reorder { idents: Vec<String> },
+    /// Forget an account: its stored login, its run profile and its slot.
+    Remove {
+        ident: String,
+        /// Confirm the deletion. Without it nothing is touched.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Write an export envelope to a file (`-` for stdout).
+    Export {
+        path: String,
+        /// Export this slot alone.
+        #[arg(long)]
+        slot: Option<u32>,
+        /// Same-machine backup: also carry the CLI's config snapshot.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Which push channels are configured, masked.
+    Notify,
     /// Read or change the `settings.json` knobs.
     Config {
         #[command(subcommand)]
@@ -241,6 +284,76 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             let out = cmd::rotate::run(&ctx, driver.as_ref(), strategy)?;
             emit(&out, cli.json, || cmd::switch::print_human(&out))
+        }
+        Command::Alias { ident, name, unset } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::alias::run(&ctx, driver.as_ref(), ident, name.as_deref(), *unset)?,
+                cli.json,
+            )
+        }
+        Command::Icon { ident, icon, unset } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::icon::run(&ctx, driver.as_ref(), ident, icon.as_deref(), *unset)?,
+                cli.json,
+            )
+        }
+        Command::Prefer { ident, state } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::prefer::run(&ctx, driver.as_ref(), ident, state)?,
+                cli.json,
+            )
+        }
+        Command::Hold { ident } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::hold::run(&ctx, driver.as_ref(), ident, true)?,
+                cli.json,
+            )
+        }
+        Command::Unhold { ident } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::hold::run(&ctx, driver.as_ref(), ident, false)?,
+                cli.json,
+            )
+        }
+        Command::Reorder { idents } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(&cmd::reorder::run(&ctx, driver.as_ref(), idents)?, cli.json)
+        }
+        Command::Remove { ident, yes } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::remove::run(&ctx, driver.as_ref(), ident, *yes)?;
+            emit(&out, cli.json, || cmd::remove::print_human(&out))
+        }
+        Command::Export { path, slot, full } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let opts = cmd::export::ExportOpts {
+                slot: *slot,
+                full: *full,
+            };
+            // A `-` export IS the output: the envelope has already gone to
+            // stdout, and a second document after it would break every reader.
+            match cmd::export::run(&ctx, driver.as_ref(), path, &opts)? {
+                Some(out) => emit(&out, cli.json, || cmd::export::print_human(&out)),
+                None => Ok(()),
+            }
+        }
+        Command::Notify => {
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::notify::run(&ctx)?;
+            emit(&out, cli.json, || cmd::notify::print_human(&out))
         }
         Command::Config { action } => {
             let ctx = ctx::Ctx::from_env()?;

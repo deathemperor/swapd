@@ -18,8 +18,9 @@ use std::process::{Command, ExitStatus};
 use crate::core::slots::{self, ProviderSlots};
 use crate::core::switch::{match_slot, resolve};
 use crate::ctx::Ctx;
-use crate::driver::Driver;
+use crate::driver::{Driver, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
+use crate::secrets::slot_key;
 
 /// Answers the child's exit code; `main` exits with it.
 pub fn run(
@@ -47,6 +48,28 @@ pub fn run(
             format!("{id} is not installed"),
         )
     })?;
+
+    // The KIND of the stored credential is settled before either path, which
+    // is what makes it a guard (cswap calls `_ensure_not_api_key` right above
+    // its fast path, `session.py:526`). A managed `sk-ant-api…` key cannot run
+    // a session in either shape — but an API-key slot carrying the live
+    // account's address matches the identity test below, and taking the fast
+    // path would launch the CLI as that live OAuth credential: a different
+    // account than the one the user named. Read, never refreshed: this asks
+    // what is stored, and spending a refresh token to answer it would be
+    // absurd.
+    if let Some(login) = ctx
+        .secrets
+        .get(&slot_key(id, slot))?
+        .map(|bytes| Login { bytes })
+    {
+        if driver.is_api_key(&login) {
+            return Err(SwapdError::new(
+                ErrorCode::Unsupported,
+                format!("slot {slot} holds a managed API key; api-key logins cannot run"),
+            ));
+        }
+    }
 
     // The fast path is decided BEFORE the login is read, let alone refreshed:
     // refreshing the stored copy of the account that is currently live would
@@ -106,7 +129,16 @@ pub fn run(
     // is branching on, so the loss is said out loud on stderr instead.
     if let Some(read_back) = &profile.read_back {
         match read_back().map_err(SwapdError::from) {
-            Err(e) => stranded(slot, &profile.dir, &e.message),
+            // Distinct from the persist failure below: here the read itself
+            // failed, so whether the CLI rotated anything is unknown. Say only
+            // that much.
+            Err(e) => eprintln!(
+                "warning: swapd could not read slot {slot}'s login back out of the profile \
+                 at {} ({}); if the CLI rotated it, that generation is still there and the \
+                 next run reads it again",
+                profile.dir.display(),
+                e.message
+            ),
             Ok(None) => {}
             Ok(Some(rotated)) => match super::persist_login(ctx, id, slot, &rotated) {
                 Err(e) => stranded(slot, &profile.dir, &e.message),

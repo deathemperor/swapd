@@ -717,3 +717,63 @@ fn a_rotation_survives_a_failed_persist_and_lands_on_the_next_run() {
     // And only now, with the store holding it, does the marker move.
     assert_eq!(fx.marker(), fingerprint_of("rt-1b"));
 }
+
+#[test]
+fn run_takes_the_profile_route_when_a_different_account_is_live() {
+    let fx = Fixture::new();
+    // Somebody else is logged in. The fast path's question is "would a plain
+    // CLI run already be this account", and here the answer is no — running
+    // slot 1 ambiently would run the OTHER account's credential under slot 1's
+    // name, which is the inversion this test exists to catch.
+    fx.write_live_login("two@example.com", "org-2");
+    fx.write_stub(Stub::new());
+
+    let out = fx
+        .cmd()
+        .args(["run", "1", "--", "-p", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    // The profile route, with slot 1's own login seeded into it.
+    assert_eq!(fx.witness_line("config"), fx.profile().to_str().unwrap());
+    assert!(fx.witness_line("seeded").contains("rt-1"));
+    // And the live login is exactly where it was: a run wearing one account
+    // never touches which account the next plain `claude` will be.
+    assert!(fx.live_credential().contains("rt-live"));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !said.contains("already the live login"),
+        "stderr was: {said}"
+    );
+}
+
+#[test]
+fn run_refuses_an_api_key_slot_that_shares_the_live_login_s_address() {
+    let fx = Fixture::new();
+    // A managed key registered under an address of the user's choosing...
+    fx.cmd()
+        .args([
+            "add-token",
+            "-",
+            "--slot",
+            "2",
+            "--email",
+            "keyed@example.com",
+        ])
+        .write_stdin("sk-ant-api03-managed")
+        .assert()
+        .success();
+    // ...which happens to be the address the CLI is currently logged in as, on
+    // a personal account that carries no org — so the identity match answers
+    // "slot 2 is live". Without the kind guard the fast path would fire and run
+    // the CLI as that OAuth login, which is not the credential slot 2 names.
+    fx.write_live_login("keyed@example.com", "");
+    fx.write_stub(Stub::new());
+
+    let err = fx.run_err(&["run", "2", "--json", "--"]);
+    assert_eq!(err["error"]["code"], "unsupported");
+    // Nothing was launched, on either path.
+    assert!(!fx.witness_path().exists());
+    assert!(!fx.profile().exists());
+}

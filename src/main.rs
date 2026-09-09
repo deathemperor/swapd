@@ -1,3 +1,4 @@
+mod contract;
 mod core;
 mod errors;
 mod output;

@@ -768,6 +768,223 @@ fn a_replaced_credential_releases_the_quarantine() {
     assert!(board.state().quarantine.is_empty());
 }
 
+/// `add --slot n` can move an account with its secret (#3): the quarantine
+/// that condemned its credential generation must follow it to the new slot
+/// number instead of being dropped, or the dead lineage re-enters rotation
+/// on slot 5 with no quarantine at all (#14).
+#[test]
+fn a_quarantine_follows_the_credential_to_its_new_slot() {
+    let board = Board::new();
+    // Slot 2's account moved to slot 5 with its secret: the row and the
+    // secret both left slot 2 behind, exactly as `slots::claim` leaves a
+    // vacated slot (`src/core/slots.rs`'s `claim` doc).
+    board.secrets().delete(&slot_key("claude", 2)).unwrap();
+    slots::update(&board.home().slots_file(), |file| {
+        file.providers.get_mut("claude").unwrap().slots.remove(&2);
+        Ok((true, ()))
+    })
+    .unwrap();
+    board.seed(5, "two@example.com", "rt-2", T0 + 86_400.0);
+
+    let entry = Quarantine {
+        reason: "invalid_grant".to_string(),
+        since: format_ts(T0).unwrap(),
+        fingerprint: Some(
+            Login {
+                bytes: login("two@example.com", "rt-2", T0 + 86_400.0),
+            }
+            .fingerprint(),
+        ),
+    };
+    board.set_state(&AutoState {
+        schema_version: 1,
+        quarantine: BTreeMap::from([("2".to_string(), entry.clone())]),
+        ..AutoState::default()
+    });
+    // Slot 5 would win outright if it were a live candidate — the only way
+    // the tick can end in `NoAction` is if the quarantine kept it out.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(95.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+
+    // Wanted to switch (one@ is over threshold) but slot 5 — the only other
+    // slot, and the only viable candidate on paper — is excluded.
+    assert_eq!(board.tick(), TickOutcome::Blocked);
+
+    assert_eq!(
+        board.state().quarantine,
+        BTreeMap::from([("5".to_string(), entry)])
+    );
+    assert_eq!(
+        board.count("account-unquarantined"),
+        0,
+        "the record moved with its credential — nothing was cured"
+    );
+    assert!(
+        !board
+            .driver
+            .take_usage_calls()
+            .contains(&"two@example.com".to_string()),
+        "a quarantined slot is excluded from the tick's candidates, so it is never fetched"
+    );
+    assert_eq!(board.live_email(), "one@example.com");
+}
+
+/// Regression guard: a credential that is genuinely gone (replaced by a
+/// different one, and not merely moved) is still released the way it always
+/// was, fingerprint-following notwithstanding.
+#[test]
+fn a_replaced_credential_is_still_released() {
+    let board = Board::new();
+    board.set_state(&AutoState {
+        schema_version: 1,
+        quarantine: BTreeMap::from([(
+            "2".to_string(),
+            Quarantine {
+                reason: "invalid_grant".to_string(),
+                since: format_ts(T0).unwrap(),
+                fingerprint: Some("sha256:stale".to_string()),
+            },
+        )]),
+        ..AutoState::default()
+    });
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    assert_eq!(board.count("account-unquarantined"), 1);
+    let released = board.last("account-unquarantined").unwrap();
+    assert_eq!(released["number"], 2);
+    assert_eq!(released["reason"], "credentials-replaced");
+    assert!(board.state().quarantine.is_empty());
+}
+
+/// An entry with no recorded fingerprint has nothing to follow: it can only
+/// ever be released, never re-keyed, however the mismatch came about.
+#[test]
+fn an_entry_without_a_fingerprint_is_released_not_moved() {
+    let board = Board::new();
+    // Slot 2's row is gone, but its secret happens to still be there (an
+    // orphan, as `slots::claim`'s doc says a crash can leave one) — any
+    // stored value at all mismatches a `None` entry.
+    slots::update(&board.home().slots_file(), |file| {
+        file.providers.get_mut("claude").unwrap().slots.remove(&2);
+        Ok((true, ()))
+    })
+    .unwrap();
+    // A slot with a row but no stored secret must not look like a match
+    // either: `stored_fingerprint(3)` is `None` too, and an implementation
+    // that dropped the `is_some()` guard would re-key onto it since
+    // `None == None`.
+    slots::update(&board.home().slots_file(), |file| {
+        file.providers.get_mut("claude").unwrap().slots.insert(
+            3,
+            Slot {
+                email: "three@example.com".to_string(),
+                organization_uuid: String::new(),
+                organization_name: String::new(),
+                plan: None,
+                alias: None,
+                icon: None,
+                disabled: false,
+                preferred: false,
+                added: None,
+                fingerprint: None,
+            },
+        );
+        Ok((true, ()))
+    })
+    .unwrap();
+    board.set_state(&AutoState {
+        schema_version: 1,
+        quarantine: BTreeMap::from([(
+            "2".to_string(),
+            Quarantine {
+                reason: "invalid_grant".to_string(),
+                since: format_ts(T0).unwrap(),
+                fingerprint: None,
+            },
+        )]),
+        ..AutoState::default()
+    });
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    let released = board.last("account-unquarantined").unwrap();
+    assert_eq!(released["number"], 2);
+    assert_eq!(released["reason"], "credentials-replaced");
+    assert!(
+        board.state().quarantine.is_empty(),
+        "released, not re-keyed onto slot 3"
+    );
+}
+
+/// A slot's own quarantine (earned on its OWN credential) is never displaced
+/// by an incoming re-key: it is released on its own mismatch first, and the
+/// moving entry then takes the now-empty key.
+#[test]
+fn a_quarantine_is_not_moved_onto_a_slot_that_earned_its_own() {
+    let board = Board::new();
+    let x_fingerprint = Login {
+        bytes: login("two@example.com", "rt-2", T0 + 86_400.0),
+    }
+    .fingerprint();
+
+    // Slot 2 is gone; its credential (X) now lives at slot 5, which used to
+    // hold a different, already-dead credential (Z).
+    board.secrets().delete(&slot_key("claude", 2)).unwrap();
+    slots::update(&board.home().slots_file(), |file| {
+        file.providers.get_mut("claude").unwrap().slots.remove(&2);
+        Ok((true, ()))
+    })
+    .unwrap();
+    board.seed(5, "two@example.com", "rt-2", T0 + 86_400.0);
+
+    let x_entry = Quarantine {
+        reason: "invalid_grant".to_string(),
+        since: format_ts(T0).unwrap(),
+        fingerprint: Some(x_fingerprint),
+    };
+    let z_entry = Quarantine {
+        reason: "invalid_grant".to_string(),
+        since: format_ts(T0 - 100.0).unwrap(),
+        fingerprint: Some("sha256:zzz".to_string()),
+    };
+    board.set_state(&AutoState {
+        schema_version: 1,
+        quarantine: BTreeMap::from([
+            ("2".to_string(), x_entry.clone()),
+            ("5".to_string(), z_entry),
+        ]),
+        ..AutoState::default()
+    });
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    assert_eq!(
+        board.state().quarantine,
+        BTreeMap::from([("5".to_string(), x_entry)])
+    );
+    assert_eq!(board.count("account-unquarantined"), 1);
+    let released = board.last("account-unquarantined").unwrap();
+    assert_eq!(released["number"], 5);
+    assert_eq!(released["reason"], "credentials-replaced");
+}
+
 #[test]
 fn all_exhausted_emits_earliest_reset() {
     let board = Board::new();

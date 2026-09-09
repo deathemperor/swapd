@@ -1,6 +1,8 @@
 mod contract;
 mod core;
+mod driver;
 mod errors;
+mod http;
 mod output;
 mod paths;
 mod secrets;

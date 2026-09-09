@@ -82,15 +82,6 @@ pub fn fetch(ep: &Endpoints, access_token: &str) -> Result<Value, DriverError> {
 
 /// `build_usage_result` against the current clock.
 ///
-/// Prefer `windows_at` wherever the fetch time is already known — pace is
-/// measured against the snapshot's own fetch time, and two `now()` reads drift.
-// `usage()` knows its fetch time and calls `windows_at`; nothing re-normalizes a
-// stored response yet.
-#[allow(dead_code)]
-pub fn windows(raw: &Value) -> Vec<Window> {
-    windows_at(raw, now_s())
-}
-
 /// Normalize a raw usage response into the windows that describe it
 /// (`oauth.py:431-503`), with weekly pace computed against `fetched_at`.
 ///
@@ -353,13 +344,6 @@ pub fn format_ts(ts: f64) -> Option<String> {
         .format(&Rfc3339)
         .ok()
         .map(|s| s.replace("+00:00", "Z"))
-}
-
-fn now_s() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

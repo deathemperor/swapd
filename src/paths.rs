@@ -7,9 +7,6 @@ pub struct Home {
     pub root: PathBuf,
 }
 
-// Most path helpers aren't consumed yet; later tasks (slots, credentials, history) add the
-// code that reads/writes each file.
-#[allow(dead_code)]
 impl Home {
     /// Resolve the data dir: `$SWAPD_HOME` if set; else the platform default
     /// (macOS `~/.swapd`, Linux `${XDG_DATA_HOME:-~/.local/share}/swapd`,
@@ -103,10 +100,6 @@ impl Home {
 
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join("profiles")
-    }
-
-    pub fn log_file(&self) -> PathBuf {
-        self.root.join("swapd.log")
     }
 
     /// Create the data dir (and parents) if missing, `0700` on unix.

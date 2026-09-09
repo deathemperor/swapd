@@ -28,7 +28,7 @@ use serde_json::{Map, Value};
 
 use crate::core::slots::{self, Slot};
 use crate::ctx::Ctx;
-use crate::driver::{Driver, Login};
+use crate::driver::{Driver, Identity, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
 
 /// What an import did.
@@ -60,6 +60,20 @@ struct Entry {
     preferred: bool,
     added: Option<String>,
     login: Login,
+}
+
+impl Entry {
+    /// The account this row names, so the occupied-slot check asks the same
+    /// question every other identity match in swapd asks.
+    fn identity(&self) -> Identity {
+        Identity {
+            email: self.email.clone(),
+            organization_uuid: self.organization_uuid.clone(),
+            organization_name: self.organization_name.clone(),
+            plan: self.plan.clone(),
+            uuid: None,
+        }
+    }
 }
 
 pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<ImportResult> {
@@ -105,8 +119,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
 
         for entry in entries {
             if let Some(occupant) = existing.slots.get(&entry.slot) {
-                let same = occupant.email.to_lowercase() == entry.email.to_lowercase()
-                    && occupant.organization_uuid == entry.organization_uuid;
+                let same = slots::same_account(&entry.identity(), occupant);
                 if same {
                     // Nothing to decide: the slot already holds this account.
                     // `--force` still rewrites it, which is how a fresher
@@ -482,6 +495,16 @@ mod tests {
         assert!(err.message.contains("encrypted"), "{}", err.message);
     }
 
+    /// An `Env` with no variables: these tests only need a driver that can
+    /// parse a credential, and reading the process environment would let a
+    /// developer's `SWAPD_LIVE_STORE` change what they exercise.
+    fn test_env() -> crate::driver::Env {
+        crate::driver::Env {
+            home: std::path::PathBuf::new(),
+            vars: Default::default(),
+        }
+    }
+
     #[test]
     fn the_config_oauth_account_travels_into_the_login() {
         let account = json!({
@@ -490,7 +513,7 @@ mod tests {
             "credentials": {"claudeAiOauth": {"refreshToken": "rt-1"}},
             "config": {"oauthAccount": {"emailAddress": "one@example.com"}},
         });
-        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform();
+        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform(&test_env());
         let entry = validate(&driver, &account).unwrap();
         let value: Value = serde_json::from_str(&entry.login.bytes).unwrap();
         assert_eq!(value["oauthAccount"]["emailAddress"], "one@example.com");
@@ -506,7 +529,7 @@ mod tests {
         });
         // Not `unwrap_err`: `Entry` deliberately has no `Debug`, so a
         // credential can never reach a panic message.
-        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform();
+        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform(&test_env());
         match validate(&driver, &account) {
             Err(e) => assert_eq!(e.code, ErrorCode::InvalidInput),
             Ok(_) => panic!("a non-key string credential must be refused"),

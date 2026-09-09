@@ -107,8 +107,8 @@ impl ClaudeDriver {
     ///
     /// The one place either variable is read: a constructed driver holds
     /// values, never an environment.
-    pub fn default_for_platform() -> Self {
-        Self::new(live_store_from_env(), Endpoints::from_env())
+    pub fn default_for_platform(env: &Env) -> Self {
+        Self::new(live_store_from_env(env), Endpoints::from_env())
     }
 
     /// Claude Code's live login for this environment, as an envelope (see the
@@ -146,8 +146,8 @@ impl ClaudeDriver {
     /// `primaryApiKey`, with the OAuth item cleared — cswap
     /// `_write_managed_credentials`); writing one into the OAuth item would
     /// replace the live login with something Claude Code will not read there.
-    /// Task 10 owns that axis; until then a non-OAuth blob is rejected before
-    /// any lock is taken.
+    /// A non-OAuth blob is rejected before any lock is taken; making a
+    /// managed key live is `add-token`'s axis, not this one.
     pub fn write_live_with_timeout(
         &self,
         env: &Env,
@@ -285,16 +285,18 @@ impl ClaudeDriver {
 }
 
 /// `SWAPD_LIVE_STORE` = `file` | `keychain` overrides the platform default;
-/// unset (or anything else) is the platform's own.
+/// unset (or anything else) is the platform's own. Read from the `Env` the
+/// driver was built with, never from the process: what a verb does must be
+/// decidable from the context it was handed.
 ///
 /// The suite needs `file` for one reason: the assert_cmd tests drive the real
 /// binary, and on macOS the platform default would run `security` against the
 /// developer's own login keychain — reading a real credential the tests must
 /// never touch. `keychain` off macOS has no backend and falls back to the file
 /// store rather than pretending.
-fn live_store_from_env() -> LiveStore {
-    let mode = std::env::var("SWAPD_LIVE_STORE").ok();
-    if mode.as_deref() == Some("file") {
+fn live_store_from_env(env: &Env) -> LiveStore {
+    let mode = env.vars.get("SWAPD_LIVE_STORE");
+    if mode.map(String::as_str) == Some("file") {
         return LiveStore::File;
     }
     #[cfg(target_os = "macos")]
@@ -612,15 +614,6 @@ pub fn prepare_for_activation(target: &str, live: Option<&str>) -> Result<String
         Some(shared) => Ok(merge_shared_credential_fields(target, &shared)),
         None => Ok(target.to_string()),
     }
-}
-
-/// The identity `~/.claude.json` currently advertises (`switcher.py:3505-3508`).
-// The slots verbs (Task 10) name an account by it; `identity()` reads the
-// login's own envelope instead.
-#[allow(dead_code)]
-pub fn read_config_identity(env: &Env) -> Option<Identity> {
-    let config = read_config(env).ok()??;
-    identity_from_oauth_account(config.get("oauthAccount")?)
 }
 
 /// An `Identity` from an `oauthAccount` object.
@@ -998,7 +991,7 @@ mod tests {
         fake.add(&services[0], "tester", live).unwrap();
 
         for bytes in [
-            "sk-ant-api03-fake-key",           // the managed-key axis (Task 10)
+            "sk-ant-api03-fake-key",           // the managed-key axis
             "",                                // an empty write would log the user out
             r#"{"trustedDeviceToken":"tdt"}"#, // JSON, but not a login
             r#"{"claudeAiOauth":"not-an-object"}"#,
@@ -1176,18 +1169,16 @@ mod tests {
     }
 
     #[test]
-    fn read_config_identity_reads_email_org_and_plan() {
-        let home = temp_home();
-        let env = env_with(&home, []);
-        assert!(read_config_identity(&env).is_none());
-
-        fs::write(
-            home.path().join(".claude.json"),
-            r#"{"oauthAccount":{"emailAddress":"a@example.com","organizationUuid":"org-1","organizationName":"Acme","accountUuid":"acc-1","userRateLimitTier":"default_claude_max_20x"}}"#,
+    fn an_oauth_account_object_reads_as_email_org_and_plan() {
+        // The shape `~/.claude.json` advertises, which is what the envelope
+        // carries and `identity_offline` answers from.
+        let account: Value = serde_json::from_str(
+            r#"{"emailAddress":"a@example.com","organizationUuid":"org-1","organizationName":"Acme","accountUuid":"acc-1","userRateLimitTier":"default_claude_max_20x"}"#,
         )
         .unwrap();
+        assert!(identity_from_oauth_account(&Value::Null).is_none());
         assert_eq!(
-            read_config_identity(&env).unwrap(),
+            identity_from_oauth_account(&account).unwrap(),
             Identity {
                 email: "a@example.com".to_string(),
                 organization_uuid: "org-1".to_string(),

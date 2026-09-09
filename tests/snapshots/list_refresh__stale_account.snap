@@ -1,0 +1,27 @@
+---
+source: tests/list_refresh.rs
+expression: "account(&payload, 1)"
+---
+{
+  "active": false,
+  "alias": "one",
+  "disabled": false,
+  "email": "one@example.com",
+  "lastGood": {
+    "ageSeconds": "[age]",
+    "fetchedAt": "[fetched-at]",
+    "windows": [
+      {
+        "kind": "5h",
+        "pct": 42.0,
+        "resetsAt": "2026-09-09T05:59:59Z"
+      }
+    ]
+  },
+  "organizationName": "Org One",
+  "organizationUuid": "org-1",
+  "preferred": false,
+  "slot": 1,
+  "usageStatus": "stale",
+  "windows": []
+}

@@ -403,6 +403,57 @@ fn add_token_refuses_a_token_on_the_command_line() {
     );
 }
 
+/// Spec §10's lock-contention case, end to end: one process holds the engine
+/// lock (as a switch in flight does), a second `swapd switch` runs, and the
+/// refusal is the `locked` envelope rather than a hang or a half-swap.
+#[test]
+fn a_switch_is_refused_while_another_process_holds_the_engine_lock() {
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (1, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+    ]);
+    fx.write_stored(
+        1,
+        &fx.login("one@example.com", "org-1", "rt-1", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(
+        2,
+        &fx.login("two@example.com", "org-2", "rt-2", NOT_EXPIRED_MS),
+    );
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-1",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    // Held the way `core::store::FileLock` holds it: an exclusive advisory lock
+    // on `<home>/engine.lock`, from a different process's point of view.
+    let lock_path = fx.home.path().join("engine.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let mut lock = fd_lock::RwLock::new(file);
+    let _held = lock.try_write().expect("the test must own the lock");
+
+    let started = std::time::Instant::now();
+    let err = fx.run_err(&["switch", "2", "--json"]);
+    assert_eq!(err["error"]["code"], "locked");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the wait is bounded by the lock timeout, not by the holder"
+    );
+
+    // And nothing moved: the live login is still slot 1's.
+    let live: Value = read_json(&fx.live_credentials());
+    assert_eq!(live["claudeAiOauth"]["refreshToken"], "rt-1");
+}
+
 #[test]
 fn switch_writes_target_and_backs_up_live_into_its_slot() {
     let fx = Fixture::new();

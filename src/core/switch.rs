@@ -17,7 +17,7 @@
 //! Nothing between (3)'s first and last step touches the network, so the lock
 //! is held for local I/O only.
 
-use crate::contract::{AccountView, ProviderView, UsageStatus};
+use crate::contract::{AccountView, ProviderView};
 use crate::core::collect::{healthy_slots, record_slot_fingerprint};
 use crate::core::history::{self, SlotRef, SwitchRecord};
 use crate::core::poll_policy::{binding_pct, parse_reset_ts};
@@ -374,9 +374,9 @@ fn refresh_if_stale(
 /// Put the outgoing live login somewhere it survives the swap, and say where
 /// it came from.
 ///
-/// Its own slot when one owns it — identity first, fingerprint second (Task 9's
-/// rule: the CLI rotates the lineage itself, so a fingerprint alone loses the
-/// slot the moment it does). Otherwise the stash, which is the *license* to
+/// Its own slot when one owns it — identity first, fingerprint second: the CLI
+/// rotates the lineage itself, so a fingerprint alone loses the slot the moment
+/// it does. Otherwise the stash, which is the *license* to
 /// overwrite the live store: a stash that fails aborts the switch rather than
 /// destroying a credential that exists nowhere else.
 fn preserve_outgoing(
@@ -463,16 +463,12 @@ fn stash_key(provider: &str, now: f64, login: &Login) -> String {
 /// second for a login that carries no identity of its own.
 pub fn match_slot(provider: &dyn Driver, slots: &ProviderSlots, login: &Login) -> Option<u32> {
     if let Some(identity) = provider.identity_offline(login) {
-        let email = identity.email.to_lowercase();
-        if !email.is_empty() {
-            let found = slots.slots.iter().find(|(_, s)| {
-                s.email.to_lowercase() == email
-                    && (identity.organization_uuid.is_empty()
-                        || s.organization_uuid == identity.organization_uuid)
-            });
-            if let Some((slot, _)) = found {
-                return Some(*slot);
-            }
+        let found = slots
+            .slots
+            .iter()
+            .find(|(_, s)| slots::same_account(&identity, s));
+        if let Some((slot, _)) = found {
+            return Some(*slot);
         }
     }
     let fingerprint = login.fingerprint();
@@ -618,14 +614,7 @@ struct RankKey {
 /// Whether the rotation may land here at all — the collector's own rule
 /// (`collect::rotatable`), applied to the view it produced.
 fn rotatable(account: &AccountView) -> bool {
-    !account.disabled
-        && !matches!(
-            account.usage_status,
-            UsageStatus::NoCredentials
-                | UsageStatus::ApiKey
-                | UsageStatus::ReloginRequired
-                | UsageStatus::Unsupported
-        )
+    crate::core::collect::rotatable_status(Some(account.usage_status), account.disabled)
 }
 
 /// The account's remaining percent on its binding window, `None` when nothing

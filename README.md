@@ -79,14 +79,18 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
 
 ```
 ~/.swapd/                      (Linux: $XDG_DATA_HOME/swapd, Windows: %APPDATA%\swapd)
-  slots.json                   provider -> slots (email, org, alias, icon, disabled, order)
+  slots.json                   provider -> slots (email, org, alias, icon, disabled,
+                               order, and each slot's credential fingerprint)
   usage.json                   the usage store
   settings.json                per-provider policy knobs
+  notify.json                  the configured push channels (`notify`)
   history.jsonl                the switch log, append-only
   auto-state.json              cooldowns, quarantine
   credentials/<provider>_<slot>   0600 files (non-macOS; macOS default is the login keychain)
   profiles/<provider>/<slot>/  per-slot run profiles (`ignite`, `run`)
-  swapd.log
+  engine.lock                  held for one switch: the live read, the swap, the record
+  refresh-<provider>-<slot>.lock  held for one slot's token refresh
+  auto.lock                    the `auto` daemon's mutex, one per data dir
 ```
 
 ## Security

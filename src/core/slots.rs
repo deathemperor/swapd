@@ -132,6 +132,25 @@ pub fn claim<T>(
     Ok((n, extra))
 }
 
+/// Whether `identity` is the account `slot` holds.
+///
+/// The ONE spelling of the question, which the collector's active-slot match,
+/// `switch`'s `match_slot`, `add`'s capture, `export` and `import` had five of
+/// between them — and one of those (export's) was missing the empty-org escape,
+/// so a slot recorded before swapd knew the organization never matched its own
+/// live login.
+///
+/// Email is case-insensitive; an identity that names no organization matches on
+/// the address alone (a cswap import, an older release, a login whose envelope
+/// carries no org); an identity that names no account matches nothing at all —
+/// a caller with a fingerprint to fall back on says so itself.
+pub fn same_account(identity: &crate::driver::Identity, slot: &Slot) -> bool {
+    !identity.email.is_empty()
+        && identity.email.to_lowercase() == slot.email.to_lowercase()
+        && (identity.organization_uuid.is_empty()
+            || slot.organization_uuid == identity.organization_uuid)
+}
+
 // (Resolving an `<ident>` to a slot is `core::switch::resolve`, which is the
 // one resolver: it tries alias before email and reports ambiguity.)
 impl ProviderSlots {

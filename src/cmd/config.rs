@@ -135,9 +135,9 @@ fn unknown_key(key: &str) -> SwapdError {
 }
 
 fn providers() -> Vec<String> {
-    driver::registry()
+    driver::provider_ids()
         .iter()
-        .map(|d| d.id().to_string())
+        .map(|id| id.to_string())
         .collect()
 }
 

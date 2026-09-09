@@ -140,20 +140,14 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     // no identity of its own.
     let live_identity = live
         .as_ref()
-        .and_then(|login| provider.identity_offline(login))
-        .map(|i| (i.email.to_lowercase(), i.organization_uuid));
-    let active_slot = order.iter().copied().find(|n| {
-        let Some(meta) = slots.slots.get(n) else {
-            return false;
-        };
-        match &live_identity {
-            Some((email, org)) => {
-                meta.email.to_lowercase() == *email
-                    && (org.is_empty() || meta.organization_uuid == *org)
-            }
-            None => false,
-        }
-    });
+        .and_then(|login| provider.identity_offline(login));
+    let active_slot = order
+        .iter()
+        .copied()
+        .find(|n| match (&live_identity, slots.slots.get(n)) {
+            (Some(identity), Some(meta)) => slots::same_account(identity, meta),
+            _ => false,
+        });
 
     // 2. Every slot's credential, and the sentinels derivable without a fetch.
     let mut states = Vec::new();
@@ -556,11 +550,9 @@ fn write_live_guarded(
     if live_fingerprint == login.fingerprint() {
         return Ok(LiveWrite::Done); // already there (another refresher wrote it)
     }
-    let same_account = provider.identity_offline(&live).is_some_and(|identity| {
-        identity.email.to_lowercase() == st.meta.email.to_lowercase()
-            && (identity.organization_uuid.is_empty()
-                || identity.organization_uuid == st.meta.organization_uuid)
-    });
+    let same_account = provider
+        .identity_offline(&live)
+        .is_some_and(|identity| slots::same_account(&identity, &st.meta));
     if !same_account || expected != Some(live_fingerprint.as_str()) {
         return Ok(moved(
             st,
@@ -796,9 +788,19 @@ fn next_candidate(
 /// how much headroom it has. A disabled slot is out by the user's choice; a
 /// slot with no usable credential is out until someone logs in again.
 fn rotatable(st: &SlotState) -> bool {
-    !st.meta.disabled
+    rotatable_status(st.sentinel, st.meta.disabled)
+}
+
+/// The rule itself, over the two facts it needs, so the collector (which asks
+/// it of a `SlotState` mid-pass) and the ranker (which asks it of the
+/// `AccountView` the pass produced) cannot drift into naming different slots.
+///
+/// `None` is "no sentinel yet": a slot whose status is still being decided is
+/// as rotatable as an `ok` one.
+pub fn rotatable_status(status: Option<UsageStatus>, disabled: bool) -> bool {
+    !disabled
         && !matches!(
-            st.sentinel,
+            status,
             Some(
                 UsageStatus::NoCredentials
                     | UsageStatus::ApiKey

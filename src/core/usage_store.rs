@@ -161,7 +161,7 @@ struct UsageFile {
 ///
 /// cswap's `sentinel` overlay ("api key", "token expired", ...) is not here: it
 /// is derived fresh by the collector on every pass and never persisted, so it
-/// belongs to Task 9's read path, not to the store.
+/// belongs to the collector's read path, not to the store.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Entry {
     pub last_good: Option<Vec<Window>>,

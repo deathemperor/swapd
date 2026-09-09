@@ -3,7 +3,7 @@
 use crate::contract::{ListPayload, ProviderView, UsageStatus, WindowKind};
 use crate::core::collect::{collect, CollectOpts};
 use crate::ctx::Ctx;
-use crate::driver::{self, Driver};
+use crate::driver::{self, Driver, Env};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
 
@@ -21,11 +21,11 @@ pub fn run(ctx: &Ctx, drivers: &[Box<dyn Driver>]) -> Result<ListPayload> {
 /// The registry, filtered to one provider when the caller named one. An
 /// unknown name is a caller error, not an empty list: silently listing nothing
 /// would read as "no accounts".
-pub fn drivers_for(provider_filter: Option<&str>) -> Result<Vec<Box<dyn Driver>>> {
+pub fn drivers_for(provider_filter: Option<&str>, env: &Env) -> Result<Vec<Box<dyn Driver>>> {
     let Some(id) = provider_filter else {
-        return Ok(driver::registry());
+        return Ok(driver::registry(env));
     };
-    let drivers: Vec<Box<dyn Driver>> = driver::registry()
+    let drivers: Vec<Box<dyn Driver>> = driver::registry(env)
         .into_iter()
         .filter(|d| d.id() == id)
         .collect();

@@ -229,11 +229,10 @@ fn live_under_lock(ctx: &Ctx, driver: &dyn Driver) -> std::result::Result<Login,
 /// Whether a login is the account a slot claims to hold — its own identity
 /// when the credential carries one, else the fingerprint the slot recorded.
 fn is_same_account(driver: &dyn Driver, login: &Login, meta: &Slot) -> bool {
-    if let Some(identity) = driver.identity_offline(login) {
-        return identity.email.to_lowercase() == meta.email.to_lowercase()
-            && identity.organization_uuid == meta.organization_uuid;
+    match driver.identity_offline(login) {
+        Some(identity) if !identity.email.is_empty() => slots::same_account(&identity, meta),
+        _ => meta.fingerprint.as_deref() == Some(login.fingerprint().as_str()),
     }
-    meta.fingerprint.as_deref() == Some(login.fingerprint().as_str())
 }
 
 /// One account entry, in spec §9's shape.

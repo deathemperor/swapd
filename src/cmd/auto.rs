@@ -65,7 +65,7 @@ pub fn run(ctx: Ctx, driver: &dyn Driver, json: bool) -> Result<i32> {
     // this content, is the authority.
     mutex.note(&json!({ "pid": std::process::id() }).to_string());
 
-    if std::env::var(SUPERVISED_ENV).as_deref() == Ok("1") {
+    if ctx.env.vars.get(SUPERVISED_ENV).map(String::as_str) == Some("1") {
         exit_on_stdin_eof();
     }
 

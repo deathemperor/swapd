@@ -233,7 +233,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::List => {
             // Resolved before `Ctx::from_env()`, which creates the data dir: a
             // rejected command must not leave one behind.
-            let drivers = cmd::list::drivers_for(cli.provider.as_deref())?;
+            let drivers = cmd::list::drivers_for(cli.provider.as_deref(), &env_snapshot()?)?;
             let ctx = ctx::Ctx::from_env()?;
             emit_list(&cmd::list::run(&ctx, &drivers)?, cli.json)
         }
@@ -420,15 +420,24 @@ fn run(cli: &Cli) -> Result<()> {
 
 /// The driver a single-provider verb runs against. Resolved before
 /// `Ctx::from_env()`, which creates the data dir: a rejected command must not
-/// leave one behind.
+/// leave one behind — which is why the driver is built from an `Env` captured
+/// here rather than from the one `Ctx` will hold. Same process, same variables;
+/// what matters is that the driver holds VALUES and never reads the
+/// environment again.
 fn single_driver(cli: &Cli) -> Result<Box<dyn driver::Driver>> {
     let provider = cli.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
-    driver::by_id(provider).ok_or_else(|| {
+    driver::by_id(provider, &env_snapshot()?).ok_or_else(|| {
         SwapdError::new(
             ErrorCode::InvalidInput,
             format!("unknown provider: {provider}"),
         )
     })
+}
+
+/// The environment a driver is built from: swapd's home (resolved, not
+/// created) plus this process's variables, captured once.
+fn env_snapshot() -> Result<driver::Env> {
+    Ok(driver::Env::current(&Home::resolve()?))
 }
 
 fn emit<T: Serialize>(payload: &T, json: bool, human: impl FnOnce()) -> Result<()> {

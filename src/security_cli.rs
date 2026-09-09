@@ -1,3 +1,14 @@
+//! Talking to `/usr/bin/security`, the macOS keychain CLI.
+//!
+//! The `security` CLI rather than a native keychain API on purpose: an item
+//! created through the API is ACL'd to the creating binary's code signature, so
+//! every unsigned `cargo build` would prompt on each read.
+//!
+//! Only `RealSecurity` is macOS-only; the parsing and classification helpers
+//! below are portable and unit-tested on every platform, which is why they wear
+//! `cfg_attr(not(macos), allow(dead_code))` rather than a `cfg` that would take
+//! their tests with them.
+
 use std::io::Read;
 #[cfg(target_os = "macos")]
 use std::io::Write;
@@ -8,20 +19,15 @@ use std::time::{Duration, Instant};
 
 use crate::errors::{ErrorCode, Result, SwapdError};
 
-// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn keychain_unavailable() -> SwapdError {
     // Never echo `security`'s stderr here: it can contain the account name.
     SwapdError::new(ErrorCode::KeychainUnavailable, "keychain unavailable")
 }
 
-// security_cli.rs — shared by Task 6's Claude driver (it reads Claude Code's own item through the same trait)
-// Not wired into a verb yet.
-#[allow(dead_code)]
 pub trait SecurityCli: Send + Sync {
     /// `security find-generic-password -s S [-a A] -g`; exit 44 (not found) -> `Ok(None)`.
     /// Reads via `-g`, not `-w`: `-w` prints the raw value only when every byte is
@@ -39,6 +45,7 @@ pub trait SecurityCli: Send + Sync {
 
 /// Reads a pipe to completion on a background thread, so it never blocks the
 /// `try_wait` poll loop below on a full pipe buffer.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn read_to_string_in_background(
     pipe: Option<impl Read + Send + 'static>,
 ) -> std::thread::JoinHandle<String> {
@@ -57,8 +64,7 @@ fn read_to_string_in_background(
 /// code, captured stdout and captured stderr — `security find-generic-password -g`
 /// puts the `password:` line on stderr, so both are captured, though neither is ever
 /// put in an error message (it can contain the account, or the encoded secret).
-// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn wait_for(mut child: Child) -> Result<(i32, String, String)> {
     let stdout_reader = read_to_string_in_background(child.stdout.take());
     let stderr_reader = read_to_string_in_background(child.stderr.take());
@@ -85,8 +91,7 @@ fn wait_for(mut child: Child) -> Result<(i32, String, String)> {
 /// Quotes `service`/`account` for `security -i`'s command line: wraps in double quotes,
 /// escaping embedded backslashes. Callers must reject embedded `"`/`\n`/`\r` first
 /// (`validate_component` below) — this only protects against a stray backslash.
-// Not wired into a verb yet; `RealSecurity::add` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn quote(s: &str) -> String {
     let escaped = s.replace('\\', "\\\\");
     format!("\"{escaped}\"")
@@ -95,8 +100,7 @@ fn quote(s: &str) -> String {
 /// Rejects a keychain `service`/`account` component that would break the `security -i`
 /// one-line command syntax. The secret value itself needs no such check: it goes over
 /// `-X <hex>`, which tolerates any byte.
-// Not wired into a verb yet; `RealSecurity` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_component(s: &str) -> Result<()> {
     if s.contains('"') || s.contains('\n') || s.contains('\r') {
         return Err(SwapdError::new(
@@ -113,8 +117,7 @@ fn validate_component(s: &str) -> Result<()> {
 /// backslash, `password: 0x<HEX>  "<preview>"` otherwise (the preview is discarded —
 /// only the hex is decoded), or `password: ` with nothing after it for an empty value.
 /// Never echoes `stderr` on a parse failure: it can contain the account name.
-// Not wired into a verb yet; `find_outcome` (below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_password_line(stderr: &str) -> Result<String> {
     let line = stderr
         .lines()
@@ -139,8 +142,7 @@ fn parse_password_line(stderr: &str) -> Result<String> {
 /// 44 (not found) -> `Ok(None)`; 0 -> the parsed `password:` line; anything else ->
 /// `KeychainUnavailable`. Pure and platform-independent so it's unit-testable without
 /// spawning `security`.
-// Not wired into a verb yet; `RealSecurity::find` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn find_outcome(code: i32, stderr: &str) -> Result<Option<String>> {
     match code {
         44 => Ok(None),
@@ -153,8 +155,7 @@ fn find_outcome(code: i32, stderr: &str) -> Result<Option<String>> {
 /// (already absent) -> `Ok(())`; anything else -> `KeychainUnavailable`. An absent item
 /// is not a failure — treating it as one would (under `StickySecrets`) permanently
 /// degrade the process to the file backend on a plain delete-of-nonexistent.
-// Not wired into a verb yet; `RealSecurity::delete` (macOS only, below) uses this.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn delete_outcome(code: i32) -> Result<()> {
     match code {
         0 | 44 => Ok(()),
@@ -162,14 +163,9 @@ fn delete_outcome(code: i32) -> Result<()> {
     }
 }
 
-// Not wired into a verb yet; Task 6's Claude driver constructs this to read/write the
-// real keychain.
-#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 pub struct RealSecurity;
 
-// Not wired into a verb yet; Task 6's Claude driver constructs `RealSecurity` and calls it.
-#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 impl RealSecurity {
     fn run(cmd: &mut Command, stdin_data: Option<&str>) -> Result<(i32, String, String)> {
@@ -241,25 +237,26 @@ impl SecurityCli for RealSecurity {
     }
 }
 
-// Not wired into a verb yet; unit tests (this file) and Task 6's Claude driver tests
-// exercise `SecuritySecrets` against this instead of the real keychain.
-#[allow(dead_code)]
+/// The keychain stand-in every test uses instead of the developer's own login
+/// keychain (`LiveStore::Keychain(FakeSecurity)` is buildable on every OS).
+#[cfg(test)]
 pub struct FakeSecurity(std::sync::Mutex<std::collections::HashMap<(String, String), String>>);
 
-// Not wired into a verb yet; unit tests (this file, secrets.rs) construct this directly.
-#[allow(dead_code)]
+#[cfg(test)]
 impl FakeSecurity {
     pub fn new() -> Self {
         Self(std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 }
 
+#[cfg(test)]
 impl Default for FakeSecurity {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl SecurityCli for FakeSecurity {
     fn find(&self, service: &str, account: Option<&str>) -> Result<Option<String>> {
         let map = self.0.lock().unwrap();

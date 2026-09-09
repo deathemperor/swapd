@@ -1,6 +1,5 @@
-//! Provider `Driver` trait and its supporting types. Task 6 adds the Claude
-//! driver's paths/locks/live layer; Task 7 implements `Driver` for it and
-//! registers it in `registry()`.
+//! The provider `Driver` trait, its supporting types, and the registry the
+//! verbs resolve a provider through.
 
 pub mod claude;
 
@@ -57,9 +56,6 @@ pub struct Usage {
     pub fetched_at: f64,
 }
 
-// `Unsupported` has no producer yet: it is the answer a capability-gated verb
-// gives, and the verbs are Task 8's.
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
     #[error("provider not installed")]
@@ -336,13 +332,28 @@ pub fn live_is_older(driver: &dyn Driver, live: &Login, stored: &Login) -> bool 
     }
 }
 
-/// All known provider drivers.
-pub fn registry() -> Vec<Box<dyn Driver>> {
-    vec![Box::new(claude::live::ClaudeDriver::default_for_platform())]
+/// All known provider drivers, built for `env`.
+///
+/// The `Env` rather than the process environment: a driver holds values (which
+/// live store to use, which endpoints), and the one it was built with is the
+/// one the verb's context carries, so nothing can answer from a different
+/// environment than the run uses.
+pub fn registry(env: &Env) -> Vec<Box<dyn Driver>> {
+    vec![Box::new(claude::live::ClaudeDriver::default_for_platform(
+        env,
+    ))]
 }
 
-pub fn by_id(id: &str) -> Option<Box<dyn Driver>> {
-    registry().into_iter().find(|d| d.id() == id)
+pub fn by_id(id: &str, env: &Env) -> Option<Box<dyn Driver>> {
+    registry(env).into_iter().find(|d| d.id() == id)
+}
+
+/// Every provider's id. The name of a driver is not a property of any
+/// environment, so a caller that only needs the names (`config`, which
+/// validates `<provider>.<key>`) does not have to invent an `Env` to build a
+/// driver it will not use.
+pub fn provider_ids() -> &'static [&'static str] {
+    &["claude"]
 }
 
 #[cfg(test)]
@@ -379,17 +390,38 @@ mod tests {
     }
 
     #[test]
+    fn provider_ids_name_the_registry() {
+        let home = Home {
+            root: std::path::PathBuf::from("/tmp/swapd-ids-test"),
+        };
+        let ids: Vec<&str> = registry(&Env::current(&home))
+            .iter()
+            .map(|d| d.id())
+            .collect();
+        assert_eq!(ids, provider_ids());
+    }
+
+    #[test]
     fn registry_holds_the_claude_driver() {
-        let drivers = registry();
+        let home = Home {
+            root: std::path::PathBuf::from("/tmp/swapd-registry-test"),
+        };
+        let env = Env::current(&home);
+        let drivers = registry(&env);
         assert_eq!(drivers.len(), 1);
         assert_eq!(drivers[0].id(), "claude");
-        assert!(by_id("claude").is_some());
-        assert!(by_id("codex").is_none());
+        assert!(by_id("claude", &env).is_some());
+        assert!(by_id("codex", &env).is_none());
     }
 
     #[test]
     fn claude_supports_every_verb() {
-        let caps = by_id("claude").unwrap().capabilities();
+        let home = Home {
+            root: std::path::PathBuf::from("/tmp/swapd-caps-test"),
+        };
+        let caps = by_id("claude", &Env::current(&home))
+            .unwrap()
+            .capabilities();
         assert_eq!(
             caps,
             Caps {

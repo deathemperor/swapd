@@ -108,11 +108,10 @@ Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
             {"kind": "5h",  "pct": 0,  "resetsAt": "2026-09-09T05:59:59Z"},
             {"kind": "7d",  "pct": 19, "resetsAt": "2026-09-15T10:59:59Z",
              "pace": {"expectedPct": 20.3, "ahead": true,
-                      "exhaustsAt": null, "lastsToReset": true}},
+                      "lastsToReset": true}},
             {"kind": "scoped", "name": "Fable", "pct": 29,
              "resetsAt": "2026-09-15T10:59:59Z"}
-          ],
-          "lastGood": {"fetchedAt": "…", "ageSeconds": 0, "windows": []}
+          ]
         }
       ]
     }
@@ -125,10 +124,16 @@ Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
   adds `used/limit/currency`. `resetsAt` may be absent (spend, or an
   unknown reset).
 - `usageStatus` ∈ `ok | stale | relogin-required | token-expired |
-  no-credentials | api-key | unsupported`. `stale` means `windows` is
-  the last good fetch, `ageSeconds` says how old.
-- `lastGood` appears only when the live fetch failed and an older good
-  fetch exists.
+  no-credentials | api-key | unsupported`.
+- Top-level `windows`, `fetchedAt` and `ageSeconds` describe an account's
+  CURRENT utilization, and only an `ok` account has one. Every other
+  status emits `windows: []`, omits `fetchedAt`/`ageSeconds`, and carries
+  whatever it last measured under `lastGood {fetchedAt, ageSeconds,
+  windows}` — including `stale`, which is exactly "the last good fetch is
+  too old to serve as current". One shape per status: a reader never has
+  to look in two places for the same number.
+- `lastGood` therefore appears on every non-`ok` status that has ever been
+  measured, and never on `ok`.
 - Countdown/clock strings are NOT in the contract (the app formats).
 
 ### Verbs
@@ -251,9 +256,12 @@ that driver's sub-spec is written.
   what is due, decide (threshold, hysteresis, cooldown, preferred,
   strategy), switch or `no-switch{reason}`. Events (NDJSON, one per
   line): `poll, switch, no-switch, account-quarantined,
-  account-unquarantined, all-exhausted, engine-refused, error`, each
-  with `schemaVersion, event, ts, provider`. Under `SWAPD_SUPERVISED=1`
-  the daemon exits on stdin EOF.
+  account-unquarantined, all-exhausted, engine-refused, error, sleep,
+  config-warning`, each with `schemaVersion, event, ts, provider`.
+  `sleep` names the delay before the next tick; `config-warning` reports
+  a `settings.json` key the daemon could not use and what it fell back
+  to. A reader that does not know an event drops it. Under
+  `SWAPD_SUPERVISED=1` the daemon exits on stdin EOF.
 
 ## 7. Infinitus adapter
 
@@ -299,7 +307,9 @@ that driver's sub-spec is written.
   auto-state.json              cooldowns, quarantine
   credentials/<provider>/<slot>   0600 files (non-macOS)
   profiles/<provider>/<slot>/  per-slot run profiles
-  swapd.log
+  engine.lock                  one switch: the live read, the swap, the record
+  refresh-<provider>-<slot>.lock  one slot's token refresh
+  auto.lock                    the `auto` daemon's mutex
 ```
 
 macOS credentials: keychain generic passwords written and read

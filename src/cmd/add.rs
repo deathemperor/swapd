@@ -86,16 +86,13 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
     // cycle: the slot number a free-slot capture lands in is only true for as
     // long as the lock is held. The live login IS this account, so the same
     // cycle records the slot as active (cswap's `activeAccountNumber` update,
-    // `switcher.py:3552`) — Task 9's keychain-down hold-back reads that field.
+    // `switcher.py:3552`) — the collector's keychain-down hold-back reads that
+    // field.
     let (slot, created) = slots::claim(ctx, id, true, |existing| {
         let owner = existing
             .slots
             .iter()
-            .find(|(_, s)| {
-                s.email.to_lowercase() == identity.email.to_lowercase()
-                    && (identity.organization_uuid.is_empty()
-                        || s.organization_uuid == identity.organization_uuid)
-            })
+            .find(|(_, s)| slots::same_account(&identity, s))
             .map(|(n, s)| (*n, s.clone()));
 
         // The account already has a slot, and that slot may hold a NEWER
@@ -117,7 +114,9 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
                 return Err(SwapdError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "slot {slot} already holds a newer generation of this account's                          login than the live one; run `swapd list`, which heals the live                          login from the slot, instead of capturing over it"
+                        "slot {slot} already holds a newer generation of this \
+                         account's login than the live one; run `swapd list`, which \
+                         heals the live login from the slot, instead of capturing over it"
                     ),
                 ));
             }

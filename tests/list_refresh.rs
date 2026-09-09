@@ -389,6 +389,24 @@ fn windows_in_payload_match_snapshot() {
     });
 }
 
+/// The `stale` shape the contract documents (spec §4): no top-level `windows`,
+/// no `fetchedAt`/`ageSeconds`, and the measurement under `lastGood` with the
+/// age a reader is meant to judge it by.
+#[test]
+fn the_stale_shape_matches_the_snapshot() {
+    let fx = Fixture::new();
+    // A measurement from before the stale-OK bound, and a fetch that fails: the
+    // account has a last-known-good reading and no current one.
+    fx.write_usage_row(UsageRow::new(1, "one@example.com", "org-1", 400.0, 42.0));
+    fx.usage_mock(1, 500, json!({ "error": "boom" }));
+
+    let payload = fx.list();
+    insta::assert_json_snapshot!("stale_account", account(&payload, 1), {
+        ".**.fetchedAt" => "[fetched-at]",
+        ".**.ageSeconds" => "[age]",
+    });
+}
+
 #[test]
 fn active_slot_matches_the_live_login_by_identity() {
     let fx = Fixture::new();

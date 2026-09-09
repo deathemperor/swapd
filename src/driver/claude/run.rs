@@ -124,22 +124,16 @@ pub fn find_claude(
 /// a run would execute — a driver that reports "installed" and then fails with
 /// `NotInstalled` turns a synthesized environment into a mystery.
 ///
-/// `SWAPD_CLAUDE_CLI` comes from the `Env` alone (naming a binary is a
-/// statement about *this* run). `PATH` falls back to the process's, because an
-/// `Env` assembled by hand — a test context, a caller building one field at a
-/// time — has no `PATH` to speak of, and answering "not installed" for a
-/// machine that plainly has the CLI would be a worse lie than looking one level
-/// out. A missing `HOME` only costs the `$HOME`-relative candidates.
+/// Everything comes from the `Env` — `SWAPD_CLAUDE_CLI`, `PATH`, `HOME` — and
+/// nothing from the process: naming a binary is a statement about *this* run,
+/// and an answer that quietly reached past the context could not be reproduced
+/// from it. An `Env` with no `PATH` still finds the CLI in the well-known
+/// install dirs; a missing `HOME` only costs the `$HOME`-relative candidates.
 pub fn resolve_cli(env: &Env) -> Option<PathBuf> {
-    let path_var = env
-        .vars
-        .get("PATH")
-        .cloned()
-        .or_else(|| std::env::var("PATH").ok());
     let home = paths::home(env).unwrap_or_default();
     find_claude(
         env.vars.get(CLI_OVERRIDE_ENV).map(String::as_str),
-        path_var.as_deref(),
+        env.vars.get("PATH").map(String::as_str),
         &home,
     )
 }

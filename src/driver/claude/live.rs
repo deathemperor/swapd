@@ -234,7 +234,7 @@ impl ClaudeDriver {
         }
     }
 
-    pub fn write_credential(&self, env: &Env, value: &str) -> Result<(), DriverError> {
+    fn write_credential(&self, env: &Env, value: &str) -> Result<(), DriverError> {
         match &self.store {
             LiveStore::Keychain(cli) => {
                 // The item Claude Code reads for *this* environment: the first
@@ -346,7 +346,7 @@ fn error_kind(err: &DriverError) -> &'static str {
 /// fallback. Matching it exactly matters on headless/launchd hosts where
 /// `$USER` is unset — a divergent default would key a *different* item than
 /// Claude Code's.
-pub fn keychain_account(env: &Env) -> String {
+fn keychain_account(env: &Env) -> String {
     for name in ["USER", "LOGNAME"] {
         if let Some(user) = env.vars.get(name) {
             if !user.is_empty() {

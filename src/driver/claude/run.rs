@@ -31,7 +31,7 @@ use serde_json::{Map, Value};
 
 use crate::driver::claude::live::{self, ClaudeDriver};
 use crate::driver::claude::paths;
-use crate::driver::{DriverError, Env, Login, RunProfile};
+use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
 
 /// The user customizations that follow an account into its profile
 /// (`session.py:76-83`, cswap's default share set). Files and directories
@@ -516,7 +516,7 @@ pub fn ignite(
     env: &Env,
     slot: u32,
     login: &Login,
-) -> Result<Option<Login>, DriverError> {
+) -> Result<IgniteOutcome, DriverError> {
     let profile = run_profile(driver, env, slot, login)?;
     let path_var = env.vars.get("PATH").map(String::as_str);
     let home = paths::home(env)?;
@@ -565,15 +565,23 @@ pub fn ignite(
             }
         }
     };
-    match status.code() {
-        Some(0) => match &profile.read_back {
-            Some(read_back) => read_back(),
-            None => Ok(None),
-        },
-        Some(code) => Err(DriverError::Http(format!("igniter exited {code}"))),
-        // Killed by a signal: no exit code to report, and it is not a success.
-        None => Err(DriverError::Http("igniter killed by a signal".to_string())),
-    }
+    // Read back on ANY normal exit, not just a clean one. `claude` refreshes its
+    // token before it does the work that may fail, so a failed run routinely
+    // leaves a rotation behind — and reporting only the failure would strand
+    // swapd on the spent refresh token, whose next use answers `invalid_grant`
+    // and reads as a dead account. The exit code goes back with it; what a
+    // non-zero one means is the verb's call, after it has persisted the login.
+    let Some(exit_code) = status.code() else {
+        // Killed by a signal: no exit status at all, so nothing to report a code
+        // for. The rotation (if any) is still in the profile, and the next run
+        // reads it back.
+        return Err(DriverError::Http("igniter killed by a signal".to_string()));
+    };
+    let rotated = match &profile.read_back {
+        Some(read_back) => read_back()?,
+        None => None,
+    };
+    Ok(IgniteOutcome { exit_code, rotated })
 }
 
 #[cfg(test)]
@@ -1032,7 +1040,9 @@ mod tests {
 
         write_fake(0);
         // Nothing rotated, so there is nothing to hand back.
-        assert!(ignite(&driver, &env, 2, &login()).unwrap().is_none());
+        let outcome = ignite(&driver, &env, 2, &login()).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.rotated.is_none());
 
         let profile_dir = env.home.join("profiles/claude/2");
         let seen = fs::read_to_string(&witness).unwrap();
@@ -1051,9 +1061,12 @@ mod tests {
             )
         );
 
+        // A failed run is still an outcome, not an error: only the verb knows
+        // what a non-zero code means, and it must persist any rotation first.
         write_fake(3);
-        let err = expect_err(ignite(&driver, &env, 2, &login()));
-        assert!(matches!(err, DriverError::Http(m) if m == "igniter exited 3"));
+        let outcome = ignite(&driver, &env, 2, &login()).unwrap();
+        assert_eq!(outcome.exit_code, 3);
+        assert!(outcome.rotated.is_none());
     }
 
     #[cfg(unix)]
@@ -1075,9 +1088,9 @@ mod tests {
         let env = env_with(&home, [("USER", "tester"), ("PATH", bin.to_str().unwrap())]);
         let driver = ClaudeDriver::new(LiveStore::File, endpoints());
 
-        let rotated = ignite(&driver, &env, 8, &login())
-            .unwrap()
-            .expect("rotated");
+        let outcome = ignite(&driver, &env, 8, &login()).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        let rotated = outcome.rotated.expect("rotated");
         assert!(rotated.bytes.contains("rt-rotated"));
         // The marker moved with it, so the next launch does not overwrite the
         // new generation with the stored (spent) one.
@@ -1090,7 +1103,10 @@ mod tests {
         // The caller persists what it was handed and igniting again with it
         // rotates nothing — and, crucially, does not re-seed over the profile.
         write_noop_claude(&bin.join("claude"));
-        assert!(ignite(&driver, &env, 8, &rotated).unwrap().is_none());
+        assert!(ignite(&driver, &env, 8, &rotated)
+            .unwrap()
+            .rotated
+            .is_none());
         assert!(fs::read_to_string(dir.join(".credentials.json"))
             .unwrap()
             .contains("rt-rotated"));
@@ -1098,10 +1114,45 @@ mod tests {
         // Handing back the SUPERSEDED login instead is a slot being re-pointed
         // as far as the profile can tell, so it is re-seeded — which is why
         // `ignite`'s answer has to be persisted.
-        assert!(ignite(&driver, &env, 8, &login()).unwrap().is_none());
+        assert!(ignite(&driver, &env, 8, &login())
+            .unwrap()
+            .rotated
+            .is_none());
         assert!(fs::read_to_string(dir.join(".credentials.json"))
             .unwrap()
             .contains("rt-1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignite_reports_a_rotation_even_when_the_child_fails() {
+        let home = temp_home();
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        // The real failure mode: `claude` refreshes its token first and only
+        // then does the work that fails. The rotation is real and the spent
+        // refresh token is what swapd would otherwise keep.
+        write_script(
+            &bin.join("claude"),
+            "#!/bin/sh\nprintf '%s' \
+             '{\"claudeAiOauth\":{\"refreshToken\":\"rt-rotated\"}}' \
+             > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\nexit 2\n",
+        );
+
+        let env = env_with(&home, [("USER", "tester"), ("PATH", bin.to_str().unwrap())]);
+        let driver = ClaudeDriver::new(LiveStore::File, endpoints());
+
+        let outcome = ignite(&driver, &env, 5, &login()).unwrap();
+        assert_eq!(outcome.exit_code, 2);
+        let rotated = outcome.rotated.expect("rotated despite the failure");
+        assert!(rotated.bytes.contains("rt-rotated"));
+        // And the marker moved, so a retry does not seed the spent token back
+        // over the generation the profile now holds.
+        assert_eq!(
+            fs::read_to_string(env.home.join("profiles/claude/5").join(SEED_MARKER)).unwrap(),
+            rotated.fingerprint()
+        );
     }
 
     #[cfg(unix)]

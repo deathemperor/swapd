@@ -20,7 +20,9 @@ pub mod tests;
 use std::path::PathBuf;
 
 use crate::driver::claude::live::ClaudeDriver;
-use crate::driver::{Caps, Driver, DriverError, Env, Identity, Login, RunProfile, Usage};
+use crate::driver::{
+    Caps, Driver, DriverError, Env, Identity, IgniteOutcome, Login, RunProfile, Usage,
+};
 
 impl Driver for ClaudeDriver {
     fn id(&self) -> &'static str {
@@ -104,7 +106,7 @@ impl Driver for ClaudeDriver {
         })
     }
 
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<Option<Login>, DriverError> {
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError> {
         run::ignite(self, env, slot, login)
     }
 

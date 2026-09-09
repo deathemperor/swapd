@@ -141,6 +141,25 @@ impl Env {
 /// `RunProfile::read_back`).
 pub type ReadBack = Box<dyn Fn() -> Result<Option<Login>, DriverError> + Send>;
 
+/// What one `ignite` run produced.
+///
+/// The rotation and the exit code are independent: the CLI refreshes its token
+/// early in a run and can still fail the request afterwards (no network, a
+/// server error, a bad prompt), so a non-zero exit routinely carries a rotation.
+/// Both are reported so the caller can persist the credential *first* and only
+/// then decide what a failed run means — dropping the rotation would leave the
+/// slot holding a refresh token the server has already spent, and the next
+/// refresh of it comes back `invalid_grant`, which reads as a dead account.
+// Produced by the driver already; Task 13's `ignite` verb is what reads it.
+#[allow(dead_code)]
+pub struct IgniteOutcome {
+    /// The child's exit status. Zero is a successful ignite; non-zero is the
+    /// caller's to report, after it has persisted `rotated`.
+    pub exit_code: i32,
+    /// The credential the CLI rotated to while running, if it did.
+    pub rotated: Option<Login>,
+}
+
 /// Per-slot environment for `run`/`ignite`: env overrides plus a working
 /// dir, with a cleanup hook that runs on drop (e.g. removing a temp dir).
 pub struct RunProfile {
@@ -222,10 +241,11 @@ pub trait Driver: Send + Sync {
     fn usage(&self, login: &Login) -> Result<Usage, DriverError>;
     /// Make one minimal request as this login, in the slot's own run profile.
     ///
-    /// Answers `Some(login)` when the CLI rotated the credential while running
-    /// (see `RunProfile::read_back`) — the caller must persist it, or the slot
-    /// keeps a refresh token the CLI has already spent.
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<Option<Login>, DriverError>;
+    /// `Ok` for any *normal* exit, zero or not, carrying both the exit code and
+    /// any rotation the CLI made while running (see `IgniteOutcome`); the caller
+    /// persists the rotation before reporting a non-zero code. Only a run that
+    /// produced no exit status at all — a timeout, a signal — is `Err`.
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
     fn capabilities(&self) -> Caps; // ignite, add_token, prefer, refresh…
 }

@@ -54,6 +54,10 @@ struct Entry {
     organization_uuid: String,
     organization_name: String,
     alias: Option<String>,
+    icon: Option<String>,
+    plan: Option<String>,
+    disabled: bool,
+    preferred: bool,
     added: Option<String>,
     login: Login,
 }
@@ -173,11 +177,11 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 email: entry.email.clone(),
                 organization_uuid: entry.organization_uuid.clone(),
                 organization_name: entry.organization_name.clone(),
-                plan: None,
+                plan: entry.plan.clone(),
                 alias: entry.alias.clone(),
-                icon: None,
-                disabled: false,
-                preferred: false,
+                icon: entry.icon.clone(),
+                disabled: entry.disabled,
+                preferred: entry.preferred,
                 added: entry.added.clone(),
                 fingerprint: Some(entry.login.fingerprint()),
             };
@@ -333,6 +337,17 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
     let alias = Some(text("alias")?)
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty());
+    // The user's own labels and choices, carried whole: an export that
+    // remembers a pinned, held or renamed account and an import that quietly
+    // dropped it would leave the two machines describing different rotations.
+    // Absent (cswap's envelope has none of these) is the row's default.
+    let icon = Some(text("icon")?)
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty());
+    let plan = Some(text("plan")?).filter(|p| !p.is_empty());
+    let flag = |key: &str| account.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let disabled = flag("disabled");
+    let preferred = flag("preferred");
 
     let login = login_of(provider, account, &email)?;
     Ok(Entry {
@@ -341,6 +356,10 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
         organization_uuid,
         organization_name,
         alias,
+        icon,
+        plan,
+        disabled,
+        preferred,
         added,
         login,
     })

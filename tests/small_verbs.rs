@@ -574,6 +574,11 @@ fn export_then_import_roundtrip() {
     );
     assert_eq!(slot_of(&slots, 2)["email"], "two@example.com");
     assert_eq!(slot_of(&slots, 2)["alias"], "death2");
+    assert_eq!(
+        slot_of(&slots, 2)["preferred"],
+        true,
+        "the user's own choices travel, not just the credential"
+    );
     let imported: Value = serde_json::from_str(&target.stored(3)).unwrap();
     assert_eq!(imported["claudeAiOauth"]["refreshToken"], "rt-3");
     assert_eq!(

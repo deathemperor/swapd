@@ -132,10 +132,8 @@ pub fn claim<T>(
     Ok((n, extra))
 }
 
-// `remove` waits for the slots verbs (`rm`); the rest are wired up.
 // (Resolving an `<ident>` to a slot is `core::switch::resolve`, which is the
 // one resolver: it tries alias before email and reports ambiguity.)
-#[allow(dead_code)]
 impl ProviderSlots {
     pub fn next_free(&self) -> u32 {
         (1..).find(|n| !self.slots.contains_key(n)).unwrap()

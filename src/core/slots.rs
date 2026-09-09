@@ -108,10 +108,14 @@ pub fn load(home: &crate::paths::Home, provider: &str) -> Result<ProviderSlots> 
 /// merely unreferenced) and inside the lock, because the slot number it is
 /// keyed by is only decided there. The vacated slot's row is removed in the
 /// SAME lock cycle (so a concurrent `list` never observes the account sitting
-/// in both slots at once), but its secret and usage-store rows follow outside
-/// the lock, exactly like `clear_dead` — a crash between the two leaves the
-/// account owning only the new slot with its old secret still around, which
-/// the next `add` simply overwrites again, never a lost account.
+/// in both slots at once), but its secret and usage-store row follow outside
+/// the lock, exactly like `clear_dead`. A crash before the file write leaves
+/// the account exactly where it started, still owning its old slot — the next
+/// `add` simply tries the move again. A crash after it leaves the account
+/// owning only the new slot, with the old slot's secret and usage row now
+/// unreferenced bytes nobody points at any more — never a lost account, and
+/// never read again unless a later `add` lands a different one on that slot
+/// number and overwrites them.
 ///
 /// `activate` records the slot as the provider's active one in the same cycle,
 /// for the verb whose write IS the live login (`add`).
@@ -127,8 +131,21 @@ pub fn claim<T>(
         ctx.secrets
             .set(&crate::secrets::slot_key(provider, n), &login.bytes)?;
         meta.fingerprint = Some(login.fingerprint());
-        existing.insert(n, meta);
         let vacated = vacate.filter(|m| *m != n);
+        if let Some(m) = vacated {
+            // A move into a FREE slot would otherwise land at the tail of the
+            // rotation (`insert` only pushes a slot it doesn't already know):
+            // put it in the vacated slot's own spot instead, so a move never
+            // reorders anyone the account used to precede. A move into an
+            // OCCUPIED slot (`--force`) already has a spot — the occupant's —
+            // which the account inherits by taking over the row there.
+            if !existing.order.contains(&n) {
+                if let Some(pos) = existing.order.iter().position(|x| *x == m) {
+                    existing.order[pos] = n;
+                }
+            }
+        }
+        existing.insert(n, meta);
         if let Some(m) = vacated {
             existing.remove(m);
         }

@@ -352,10 +352,17 @@ fn add_refuses_to_capture_a_login_older_than_the_stored_one() {
 #[test]
 fn add_slot_moves_an_account_that_already_owns_another_slot() {
     let fx = Fixture::new();
-    fx.write_slots(&[(2, "one@example.com", "org-1")]);
+    fx.write_slots(&[
+        (2, "one@example.com", "org-1"),
+        (3, "three@example.com", "org-3"),
+    ]);
     fx.write_stored(
         2,
         &fx.login("one@example.com", "org-1", "rt-old", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(
+        3,
+        &fx.login("three@example.com", "org-3", "rt-3", NOT_EXPIRED_MS),
     );
     fx.write_usage(json!({
         "claude:2": {
@@ -389,6 +396,11 @@ fn add_slot_moves_an_account_that_already_owns_another_slot() {
     assert_eq!(
         slots["providers"]["claude"]["activeSlot"], 5,
         "the live login's slot is active, not the one it moved from"
+    );
+    assert_eq!(
+        slots["providers"]["claude"]["order"],
+        json!([5, 3]),
+        "the moved account keeps slot 2's place in the rotation, not the tail"
     );
 
     let stored: Value = serde_json::from_str(&fx.stored(5)).unwrap();

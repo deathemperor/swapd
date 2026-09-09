@@ -25,7 +25,7 @@ impl Ctx {
     pub fn from_env() -> Result<Ctx> {
         let home = Home::resolve()?;
         home.ensure()?;
-        let secrets = secrets::default_secrets(&home);
+        let secrets = secrets::default_secrets(&home)?;
         let env = Env::current(&home);
         let store = UsageStore::new(&home.usage_file());
         // One provider today, so one section is read. A multi-provider `list`

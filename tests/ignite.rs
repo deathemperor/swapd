@@ -673,11 +673,14 @@ fn a_rotation_survives_a_failed_persist_and_lands_on_the_next_run() {
     });
     // The stored login can be read (so the profile is seeded and the child
     // runs) but not written: this is the failure that happens AFTER the child
-    // has exited, with its code already decided.
-    let saved = std::fs::metadata(fx.credential()).unwrap().permissions();
-    std::fs::set_permissions(fx.credential(), std::fs::Permissions::from_mode(0o400)).unwrap();
+    // has exited, with its code already decided. The DIRECTORY is what loses
+    // write permission — the store replaces a secret by renaming a new file
+    // over it, so a read-only file alone would not stop it.
+    let dir = fx.credential().parent().unwrap().to_path_buf();
+    let saved = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let out = fx.cmd().args(["run", "1", "--"]).output().unwrap();
-    std::fs::set_permissions(fx.credential(), saved).unwrap();
+    std::fs::set_permissions(&dir, saved).unwrap();
 
     // The child is gone and its code is the answer to the command the user
     // gave; a swapd-side failure to store the rotation must not overwrite it.

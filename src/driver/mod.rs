@@ -123,10 +123,22 @@ pub struct Env {
 }
 
 impl Env {
+    /// Snapshot the process environment.
+    ///
+    /// `vars_os`, not `vars`: the latter PANICS on a value that is not valid
+    /// Unicode (a Latin-1 `LESS_TERMCAP_*`, a `PWD` left over from a renamed
+    /// directory), and this runs before the verb dispatch — so one such
+    /// variable would replace every `--json` envelope with a Rust panic on
+    /// stderr and exit 101. A pair swapd cannot read is a pair swapd cannot use
+    /// anyway, so it is dropped.
     pub fn current(home: &Home) -> Env {
         Env {
             home: home.root.clone(),
-            vars: std::env::vars().collect(),
+            vars: std::env::vars_os()
+                .filter_map(|(key, value)| {
+                    Some((key.into_string().ok()?, value.into_string().ok()?))
+                })
+                .collect(),
         }
     }
 }

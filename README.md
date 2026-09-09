@@ -51,6 +51,11 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 machine-readable output; `--provider <name>` picks a provider other than the
 default (`claude`).
 
+`export --full` embeds the active account's whole `~/.claude.json` — which
+includes its project paths and prompt history — beside the credentials, so
+treat a `--full` export as the same kind of secret as the login itself. A plain
+`export` carries the logins and the slot rows only.
+
 ## The JSON contract
 
 Every verb's `--json` output starts with `"schemaVersion": 1`, so a caller

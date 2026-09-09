@@ -51,6 +51,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(9);
 #[derive(Debug)]
 pub struct LockGuard {
     dir: PathBuf,
+    /// The directory this guard created, by identity rather than by path (unix
+    /// only). A holder that stalled past the staleness bound has its lock
+    /// removed and remade by whoever takes over, and removing THAT directory on
+    /// our way out would release a lock somebody else is holding.
+    #[cfg(unix)]
+    id: Option<DirId>,
     // Dropping the sender wakes the toucher out of `recv_timeout` at once.
     stop: Option<Sender<()>>,
     toucher: Option<JoinHandle<()>>,
@@ -64,9 +70,35 @@ impl Drop for LockGuard {
         // hangs. Python joined with a 1s timeout; Rust's `join` has none.
         drop(self.stop.take());
         drop(self.toucher.take());
+        // Identity, never mtime: our own toucher moves the mtime every few
+        // seconds, so a timestamp could not tell "still ours" from "taken
+        // over". Windows keeps the unconditional removal (see swapd issue #6,
+        // which owns that platform's lock-directory handling).
+        #[cfg(unix)]
+        if self.id.is_some() && dir_id(&self.dir) != self.id {
+            return;
+        }
         // A vanished lock means someone took it over as stale; nothing to undo.
         let _ = fs::remove_dir(&self.dir);
     }
+}
+
+/// What identifies a lock directory across a take-over.
+///
+/// `(dev, ino)` alone is not enough: APFS never reuses an inode, but ext4 hands
+/// the freed one straight back to the next `mkdir` in the same block group, so
+/// a remade lock there can wear the number we recorded. The birth time settles
+/// it — a real take-over is at least a staleness bound (10s) after ours, and
+/// `btime` is the one timestamp our own toucher does not move. `None` where the
+/// filesystem has no `btime`, which just restores the `(dev, ino)` behaviour.
+#[cfg(unix)]
+type DirId = (u64, u64, Option<std::time::SystemTime>);
+
+#[cfg(unix)]
+fn dir_id(dir: &Path) -> Option<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(dir).ok()?;
+    Some((meta.dev(), meta.ino(), meta.created().ok()))
 }
 
 /// Acquire a proper-lockfile-compatible directory lock on `dir` (the lock
@@ -140,6 +172,8 @@ pub fn proper_lockfile(
 
     Ok(LockGuard {
         dir: dir.to_path_buf(),
+        #[cfg(unix)]
+        id: dir_id(dir),
         stop: Some(stop),
         toucher: Some(toucher),
     })
@@ -273,6 +307,30 @@ mod tests {
         assert!(home.path().join(".claude.json.lock").is_dir());
         drop(guard);
         assert!(!home.path().join(".claude.json.lock").exists());
+    }
+
+    /// A holder we deemed stale had its directory removed and remade by the
+    /// taker; dropping our guard must not remove the taker's lock.
+    /// Unix only: the identity check in `Drop` is (see `DirId`), so on Windows
+    /// the removal is unconditional and this is not the behaviour to assert.
+    #[cfg(unix)]
+    #[test]
+    fn a_stolen_lock_is_left_for_its_new_holder() {
+        let home = temp_home();
+        let lock = home.path().join("stolen.lock");
+        let guard = proper_lockfile(&lock, CONFIG_STALENESS, Duration::from_millis(300)).unwrap();
+
+        // What a taker does: remove the dir it judged stale, then remake it.
+        // The pause is the birth-time clock's granularity, not a race: a real
+        // take-over waits out a staleness bound first, and on a filesystem that
+        // reuses inodes (ext4) two back-to-back `mkdir`s can otherwise share
+        // both the inode number and the coarse `btime`.
+        fs::remove_dir(&lock).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        fs::create_dir(&lock).unwrap();
+
+        drop(guard);
+        assert!(lock.is_dir(), "the new holder's lock must survive our drop");
     }
 
     #[test]

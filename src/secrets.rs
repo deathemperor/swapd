@@ -88,35 +88,55 @@ impl Secrets for FileSecrets {
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
         let path = self.key_path(key)?;
-        fs::create_dir_all(&self.dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+        // Atomic, like `store::write_json_atomic`: a new 0600 file, flushed to
+        // the disk, then renamed over the target. Truncating the target in
+        // place would mean a crash between the truncate and the write leaves an
+        // empty file — and on Linux this store is the ONLY one, written right
+        // after a refresh has spent the previous token, so that window costs
+        // the account. The temp name carries a random suffix because two
+        // writers of one key must not share it.
+        // Created 0700 in one step (never created loose and tightened after),
+        // and re-tightened after a successful write so a directory somebody
+        // loosened does not stay that way. AFTER, not before: a directory this
+        // process cannot write to must fail the write rather than be repaired
+        // into one it can.
+        if !self.dir.is_dir() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&self.dir)?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir_all(&self.dir)?;
         }
 
-        // Single opaque value: written straight to `path`, not through an atomic
-        // tmp+rename like `write_json_atomic` — a crash mid-write loses the value
-        // rather than leaving the old one intact. `mode(0o600)` only applies at
-        // creation, so an existing looser-mode file gets `set_permissions` on the open
-        // handle BEFORE any content is written, closing the window where a stale mode
-        // would make the secret briefly world/group readable.
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(path.file_name().unwrap_or_default());
+        tmp_name.push(format!(".tmp.{}", rand::random::<u64>()));
+        let tmp_path = self.dir.join(tmp_name);
+
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
         use std::io::Write as _;
-        let mut f = opts.open(&path)?;
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(value.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+
+        fs::rename(&tmp_path, &path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         }
-        f.write_all(value.as_bytes())?;
-        f.sync_all()?;
         Ok(())
     }
 
@@ -252,10 +272,9 @@ impl Secrets for StickySecrets {
     }
 }
 
-/// `SWAPD_SECRETS` = `file` | `memory` overrides (tests, CI); unset -> macOS
-/// `Sticky(Security, File)`, elsewhere `File`. An unrecognized (non-empty, non-`file`,
-/// non-`memory`) value also falls back to `File` — never silently to the keychain.
-pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
+/// `SWAPD_SECRETS` = `file` | `memory` overrides (tests, CI); unset (or empty)
+/// -> macOS `Sticky(Security, File)`, elsewhere `File`.
+pub fn default_secrets(home: &Home) -> Result<Box<dyn Secrets>> {
     secrets_for(home, std::env::var("SWAPD_SECRETS").ok().as_deref())
 }
 
@@ -264,12 +283,20 @@ pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
 /// (a process-global that isn't safe to set/unset from a parallel test binary — a race
 /// could let `platform_default` run and, on macOS, write a test value into the real
 /// login keychain).
-pub fn secrets_for(home: &Home, mode: Option<&str>) -> Box<dyn Secrets> {
+pub fn secrets_for(home: &Home, mode: Option<&str>) -> Result<Box<dyn Secrets>> {
     match mode {
-        Some("file") => Box::new(FileSecrets::new(home.credentials_dir())),
-        Some("memory") => Box::new(MemorySecrets::new()),
-        Some(_) => Box::new(FileSecrets::new(home.credentials_dir())),
-        None => platform_default(home),
+        Some("file") => Ok(Box::new(FileSecrets::new(home.credentials_dir()))),
+        Some("memory") => Ok(Box::new(MemorySecrets::new())),
+        // A typo must not silently pick a store: `SWAPD_SECRETS=keychan` used
+        // to write the login to disk on a machine whose keychain was the whole
+        // point of the setting.
+        Some(other) if !other.is_empty() => Err(SwapdError::new(
+            ErrorCode::InvalidInput,
+            format!("unknown SWAPD_SECRETS value: {other} (file, memory, or unset)"),
+        )),
+        // An exported-but-empty variable reads as unset, as it does everywhere
+        // else in the CLI.
+        Some(_) | None => Ok(platform_default(home)),
     }
 }
 
@@ -457,7 +484,7 @@ mod tests {
         // Calls `secrets_for` directly rather than mutating the process-global
         // `SWAPD_SECRETS` env var, which a parallel test binary can't safely do (a
         // race would let `platform_default` run and, on macOS, hit the real keychain).
-        let secrets = secrets_for(&home, Some("file"));
+        let secrets = secrets_for(&home, Some("file")).unwrap();
         secrets.set("claude:1", "tok-1").unwrap();
 
         let path = home.credentials_dir().join("claude_1");
@@ -465,17 +492,52 @@ mod tests {
     }
 
     #[test]
-    fn env_override_unrecognized_falls_back_to_file() {
+    fn env_override_unrecognized_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home {
             root: dir.path().to_path_buf(),
         };
-        let secrets = secrets_for(&home, Some("bogus"));
-        secrets.set("claude:1", "tok-1").unwrap();
+        // A typo used to select the file store silently, writing to disk the
+        // secrets a macOS user had asked the keychain to hold.
+        // Matched rather than `unwrap_err`: a `Box<dyn Secrets>` has no `Debug`,
+        // so nothing a secret store holds can reach a panic message.
+        match secrets_for(&home, Some("keychan")) {
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::InvalidInput);
+                assert!(e.message.contains("keychan"), "message: {}", e.message);
+            }
+            Ok(_) => panic!("an unknown SWAPD_SECRETS value must be refused"),
+        }
 
-        // Never the keychain: the value must land in the file backend.
-        let path = home.credentials_dir().join("claude_1");
-        assert_eq!(fs::read_to_string(path).unwrap(), "tok-1");
+        // An exported-but-empty value still reads as unset.
+        assert!(secrets_for(&home, Some("")).is_ok());
+    }
+
+    #[test]
+    fn file_secrets_leave_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home {
+            root: dir.path().to_path_buf(),
+        };
+        let secrets = secrets_for(&home, Some("file")).unwrap();
+        secrets.set("claude:1", "tok-1").unwrap();
+        secrets.set("claude:1", "tok-2").unwrap();
+
+        assert_eq!(secrets.get("claude:1").unwrap().as_deref(), Some("tok-2"));
+        let leftovers: Vec<_> = fs::read_dir(home.credentials_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != "claude_1")
+            .collect();
+        assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = home.credentials_dir().join("claude_1");
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[cfg(target_os = "macos")]

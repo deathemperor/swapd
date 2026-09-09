@@ -250,7 +250,7 @@ impl Board {
     }
 
     fn secrets(&self) -> Box<dyn Secrets> {
-        secrets_for(&self.home(), Some("file"))
+        secrets_for(&self.home(), Some("file")).unwrap()
     }
 
     /// Add a slot with a stored login.

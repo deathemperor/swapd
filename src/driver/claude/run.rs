@@ -569,11 +569,53 @@ fn copy_share_set(env: &Env, dir: &Path) -> Result<(), DriverError> {
     let source = paths::home(env)?.join(".claude");
     for item in SHARED_ITEMS {
         let from = source.join(item);
-        if from.exists() {
-            copy_tree(&from, &dir.join(item))?;
+        if !from.exists() {
+            continue;
         }
+        let to = dir.join(item);
+        if item == "settings.json" {
+            if let Some(scrubbed) = scrub_auth_overrides(&from) {
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&to, scrubbed)?;
+                continue;
+            }
+        }
+        copy_tree(&from, &to)?;
     }
     Ok(())
+}
+
+/// `settings.json` without the keys that would send the child to a different
+/// account than the profile selects, or `None` when there was nothing to strip.
+///
+/// `apiKeyHelper` and a `settings.env` entry naming one of the auth-override
+/// variables reintroduce, through the settings file, exactly what
+/// `AUTH_OVERRIDE_ENV_VARS` scrubs from the environment: running slot N is an
+/// explicit request to run AS slot N, and a key that overrides it makes the run
+/// silently somebody else's. cswap strips the same on copy.
+///
+/// `None` for a settings file that carries none of them — and for one that is
+/// not JSON at all, which Claude Code would not read either — so the common
+/// case stays a byte-for-byte copy.
+fn scrub_auth_overrides(from: &Path) -> Option<String> {
+    let mut settings: Map<String, Value> = serde_json::from_slice(&fs::read(from).ok()?).ok()?;
+    let mut stripped = settings.remove("apiKeyHelper").is_some();
+    if let Some(Value::Object(vars)) = settings.get_mut("env") {
+        let overrides: Vec<String> = vars
+            .keys()
+            .filter(|key| {
+                key.starts_with("ANTHROPIC_") || AUTH_OVERRIDE_ENV_VARS.contains(&key.as_str())
+            })
+            .cloned()
+            .collect();
+        stripped |= !overrides.is_empty();
+        for key in overrides {
+            vars.remove(&key);
+        }
+    }
+    stripped.then(|| serde_json::to_string_pretty(&settings).ok())?
 }
 
 /// `cp -R` for one entry of the share set.
@@ -862,6 +904,38 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn the_share_set_copy_strips_auth_overrides_from_settings() {
+        let home = temp_home();
+        let env = env_with(&home, [("USER", "tester")]);
+        let driver = ClaudeDriver::new(LiveStore::File, endpoints());
+
+        let config_home = home.path().join(".claude");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"theme":"dark","apiKeyHelper":"/bin/echo sk-ant-api03-key",
+                "env":{"ANTHROPIC_API_KEY":"sk-ant-api03-key",
+                       "CLAUDE_CODE_OAUTH_TOKEN":"tok","EDITOR":"vim"}}"#,
+        )
+        .unwrap();
+
+        run_profile(&driver, &env, 3, &login()).unwrap();
+
+        // A key that overrides the account would make the run somebody else's,
+        // which is the one thing a per-slot profile exists to prevent.
+        let copied: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(env.home.join("profiles/claude/3/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(copied.get("apiKeyHelper").is_none());
+        assert!(copied.pointer("/env/ANTHROPIC_API_KEY").is_none());
+        assert!(copied.pointer("/env/CLAUDE_CODE_OAUTH_TOKEN").is_none());
+        // Everything else the user set follows the account in, untouched.
+        assert_eq!(copied["theme"], "dark");
+        assert_eq!(copied["env"]["EDITOR"], "vim");
     }
 
     #[test]

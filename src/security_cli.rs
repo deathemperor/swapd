@@ -113,7 +113,7 @@ fn validate_component(s: &str) -> Result<()> {
 /// backslash, `password: 0x<HEX>  "<preview>"` otherwise (the preview is discarded —
 /// only the hex is decoded), or `password: ` with nothing after it for an empty value.
 /// Never echoes `stderr` on a parse failure: it can contain the account name.
-// Not wired into a verb yet; `RealSecurity::find` (macOS only, below) uses this.
+// Not wired into a verb yet; `find_outcome` (below) uses this.
 #[allow(dead_code)]
 fn parse_password_line(stderr: &str) -> Result<String> {
     let line = stderr
@@ -133,6 +133,33 @@ fn parse_password_line(stderr: &str) -> Result<String> {
         return Ok(rest[1..rest.len() - 1].to_string());
     }
     Err(keychain_unavailable())
+}
+
+/// Maps a `security find-generic-password -g` exit code + captured stderr to a result:
+/// 44 (not found) -> `Ok(None)`; 0 -> the parsed `password:` line; anything else ->
+/// `KeychainUnavailable`. Pure and platform-independent so it's unit-testable without
+/// spawning `security`.
+// Not wired into a verb yet; `RealSecurity::find` (macOS only, below) uses this.
+#[allow(dead_code)]
+fn find_outcome(code: i32, stderr: &str) -> Result<Option<String>> {
+    match code {
+        44 => Ok(None),
+        0 => parse_password_line(stderr).map(Some),
+        _ => Err(keychain_unavailable()),
+    }
+}
+
+/// Maps a `security delete-generic-password` exit code to a result: 0 (deleted) or 44
+/// (already absent) -> `Ok(())`; anything else -> `KeychainUnavailable`. An absent item
+/// is not a failure — treating it as one would (under `StickySecrets`) permanently
+/// degrade the process to the file backend on a plain delete-of-nonexistent.
+// Not wired into a verb yet; `RealSecurity::delete` (macOS only, below) uses this.
+#[allow(dead_code)]
+fn delete_outcome(code: i32) -> Result<()> {
+    match code {
+        0 | 44 => Ok(()),
+        _ => Err(keychain_unavailable()),
+    }
 }
 
 // Not wired into a verb yet; Task 6's Claude driver constructs this to read/write the
@@ -179,11 +206,7 @@ impl SecurityCli for RealSecurity {
         }
         cmd.arg("-g");
         let (code, _stdout, stderr) = Self::run(&mut cmd, None)?;
-        match code {
-            44 => Ok(None),
-            0 => parse_password_line(&stderr).map(Some),
-            _ => Err(keychain_unavailable()),
-        }
+        find_outcome(code, &stderr)
     }
 
     fn add(&self, service: &str, account: &str, value: &str) -> Result<()> {
@@ -214,10 +237,7 @@ impl SecurityCli for RealSecurity {
             .arg("-a")
             .arg(account);
         let (code, _, _) = Self::run(&mut cmd, None)?;
-        if code != 0 {
-            return Err(keychain_unavailable());
-        }
-        Ok(())
+        delete_outcome(code)
     }
 }
 
@@ -304,7 +324,9 @@ mod tests {
         struct Cleanup;
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = RealSecurity.delete("swapd test", "swapd-test-account");
+                RealSecurity
+                    .delete("swapd test", "swapd-test-account")
+                    .expect("cleanup delete must succeed (0 or already-absent 44)");
             }
         }
         let _cleanup = Cleanup;
@@ -362,6 +384,41 @@ mod tests {
     #[test]
     fn parse_password_line_missing_line_is_keychain_unavailable() {
         let err = parse_password_line("no password here\n").unwrap_err();
+        assert_eq!(err.code, ErrorCode::KeychainUnavailable);
+    }
+
+    #[test]
+    fn find_outcome_not_found() {
+        assert_eq!(find_outcome(44, "").unwrap(), None);
+    }
+
+    #[test]
+    fn find_outcome_success_printable_line() {
+        let stderr = "password: \"hello\"\n";
+        assert_eq!(find_outcome(0, stderr).unwrap(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn find_outcome_success_hex_line() {
+        let stderr = "password: 0x68656c6c6f  \"hello\"\n";
+        assert_eq!(find_outcome(0, stderr).unwrap(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn find_outcome_other_code_is_keychain_unavailable() {
+        let err = find_outcome(1, "").unwrap_err();
+        assert_eq!(err.code, ErrorCode::KeychainUnavailable);
+    }
+
+    #[test]
+    fn delete_outcome_success_and_not_found_are_ok() {
+        assert!(delete_outcome(0).is_ok());
+        assert!(delete_outcome(44).is_ok());
+    }
+
+    #[test]
+    fn delete_outcome_other_code_is_keychain_unavailable() {
+        let err = delete_outcome(1).unwrap_err();
         assert_eq!(err.code, ErrorCode::KeychainUnavailable);
     }
 }

@@ -40,6 +40,12 @@ impl Secrets for SecuritySecrets {
         self.cli.find(SERVICE, Some(key))
     }
     fn set(&self, key: &str, value: &str) -> Result<()> {
+        // `security -i add-generic-password ... -X` with an empty hex string is
+        // rejected by `security` itself (exit 2), which would otherwise read as a
+        // backend error and permanently degrade `StickySecrets` to the file backend.
+        if value.is_empty() {
+            return Err(SwapdError::new(ErrorCode::InvalidInput, "empty secret"));
+        }
         self.cli.add(SERVICE, key, value)
     }
     fn delete(&self, key: &str) -> Result<()> {
@@ -83,10 +89,18 @@ impl Secrets for FileSecrets {
     fn set(&self, key: &str, value: &str) -> Result<()> {
         let path = self.key_path(key)?;
         fs::create_dir_all(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+        }
 
-        // Single opaque value, no partial-write concern worth an atomic tmp+rename here
-        // (unlike the JSON stores in core/store.rs): create straight at 0600, then
-        // re-assert the mode in case the file already existed under a looser one.
+        // Single opaque value: written straight to `path`, not through an atomic
+        // tmp+rename like `write_json_atomic` — a crash mid-write loses the value
+        // rather than leaving the old one intact. `mode(0o600)` only applies at
+        // creation, so an existing looser-mode file gets `set_permissions` on the open
+        // handle BEFORE any content is written, closing the window where a stale mode
+        // would make the secret briefly world/group readable.
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -96,13 +110,13 @@ impl Secrets for FileSecrets {
         }
         use std::io::Write as _;
         let mut f = opts.open(&path)?;
-        f.write_all(value.as_bytes())?;
-        f.sync_all()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
+        f.write_all(value.as_bytes())?;
+        f.sync_all()?;
         Ok(())
     }
 
@@ -150,7 +164,11 @@ impl Secrets for MemorySecrets {
 }
 
 /// Ported sticky per-process fallback: once `primary` errors, every later call in this
-/// process goes straight to `fallback`. A `None` result from `primary` is not a failure.
+/// process goes straight to `fallback`. A `None` result from `primary` is not a
+/// failure. `delete` always fans out to both backends (so a plaintext copy the file
+/// backend may hold can't outlive the keychain item, and vice versa) and reports
+/// `fallback`'s result; a successful `set` on `primary` also clears any stale copy in
+/// `fallback` left by an earlier degraded run, ignoring that delete's result.
 // Not wired into a verb yet; `default_secrets` builds one for the macOS default.
 #[allow(dead_code)]
 pub struct StickySecrets {
@@ -185,20 +203,32 @@ impl Secrets for StickySecrets {
         if self.degraded.load(Ordering::SeqCst) {
             return self.fallback.set(key, value);
         }
-        self.primary.set(key, value).or_else(|_| {
-            self.degraded.store(true, Ordering::SeqCst);
-            self.fallback.set(key, value)
-        })
+        match self.primary.set(key, value) {
+            Ok(()) => {
+                // Clear any plaintext copy an earlier degraded run may have left in
+                // the fallback, so it can't outlive the keychain item. Ignore the
+                // result: a missing copy isn't an error, and the write already
+                // succeeded via `primary`.
+                let _ = self.fallback.delete(key);
+                Ok(())
+            }
+            Err(_) => {
+                self.degraded.store(true, Ordering::SeqCst);
+                self.fallback.set(key, value)
+            }
+        }
     }
 
     fn delete(&self, key: &str) -> Result<()> {
         if self.degraded.load(Ordering::SeqCst) {
             return self.fallback.delete(key);
         }
-        self.primary.delete(key).or_else(|_| {
+        // Fan out to both backends regardless of `primary`'s outcome, so a copy in
+        // one can't outlive the other; `fallback`'s result is the one reported.
+        if self.primary.delete(key).is_err() {
             self.degraded.store(true, Ordering::SeqCst);
-            self.fallback.delete(key)
-        })
+        }
+        self.fallback.delete(key)
     }
 }
 
@@ -208,11 +238,22 @@ impl Secrets for StickySecrets {
 // Not wired into a verb yet; later tasks (login, use) call this to build their store.
 #[allow(dead_code)]
 pub fn default_secrets(home: &Home) -> Box<dyn Secrets> {
-    match std::env::var("SWAPD_SECRETS") {
-        Ok(v) if v == "file" => Box::new(FileSecrets::new(home.credentials_dir())),
-        Ok(v) if v == "memory" => Box::new(MemorySecrets::new()),
-        Ok(_) => Box::new(FileSecrets::new(home.credentials_dir())),
-        Err(_) => platform_default(home),
+    secrets_for(home, std::env::var("SWAPD_SECRETS").ok().as_deref())
+}
+
+/// `default_secrets` reads `SWAPD_SECRETS` from the process environment and calls this;
+/// tests call it directly with an explicit `mode` instead of mutating `SWAPD_SECRETS`
+/// (a process-global that isn't safe to set/unset from a parallel test binary — a race
+/// could let `platform_default` run and, on macOS, write a test value into the real
+/// login keychain).
+// Not wired into a verb yet; `default_secrets` (above) and tests call this directly.
+#[allow(dead_code)]
+pub fn secrets_for(home: &Home, mode: Option<&str>) -> Box<dyn Secrets> {
+    match mode {
+        Some("file") => Box::new(FileSecrets::new(home.credentials_dir())),
+        Some("memory") => Box::new(MemorySecrets::new()),
+        Some(_) => Box::new(FileSecrets::new(home.credentials_dir())),
+        None => platform_default(home),
     }
 }
 
@@ -352,10 +393,11 @@ mod tests {
         let home = Home {
             root: dir.path().to_path_buf(),
         };
-        std::env::set_var("SWAPD_SECRETS", "file");
-        let secrets = default_secrets(&home);
+        // Calls `secrets_for` directly rather than mutating the process-global
+        // `SWAPD_SECRETS` env var, which a parallel test binary can't safely do (a
+        // race would let `platform_default` run and, on macOS, hit the real keychain).
+        let secrets = secrets_for(&home, Some("file"));
         secrets.set("claude:1", "tok-1").unwrap();
-        std::env::remove_var("SWAPD_SECRETS");
 
         let path = home.credentials_dir().join("claude_1");
         assert_eq!(fs::read_to_string(path).unwrap(), "tok-1");
@@ -367,13 +409,65 @@ mod tests {
         let home = Home {
             root: dir.path().to_path_buf(),
         };
-        std::env::set_var("SWAPD_SECRETS", "bogus");
-        let secrets = default_secrets(&home);
+        let secrets = secrets_for(&home, Some("bogus"));
         secrets.set("claude:1", "tok-1").unwrap();
-        std::env::remove_var("SWAPD_SECRETS");
 
         // Never the keychain: the value must land in the file backend.
         let path = home.credentials_dir().join("claude_1");
         assert_eq!(fs::read_to_string(path).unwrap(), "tok-1");
+    }
+
+    #[test]
+    fn security_secrets_rejects_empty_value() {
+        let secrets = SecuritySecrets::new(Arc::new(FakeSecurity::new()));
+        let err = secrets.set("claude:1", "").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    struct SharedSecrets(Arc<MemorySecrets>);
+    impl Secrets for SharedSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.0.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<()> {
+            self.0.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key)
+        }
+    }
+
+    #[test]
+    fn sticky_delete_reaches_both_backends() {
+        let primary_mem = Arc::new(MemorySecrets::new());
+        let fallback_mem = Arc::new(MemorySecrets::new());
+        primary_mem.set("k", "p").unwrap();
+        fallback_mem.set("k", "f").unwrap();
+
+        let sticky = StickySecrets::new(
+            Box::new(SharedSecrets(primary_mem.clone())),
+            Box::new(SharedSecrets(fallback_mem.clone())),
+        );
+        sticky.delete("k").unwrap();
+
+        assert_eq!(primary_mem.get("k").unwrap(), None);
+        assert_eq!(fallback_mem.get("k").unwrap(), None);
+    }
+
+    #[test]
+    fn sticky_set_on_primary_clears_fallback_copy() {
+        let primary_mem = Arc::new(MemorySecrets::new());
+        let fallback_mem = Arc::new(MemorySecrets::new());
+        // Simulates a stale plaintext copy left by an earlier degraded run.
+        fallback_mem.set("k", "stale-plaintext").unwrap();
+
+        let sticky = StickySecrets::new(
+            Box::new(SharedSecrets(primary_mem.clone())),
+            Box::new(SharedSecrets(fallback_mem.clone())),
+        );
+        sticky.set("k", "fresh").unwrap();
+
+        assert_eq!(primary_mem.get("k").unwrap(), Some("fresh".to_string()));
+        assert_eq!(fallback_mem.get("k").unwrap(), None);
     }
 }

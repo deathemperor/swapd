@@ -28,7 +28,7 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | `doctor` | check the local environment: stores, locks, profiles, CLI version |
 | `list` | list every account, its usage and the rotation |
 | `refresh [--slot n]` | fetch usage now, then list |
-| `add [--slot n] [--alias name] [--force]` | capture the CLI's current live login into a slot |
+| `add [--slot n] [--alias name] [--force]` | capture the CLI's current live login into a slot, moving it there if it already owns a different one |
 | `add-token - [--slot n] [--email addr] [--alias name] [--force]` | register a raw OAuth setup token or API key read from stdin |
 | `import <path\|-> [--force]` | import accounts from an export file |
 | `export <path\|-> [--slot n] [--full]` | write an export envelope to a file |

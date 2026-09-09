@@ -22,6 +22,11 @@ pub struct AddOutput {
     pub email: String,
     /// False when an existing slot for this account was refreshed in place.
     pub created: bool,
+    /// `--slot n` for an account that already owns a different slot MOVES it
+    /// rather than duplicating it: the slot it moved from, when this capture
+    /// did that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<u32>,
 }
 
 pub struct AddOpts {
@@ -88,7 +93,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
     // cycle records the slot as active (cswap's `activeAccountNumber` update,
     // `switcher.py:3552`) — the collector's keychain-down hold-back reads that
     // field.
-    let (slot, created) = slots::claim(ctx, id, true, |existing| {
+    let (slot, moved_from, created) = slots::claim(ctx, id, true, |existing| {
         let owner = existing
             .slots
             .iter()
@@ -128,9 +133,9 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
 
         // An explicit `--slot` decides; otherwise the account's own slot
         // refreshes in place and a new account takes the next free one.
-        let (slot, created, prior) = match (opts.slot, owner) {
-            (None, Some((slot, meta))) => (slot, false, Some(meta)),
-            (None, None) => (existing.next_free(), true, None),
+        let (slot, created, prior, moved_from) = match (opts.slot, owner) {
+            (None, Some((slot, meta))) => (slot, false, Some(meta), None),
+            (None, None) => (existing.next_free(), true, None, None),
             (Some(slot), owner) => {
                 if slot < 1 {
                     return Err(SwapdError::new(
@@ -151,12 +156,22 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
                         ));
                     }
                 }
-                (slot, occupant.is_none(), occupant)
+                // The account already owns a DIFFERENT slot: `--slot slot`
+                // moves it there instead of duplicating the row, so `prior`
+                // is the account's OWN meta (alias, icon, …) — not
+                // `occupant`, which (when `--force` allowed one) is a
+                // different account being overwritten, not this one's past.
+                match owner {
+                    Some((from, meta)) if from != slot => {
+                        (slot, occupant.is_none(), Some(meta), Some(from))
+                    }
+                    _ => (slot, occupant.is_none(), occupant, None),
+                }
             }
         };
 
         let meta = compose(&identity, prior.as_ref(), opts.alias.as_deref(), ctx.now());
-        Ok((slot, meta, login, created))
+        Ok((slot, meta, login, moved_from, created))
     })?;
 
     drop(engine);
@@ -166,6 +181,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
         slot,
         email: identity.email,
         created,
+        moved_from,
     })
 }
 
@@ -252,6 +268,10 @@ pub fn check_alias(slots: &ProviderSlots, alias: &str, owner: Option<u32>) -> Re
 }
 
 pub fn print_human(out: &AddOutput) {
+    if let Some(from) = out.moved_from {
+        println!("moved {} from slot {from} to slot {}", out.email, out.slot);
+        return;
+    }
     let verb = if out.created { "Added" } else { "Updated" };
     println!("{verb} slot {}: {}", out.slot, out.email);
 }

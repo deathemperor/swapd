@@ -119,14 +119,18 @@ impl Fixture {
     }
 
     fn write_stored(&self, slot: u32, login: &Value) {
-        write(
-            &self
-                .home
-                .path()
-                .join("credentials")
-                .join(format!("claude_{slot}")),
-            &login.to_string(),
-        );
+        write(&self.credential(slot), &login.to_string());
+    }
+
+    fn credential(&self, slot: u32) -> std::path::PathBuf {
+        self.home
+            .path()
+            .join("credentials")
+            .join(format!("claude_{slot}"))
+    }
+
+    fn usage_rows(&self) -> Value {
+        read_json(&self.home.path().join("usage.json"))["rows"].clone()
     }
 
     /// Every stashed credential the run left behind, by secret name.
@@ -343,6 +347,198 @@ fn add_refuses_to_capture_a_login_older_than_the_stored_one() {
     // And the newer generation is still there.
     let stored: Value = serde_json::from_str(&fx.stored(1)).unwrap();
     assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-new");
+}
+
+#[test]
+fn add_slot_moves_an_account_that_already_owns_another_slot() {
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (2, "one@example.com", "org-1"),
+        (3, "three@example.com", "org-3"),
+    ]);
+    fx.write_stored(
+        2,
+        &fx.login("one@example.com", "org-1", "rt-old", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(
+        3,
+        &fx.login("three@example.com", "org-3", "rt-3", NOT_EXPIRED_MS),
+    );
+    fx.write_usage(json!({
+        "claude:2": {
+            "email": "one@example.com", "org": "org-1",
+            "fetchedAt": now_s() - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 42.0, "resetsAt": "2026-09-20T00:00:00Z"}],
+        },
+    }));
+    // The same account as slot 2, one refresh-token generation later.
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-new",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    let out = fx.run(&["add", "--slot", "5", "--json"]);
+    assert_eq!(out["slot"], 5);
+    assert_eq!(out["email"], "one@example.com");
+    assert_eq!(out["movedFrom"], 2);
+
+    let slots = fx.slots();
+    assert!(slot_of(&slots, 2).is_null(), "slot 2 no longer has a row");
+    assert_eq!(slot_of(&slots, 5)["email"], "one@example.com");
+    assert_eq!(
+        slot_of(&slots, 5)["alias"],
+        "a2",
+        "the alias the account had at slot 2 follows it"
+    );
+    assert_eq!(
+        slots["providers"]["claude"]["activeSlot"], 5,
+        "the live login's slot is active, not the one it moved from"
+    );
+    assert_eq!(
+        slots["providers"]["claude"]["order"],
+        json!([5, 3]),
+        "the moved account keeps slot 2's place in the rotation, not the tail"
+    );
+
+    let stored: Value = serde_json::from_str(&fx.stored(5)).unwrap();
+    assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-new");
+    assert!(!fx.credential(2).exists(), "slot 2's secret is gone");
+
+    let usage = fx.usage_rows();
+    assert!(usage.get("claude:2").is_none(), "slot 2's usage row moved");
+    assert_eq!(usage["claude:5"]["lastGood"][0]["pct"], 42.0);
+}
+
+#[test]
+fn add_slot_refuses_an_occupied_slot_without_force() {
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (2, "one@example.com", "org-1"),
+        (3, "three@example.com", "org-3"),
+    ]);
+    fx.write_stored(
+        2,
+        &fx.login("one@example.com", "org-1", "rt-2", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(
+        3,
+        &fx.login("three@example.com", "org-3", "rt-3", NOT_EXPIRED_MS),
+    );
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-new",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    let err = fx.run_err(&["add", "--slot", "3", "--json"]);
+    assert_eq!(err["error"]["code"], "invalid-input");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("three@example.com"));
+
+    // Nothing moved.
+    let slots = fx.slots();
+    assert_eq!(slot_of(&slots, 2)["email"], "one@example.com");
+    assert_eq!(slot_of(&slots, 3)["email"], "three@example.com");
+    let stored: Value = serde_json::from_str(&fx.stored(3)).unwrap();
+    assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-3");
+}
+
+#[test]
+fn add_slot_force_overwrites_the_occupant_and_still_moves_the_owner() {
+    let fx = Fixture::new();
+    fx.write_slots(&[
+        (2, "one@example.com", "org-1"),
+        (3, "three@example.com", "org-3"),
+    ]);
+    fx.write_stored(
+        2,
+        &fx.login("one@example.com", "org-1", "rt-2", NOT_EXPIRED_MS),
+    );
+    fx.write_stored(
+        3,
+        &fx.login("three@example.com", "org-3", "rt-3", NOT_EXPIRED_MS),
+    );
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-new",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    let out = fx.run(&["add", "--slot", "3", "--force", "--json"]);
+    assert_eq!(out["slot"], 3);
+    assert_eq!(out["movedFrom"], 2);
+
+    let slots = fx.slots();
+    assert!(slot_of(&slots, 2).is_null());
+    assert_eq!(slot_of(&slots, 3)["email"], "one@example.com");
+
+    let stored: Value = serde_json::from_str(&fx.stored(3)).unwrap();
+    assert_eq!(
+        stored["claudeAiOauth"]["refreshToken"], "rt-new",
+        "the occupant's secret is gone; the moved account's is there instead"
+    );
+}
+
+#[test]
+fn add_slot_matching_the_owners_own_slot_refreshes_in_place() {
+    let fx = Fixture::new();
+    fx.write_slots(&[(2, "one@example.com", "org-1")]);
+    fx.write_stored(
+        2,
+        &fx.login("one@example.com", "org-1", "rt-old", NOT_EXPIRED_MS),
+    );
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-new",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    let out = fx.run(&["add", "--slot", "2", "--json"]);
+    assert_eq!(out["slot"], 2);
+    assert!(
+        out.as_object().unwrap().get("movedFrom").is_none(),
+        "no move happened, so the field is skipped rather than null: {out}"
+    );
+
+    let stored: Value = serde_json::from_str(&fx.stored(2)).unwrap();
+    assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-new");
+}
+
+#[test]
+fn add_then_add_slot_move_leaves_one_account_in_the_list() {
+    let fx = Fixture::new();
+    fx.write_live(
+        "one@example.com",
+        "org-1",
+        "rt-1",
+        NOT_EXPIRED_MS,
+        json!({}),
+    );
+
+    let out = fx.run(&["add", "--json"]);
+    assert_eq!(out["slot"], 1);
+    assert!(out.as_object().unwrap().get("movedFrom").is_none());
+
+    let out = fx.run(&["add", "--slot", "5", "--json"]);
+    assert_eq!(out["slot"], 5);
+    assert_eq!(out["movedFrom"], 1);
+
+    let listed = fx.run(&["list", "--json"]);
+    let accounts = listed["providers"][0]["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1, "the account, not a duplicate: {listed}");
+    assert_eq!(accounts[0]["slot"], 5);
+    assert_eq!(accounts[0]["email"], "one@example.com");
 }
 
 #[test]

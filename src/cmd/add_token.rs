@@ -96,7 +96,7 @@ pub fn run(
     // carries the slot number, so the slot has to be chosen and taken together
     // or two concurrent registrations would answer with the same default
     // address.
-    let (slot, (email, created)) = slots::claim(ctx, id, false, |existing| {
+    let (slot, _vacated, (email, created)) = slots::claim(ctx, id, false, |existing| {
         let by_email = |email: &str| {
             existing
                 .slots
@@ -186,7 +186,10 @@ pub fn run(
         };
         let meta = compose(&identity, prior.as_ref(), opts.alias.as_deref(), ctx.now());
         let created = prior.is_none();
-        Ok((slot, meta, login, (email, created)))
+        // `add-token` has no live login to identify, so an account already
+        // owning another slot is invisible to it (`by_email`/`--slot` name
+        // this slot directly) — there is nothing here for `add`'s move to do.
+        Ok((slot, meta, login, None, (email, created)))
     })?;
 
     Ok(AddOutput {
@@ -194,6 +197,7 @@ pub fn run(
         slot,
         email,
         created,
+        moved_from: None,
     })
 }
 

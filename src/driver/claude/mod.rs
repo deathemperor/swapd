@@ -32,11 +32,13 @@ impl Driver for ClaudeDriver {
     /// The `claude` binary, if this machine has one.
     ///
     /// The single process-environment read the driver makes: `installed()` takes
-    /// no `Env`, so `PATH` and `HOME` come from the process here (the ruling's
-    /// explicit exception). Everything else goes through `Env`.
+    /// no `Env`, so `SWAPD_CLAUDE_CLI`, `PATH` and `HOME` come from the process
+    /// here (the ruling's explicit exception). Everything else goes through
+    /// `Env`.
     fn installed(&self) -> Option<PathBuf> {
         let home = std::env::var("HOME").unwrap_or_default();
         run::find_claude(
+            std::env::var(run::CLI_OVERRIDE_ENV).ok().as_deref(),
             std::env::var("PATH").ok().as_deref(),
             std::path::Path::new(&home),
         )
@@ -124,6 +126,10 @@ impl Driver for ClaudeDriver {
 
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError> {
         run::run_profile(self, env, slot, login)
+    }
+
+    fn forget_profile(&self, env: &Env, slot: u32) -> Result<(), DriverError> {
+        run::forget_profile(self, env, slot)
     }
 
     /// `~/.claude.json` (or the legacy `<config dir>/.config.json`), through

@@ -116,9 +116,6 @@ impl From<DriverError> for SwapdError {
 
 /// The process environment a driver operates under: swapd's home dir plus
 /// the process env captured once at startup.
-// `home` is read by the driver's profile paths (Task 13's `run`), not by the
-// collector.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct Env {
     pub home: PathBuf,
@@ -147,8 +144,6 @@ pub type ReadBack = Box<dyn Fn() -> Result<Option<Login>, DriverError> + Send>;
 /// then decide what a failed run means — dropping the rotation would leave the
 /// slot holding a refresh token the server has already spent, and the next
 /// refresh of it comes back `invalid_grant`, which reads as a dead account.
-// Produced by the driver already; Task 13's `ignite` verb is what reads it.
-#[allow(dead_code)]
 pub struct IgniteOutcome {
     /// The child's exit status. Zero is a successful ignite; non-zero is the
     /// caller's to report, after it has persisted `rotated`.
@@ -167,8 +162,10 @@ pub struct RunProfile {
     /// makes the CLI bypass the account this profile selects (see the Claude
     /// driver's `AUTH_OVERRIDE_ENV_VARS`).
     pub unset: Vec<String>,
-    /// The profile's own directory. `ignite` deliberately runs elsewhere (an
-    /// empty cwd of swapd's own); Task 8's `run` verb reports this to the user.
+    /// The profile's own directory. Nothing *runs* in it — `ignite` uses an
+    /// empty cwd of swapd's own and `run` inherits the user's — so it is here
+    /// for a caller that wants to report or inspect the profile, and the
+    /// driver's own tests are what read it today.
     #[allow(dead_code)]
     pub dir: PathBuf,
     /// Reads the profile's credential back after the child exits, answering
@@ -218,9 +215,6 @@ pub struct Caps {
     pub run: bool,
 }
 
-// The collector calls most of it; `ignite`/`run_profile` wait for the `run`
-// verb, and the allow keeps the whole driver behind them counting as live.
-#[allow(dead_code)]
 pub trait Driver: Send + Sync {
     fn id(&self) -> &'static str; // "claude"
     fn installed(&self) -> Option<PathBuf>; // the CLI on this machine
@@ -260,6 +254,16 @@ pub trait Driver: Send + Sync {
     /// produced no exit status at all — a timeout, a signal — is `Err`.
     fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
+    /// Delete whatever the slot's run profile left *outside* its directory, so
+    /// `remove` can forget an account completely.
+    ///
+    /// A profile is not only its files: Claude Code migrates the seeded
+    /// `.credentials.json` into a keychain item named after the config dir, and
+    /// `remove_dir_all` never touches it. Only the driver knows that item
+    /// exists, or how it is named. No default — an engine that quietly
+    /// inherited "nothing to do" would leave a live credential behind for an
+    /// account swapd has forgotten.
+    fn forget_profile(&self, env: &Env, slot: u32) -> Result<(), DriverError>;
     /// The CLI's own config file for the live login, as text — `None` when the
     /// CLI keeps no such file or it is not there.
     ///

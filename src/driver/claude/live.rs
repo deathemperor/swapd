@@ -357,7 +357,7 @@ fn error_kind(err: &DriverError) -> &'static str {
 /// fallback. Matching it exactly matters on headless/launchd hosts where
 /// `$USER` is unset — a divergent default would key a *different* item than
 /// Claude Code's.
-fn keychain_account(env: &Env) -> String {
+pub fn keychain_account(env: &Env) -> String {
     for name in ["USER", "LOGNAME"] {
         if let Some(user) = env.vars.get(name) {
             if !user.is_empty() {
@@ -368,7 +368,7 @@ fn keychain_account(env: &Env) -> String {
     "claude-code-user".to_string()
 }
 
-fn map_security_error(err: crate::errors::SwapdError) -> DriverError {
+pub fn map_security_error(err: crate::errors::SwapdError) -> DriverError {
     match err.code {
         ErrorCode::KeychainUnavailable => DriverError::KeychainUnavailable,
         _ => DriverError::Invalid(err.message),

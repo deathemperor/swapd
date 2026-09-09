@@ -84,6 +84,15 @@ enum Command {
     Switch { ident: String },
     /// Run the switching daemon: poll usage, switch when policy says to.
     Auto,
+    /// Start an account's usage window: one short run in its own profile.
+    Ignite { ident: String },
+    /// Run the provider's CLI as one account, without touching the live login.
+    Run {
+        ident: String,
+        /// Everything after `--`, passed to the CLI untouched.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Switch to the next account a strategy picks.
     Rotate {
         /// `consume-first`, `best` or `next-available`.
@@ -286,6 +295,23 @@ fn run(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Ignite { ident } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::ignite::run(&ctx, driver.as_ref(), ident)?;
+            emit(&out, cli.json, || cmd::ignite::print_human(&out))
+        }
+        Command::Run { ident, args } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            // The child's code is the verb's: `swapd run` is a wrapper, and a
+            // wrapper that flattens exit codes breaks every script around it.
+            let code = cmd::run::run(&ctx, driver.as_ref(), ident, args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Rotate { strategy } => {
             // Parsed before the data dir is created: a bad strategy is a
             // rejected command, and a rejected command leaves nothing behind.
@@ -471,8 +497,13 @@ fn doctor(json: bool) -> Result<()> {
 /// run would actually execute.
 fn locate_claude() -> (bool, Option<String>) {
     let home = std::env::var("HOME").unwrap_or_default();
-    match driver::claude::run::find_claude(std::env::var("PATH").ok().as_deref(), Path::new(&home))
-    {
+    match driver::claude::run::find_claude(
+        std::env::var(driver::claude::run::CLI_OVERRIDE_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+        Path::new(&home),
+    ) {
         Some(path) => (true, Some(path.to_string_lossy().into_owned())),
         None => (false, None),
     }

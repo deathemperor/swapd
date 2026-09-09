@@ -63,6 +63,14 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str, yes: bool) -> Result<Rem
             .clone();
         provider.remove(target);
         ctx.secrets.delete(&slot_key(id, target))?;
+        // A profile is not only its directory: the CLI may have migrated the
+        // seeded credential into a keychain item named after the profile's
+        // config dir, which `remove_dir_all` would never touch — leaving a live
+        // login behind for an account swapd has forgotten. Only the driver
+        // knows that item exists, so it is the driver that deletes it, and
+        // first: a failure here aborts the removal like any other, rather than
+        // orphaning the item under a slot that no longer names it.
+        driver.forget_profile(&ctx.env, target)?;
         // The slot's run profile holds a copy of the credential (and whatever
         // Claude Code wrote beside it), so forgetting the account has to take
         // the profile with it. Already gone is fine.

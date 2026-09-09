@@ -177,6 +177,10 @@ impl Driver for FakeDriver {
     ) -> std::result::Result<RunProfile, DriverError> {
         Err(DriverError::Unsupported("run"))
     }
+
+    fn forget_profile(&self, _env: &Env, _slot: u32) -> std::result::Result<(), DriverError> {
+        Ok(())
+    }
     fn live_config_text(&self, _env: &Env) -> std::result::Result<Option<String>, DriverError> {
         Ok(None)
     }

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::driver::claude::live::{self, ClaudeDriver};
+use crate::driver::claude::live::{self, ClaudeDriver, LiveStore};
 use crate::driver::claude::paths;
 use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
 
@@ -79,13 +79,33 @@ const SEED_MARKER: &str = ".swapd-seeded";
 /// returns would wedge the verb that called it.
 const IGNITE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The `claude` binary for this machine: `PATH` first, then the well-known
-/// install locations.
+/// The environment variable that names the `claude` binary outright.
 ///
-/// `path_var` and `home` are passed in rather than read from the process
-/// environment, so `ignite` can resolve against the environment its child will
-/// actually run under while `doctor` resolves against the process's.
-pub fn find_claude(path_var: Option<&str>, home: &Path) -> Option<PathBuf> {
+/// The suite's only way to keep a run hermetic: two of `CANDIDATES` are
+/// absolute paths that exist on a developer's machine whatever `HOME` says, so
+/// a test that merely empties `PATH` would still find — and run — the real CLI.
+pub const CLI_OVERRIDE_ENV: &str = "SWAPD_CLAUDE_CLI";
+
+/// The `claude` binary for this machine: an explicit `SWAPD_CLAUDE_CLI` first,
+/// then `PATH`, then the well-known install locations.
+///
+/// `cli_override`, `path_var` and `home` are passed in rather than read from the
+/// process environment, so `ignite` can resolve against the environment its
+/// child will actually run under while `doctor` resolves against the process's.
+///
+/// An override that is not an executable file answers `None` rather than
+/// falling through to the lookup: naming a binary is a statement about *which*
+/// one to run, and quietly running a different one would turn a typo (or a
+/// test's missing stub) into a real request as some other account.
+pub fn find_claude(
+    cli_override: Option<&str>,
+    path_var: Option<&str>,
+    home: &Path,
+) -> Option<PathBuf> {
+    if let Some(explicit) = cli_override.filter(|p| !p.is_empty()) {
+        let explicit = PathBuf::from(explicit);
+        return is_executable(&explicit).then_some(explicit);
+    }
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
             let candidate = dir.join(binary_name());
@@ -424,6 +444,37 @@ impl ClaudeDriver {
     }
 }
 
+/// Delete the keychain item slot `slot`'s profile migrated its seed into, so
+/// `remove` takes the account's last copy of the credential with it.
+///
+/// Seeding writes plaintext only, but Claude Code moves that seed into a hashed
+/// item on its first write (see the module docs), and the item is keyed by a
+/// hash of the *exact* string swapd puts in `CLAUDE_CONFIG_DIR` — so the name is
+/// derived here, from the same `profile_dir`, rather than guessed. Deleting the
+/// profile directory alone would leave that item behind holding a login for an
+/// account swapd no longer knows.
+///
+/// A store with no keychain (Linux, Windows, `SWAPD_LIVE_STORE=file`) has
+/// nothing to delete, and an item that is already gone is a success — the
+/// `SecurityCli` maps `security`'s exit 44 to `Ok`.
+pub fn forget_profile(driver: &ClaudeDriver, env: &Env, slot: u32) -> Result<(), DriverError> {
+    let LiveStore::Keychain(cli) = &driver.store else {
+        return Ok(());
+    };
+    let dir = profile_dir(env, slot);
+    // No string, no item: a non-UTF-8 profile path could never have been put in
+    // `CLAUDE_CONFIG_DIR` in the first place (`run_profile` refuses it), so
+    // there is nothing keyed by it.
+    let Some(dir_str) = dir.to_str() else {
+        return Ok(());
+    };
+    cli.delete(
+        &paths::keychain_service_name(dir_str),
+        &live::keychain_account(env),
+    )
+    .map_err(live::map_security_error)
+}
+
 /// The environment that selects slot `slot`'s profile, without creating or
 /// seeding anything.
 fn profile_env(env: &Env, slot: u32) -> Result<Env, DriverError> {
@@ -520,7 +571,12 @@ pub fn ignite(
     let profile = run_profile(driver, env, slot, login)?;
     let path_var = env.vars.get("PATH").map(String::as_str);
     let home = paths::home(env)?;
-    let binary = find_claude(path_var, &home).ok_or(DriverError::NotInstalled)?;
+    let binary = find_claude(
+        env.vars.get(CLI_OVERRIDE_ENV).map(String::as_str),
+        path_var,
+        &home,
+    )
+    .ok_or(DriverError::NotInstalled)?;
 
     // An empty directory of swapd's own: `claude` scans its working directory
     // for project files (and records the run against that project), and the
@@ -631,7 +687,7 @@ mod tests {
 
         // Nothing on PATH: the well-known location answers.
         assert_eq!(
-            find_claude(None, home.path()),
+            find_claude(None, None, home.path()),
             Some(local.join(binary_name()))
         );
 
@@ -640,13 +696,13 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         write_noop_claude(&bin.join(binary_name()));
         assert_eq!(
-            find_claude(Some(bin.to_str().unwrap()), home.path()),
+            find_claude(None, Some(bin.to_str().unwrap()), home.path()),
             Some(bin.join(binary_name()))
         );
 
         // Neither: not installed.
         let empty = temp_home();
-        assert_eq!(find_claude(Some(""), empty.path()), None);
+        assert_eq!(find_claude(None, Some(""), empty.path()), None);
     }
 
     #[cfg(unix)]
@@ -666,9 +722,89 @@ mod tests {
 
         let path_var = format!("{}:{}", dead.display(), live.display());
         assert_eq!(
-            find_claude(Some(&path_var), home.path()),
+            find_claude(None, Some(&path_var), home.path()),
             Some(live.join("claude"))
         );
+    }
+
+    #[test]
+    fn find_claude_honours_the_explicit_override() {
+        let home = temp_home();
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        write_noop_claude(&bin.join(binary_name()));
+        let explicit = home.path().join("stub");
+        write_noop_claude(&explicit);
+
+        // A named binary wins over PATH and over the well-known locations.
+        assert_eq!(
+            find_claude(
+                Some(explicit.to_str().unwrap()),
+                Some(bin.to_str().unwrap()),
+                home.path()
+            ),
+            Some(explicit)
+        );
+
+        // And a named binary that is not there is "not installed", never a
+        // licence to run a different one: two of the candidates are absolute
+        // paths that exist on most machines, so falling through would turn a
+        // typo into a real run as whatever account that CLI is logged into.
+        let missing = home.path().join("nope");
+        assert_eq!(
+            find_claude(
+                Some(missing.to_str().unwrap()),
+                Some(bin.to_str().unwrap()),
+                home.path()
+            ),
+            None
+        );
+
+        // An unset variable arrives as an empty string often enough that it has
+        // to mean "no override" rather than "a binary named ''".
+        assert_eq!(
+            find_claude(Some(""), Some(bin.to_str().unwrap()), home.path()),
+            Some(bin.join(binary_name()))
+        );
+    }
+
+    #[test]
+    fn forget_profile_deletes_the_profiles_own_item_and_nothing_else() {
+        let home = temp_home();
+        let env = env_with(&home, [("USER", "tester")]);
+        let fake = std::sync::Arc::new(crate::security_cli::FakeSecurity::default());
+        let driver = ClaudeDriver::new(LiveStore::Keychain(fake.clone()), endpoints());
+
+        let profile = run_profile(&driver, &env, 3, &login()).unwrap();
+        let dir_str = profile.dir.to_str().unwrap().to_string();
+        let service = paths::keychain_service_name(&dir_str);
+        // Claude Code migrated the seed into its hashed item, whose name hashes
+        // the EXACT string swapd put in `CLAUDE_CONFIG_DIR`.
+        fake.add(
+            &service,
+            "tester",
+            r#"{"claudeAiOauth":{"refreshToken":"rt"}}"#,
+        )
+        .unwrap();
+        // A trailing slash names the same directory and a different item: the
+        // service has to be derived from that exact string, not re-spelled.
+        let decoy = paths::keychain_service_name(&format!("{dir_str}/"));
+        fake.add(&decoy, "tester", "decoy").unwrap();
+        // The live login's own item is on the other side of the same keychain.
+        fake.add(paths::DEFAULT_SERVICE, "tester", "live").unwrap();
+
+        forget_profile(&driver, &env, 3).unwrap();
+        assert_eq!(fake.find(&service, None).unwrap(), None);
+        assert_eq!(fake.find(&decoy, None).unwrap().as_deref(), Some("decoy"));
+        assert_eq!(
+            fake.find(paths::DEFAULT_SERVICE, None).unwrap().as_deref(),
+            Some("live")
+        );
+
+        // Already gone is a success (`security` exit 44), and a store with no
+        // keychain at all — Linux, Windows — has nothing to delete.
+        forget_profile(&driver, &env, 3).unwrap();
+        forget_profile(&ClaudeDriver::new(LiveStore::File, endpoints()), &env, 3).unwrap();
     }
 
     #[test]

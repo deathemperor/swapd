@@ -24,6 +24,7 @@ use crate::core::poll_policy::{binding_pct, parse_reset_ts};
 use crate::core::refresh::{refresh_slot, Refreshed};
 use crate::core::slots::{self, ProviderSlots};
 use crate::core::store::FileLock;
+use crate::core::unclaimed;
 use crate::ctx::Ctx;
 use crate::driver::claude::usage::format_ts;
 use crate::driver::{Driver, DriverError, Login};
@@ -400,12 +401,38 @@ fn preserve_outgoing(
         .unwrap_or_default();
 
     let Some(slot) = match_slot(provider, slots, live) else {
-        let stash_key = stash_key(id, ctx.now(), live);
+        let stash_id = stash_id(ctx.now(), live);
+        let stash_key = stash_key(id, &stash_id);
         ctx.secrets.set(&stash_key, &live.bytes)?;
+        // A failed record aborts the switch: the bytes are safe under
+        // `stash_key`, but a row-less stash is the exact problem this manifest
+        // exists to fix, so a switch must not proceed on one the user cannot
+        // find by name.
+        unclaimed::record(
+            ctx,
+            &stash_id,
+            unclaimed::Entry {
+                provider: id.to_string(),
+                stashed_at: ctx.now() as u64,
+                email: email.clone(),
+                fingerprint: live.fingerprint(),
+                reason: "switch: live login matched no slot".to_string(),
+                secret_key: stash_key.clone(),
+            },
+        )
+        .map_err(|e| {
+            SwapdError::new(
+                e.code,
+                format!(
+                    "the live login is stashed under secret key '{stash_key}' but could not be \
+                     recorded in the unclaimed manifest ({e}); recover it by hand from that key"
+                ),
+            )
+        })?;
         warnings.push(format!(
-            "the live login does not match a managed account; it was preserved as \
-             '{stash_key}' and not written into any slot. If you need that account, \
-             log in as it and run `swapd add`"
+            "the live login does not match a managed account; it was preserved as unclaimed \
+             entry '{stash_id}' and not written into any slot — see `swapd unclaimed`. If you \
+             need that account, log in as it and run `swapd add`"
         ));
         return Ok(SlotRef::unmanaged(email));
     };
@@ -446,15 +473,14 @@ fn preserve_outgoing(
     Ok(SlotRef::numbered(slot, email))
 }
 
-/// `FileSecrets` folds `:` to `_` and rejects `/`, so the stash lives under
-/// `<provider>:unclaimed-<unix-ts>-<fp>` rather than the `unclaimed/<ts>` the
-/// design note wrote.
+/// The tail both the stash key and the manifest row are keyed by:
+/// `<unix-ts>-<fp8>`.
 ///
 /// The fingerprint tail is not decoration: the timestamp is whole seconds, and
 /// `set` truncates, so two switches inside one second would otherwise have the
 /// second stash overwrite the first — discarding a login that exists nowhere
 /// else, which is the one thing this path must never do.
-fn stash_key(provider: &str, now: f64, login: &Login) -> String {
+fn stash_id(now: f64, login: &Login) -> String {
     let fp = login.fingerprint();
     let short: String = fp
         .rsplit(':')
@@ -463,7 +489,14 @@ fn stash_key(provider: &str, now: f64, login: &Login) -> String {
         .chars()
         .take(8)
         .collect();
-    format!("{provider}:unclaimed-{}-{}", now as u64, short)
+    format!("{}-{}", now as u64, short)
+}
+
+/// `FileSecrets` folds `:` to `_` and rejects `/`, so the stash lives under
+/// `<provider>:unclaimed-<unix-ts>-<fp>` rather than the `unclaimed/<ts>` the
+/// design note wrote.
+fn stash_key(provider: &str, id: &str) -> String {
+    format!("{provider}:unclaimed-{id}")
 }
 
 /// The slot a login belongs to: identity (email + org) first, fingerprint
@@ -716,16 +749,80 @@ mod tests {
         let login = Login {
             bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-a"}}"#.to_string(),
         };
-        let key = stash_key("claude", 1_757_000_000.7, &login);
+        let id = stash_id(1_757_000_000.7, &login);
+        let key = stash_key("claude", &id);
         assert!(key.starts_with("claude:unclaimed-1757000000-"), "{key}");
         assert!(!key.contains('/'));
 
-        // Same second, different login: the keys must not collide, or the
+        // Same second, different login: the ids must not collide, or the
         // second stash would overwrite the first.
         let other = Login {
             bytes: r#"{"claudeAiOauth":{"refreshToken":"rt-b"}}"#.to_string(),
         };
-        assert_ne!(key, stash_key("claude", 1_757_000_000.7, &other));
+        assert_ne!(id, stash_id(1_757_000_000.7, &other));
+    }
+
+    /// The other half of `preserve_outgoing`'s stash path (M1): an outgoing
+    /// live login nobody's slot claims lands in the unclaimed manifest, keyed
+    /// by the same id the stash key carries, and the secret it names holds the
+    /// exact bytes that were live.
+    #[test]
+    fn an_unmanaged_outgoing_login_stashes_a_manifest_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        // Neither slot 1 nor slot 2's email, so `match_slot` finds nothing.
+        let driver = FakeDriver::new(&login_for("stranger@example.com", "rt-stranger"), false);
+
+        let result = perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND).unwrap();
+        assert!(result.switched);
+        assert_eq!(result.from.as_ref().unwrap().slot, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("swapd unclaimed")),
+            "{:?}",
+            result.warnings
+        );
+
+        let entries = crate::core::unclaimed::list(&ctx).unwrap();
+        assert_eq!(entries.len(), 1);
+        let (id, entry) = entries.iter().next().unwrap();
+        assert_eq!(entry.provider, "claude");
+        assert_eq!(entry.email, "stranger@example.com");
+        assert_eq!(entry.secret_key, format!("claude:unclaimed-{id}"));
+        assert_eq!(
+            ctx.secrets.get(&entry.secret_key).unwrap().unwrap(),
+            login_for("stranger@example.com", "rt-stranger")
+        );
+    }
+
+    /// M1's abort path: a stash whose row cannot be recorded must not let the
+    /// switch land, because a stash with no row is exactly the unrecoverable
+    /// state this manifest exists to prevent.
+    #[test]
+    fn a_manifest_write_failure_aborts_the_switch_and_leaves_the_live_store_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = two_slots(dir.path());
+        let driver = FakeDriver::new(&login_for("stranger@example.com", "rt-stranger"), false);
+
+        // A directory where `unclaimed.json`'s lock belongs: `FileLock::acquire`
+        // can never take it.
+        std::fs::create_dir_all(dir.path().join("unclaimed.json.lock")).unwrap();
+
+        match perform(&ctx, &driver, 2, "manual", Freshen::ON_DEMAND) {
+            Err(e) => assert!(e.message.contains("unclaimed-"), "{}", e.message),
+            Ok(_) => panic!("a manifest write failure must abort the switch"),
+        }
+
+        // The live store was never touched: `write_live` runs after
+        // `preserve_outgoing`, which is where this failed.
+        assert!(driver.writes.lock().unwrap().is_empty());
+        assert_eq!(
+            driver.live.lock().unwrap().clone().unwrap(),
+            login_for("stranger@example.com", "rt-stranger")
+        );
+        assert!(crate::core::unclaimed::list(&ctx).unwrap().is_empty());
     }
 
     /// A driver whose live store is a `Mutex<String>` and whose `write_live`

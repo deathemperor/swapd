@@ -98,6 +98,14 @@ impl Home {
         self.root.join("credentials")
     }
 
+    /// The unclaimed-stash manifest (`core::unclaimed`): one row per outgoing
+    /// live login `preserve_outgoing` stashed because it matched no slot. Its
+    /// `.lock` sibling — `unclaimed.json.lock` — fences every read-modify-write
+    /// of it, the same shape `slots.json` uses.
+    pub fn unclaimed_file(&self) -> PathBuf {
+        self.root.join("unclaimed.json")
+    }
+
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join("profiles")
     }

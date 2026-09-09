@@ -13,3 +13,4 @@
 - Secrets backends: macOS keychain via `security`, a file store, an in-memory store for tests.
 - Platforms: macOS, Linux, Windows.
 - `doctor` reports the live store, secrets backend, engine/auto lock state (with the daemon pid), profile dirs and the CLI version (#7).
+- unclaimed: a stashed login that matched no slot is recorded in a manifest, listed by `swapd unclaimed`, dropped with `--purge`, and carried by `export` (#2).

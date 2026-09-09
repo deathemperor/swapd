@@ -97,8 +97,13 @@ pub fn run(
             Some(pair) => pair,
             None => {
                 let reason = format!("slot {slot} ({}) has no stored login", meta.email);
+                // The slot exists — `list` reports it as `no-credentials` — so
+                // it is `invalid-input`, never `no-such-slot`: that answer is
+                // reserved for a slot number that is not in the table at all,
+                // and conflating the two tells the user to look for the wrong
+                // problem.
                 if opts.slot.is_some() {
-                    return Err(SwapdError::new(ErrorCode::NoSuchSlot, reason));
+                    return Err(invalid(format!("{reason}; nothing to export")));
                 }
                 warnings.push(format!("{reason}; skipped"));
                 continue;

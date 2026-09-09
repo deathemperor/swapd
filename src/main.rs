@@ -276,12 +276,19 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Rotate { strategy } => {
             // Parsed before the data dir is created: a bad strategy is a
             // rejected command, and a rejected command leaves nothing behind.
-            let strategy = match strategy {
-                Some(name) => core::switch::Strategy::parse(name)?,
-                None => cmd::rotate::DEFAULT_STRATEGY,
-            };
+            let named = strategy
+                .as_deref()
+                .map(core::switch::Strategy::parse)
+                .transpose()?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
+            // `--strategy` overrides; without it the answer is the policy file's
+            // (`<provider>.strategy`), which the lenient load has already
+            // narrowed to one of the three choices.
+            let strategy = match named {
+                Some(strategy) => strategy,
+                None => core::switch::Strategy::parse(&ctx.settings.strategy)?,
+            };
             let out = cmd::rotate::run(&ctx, driver.as_ref(), strategy)?;
             emit(&out, cli.json, || cmd::switch::print_human(&out))
         }

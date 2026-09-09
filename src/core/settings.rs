@@ -152,7 +152,8 @@ pub const SPECS: &[Spec] = &[
     Spec {
         key: "includeApiKeyAccounts",
         kind: Kind::Bool,
-        help: "Allow rotating onto managed API-key accounts (bill per token)",
+        help: "Allow rotating onto managed API-key accounts (bill per token) \
+               — stored only in phase 1: a managed key cannot be made the live login",
     },
     Spec {
         key: "unhealthyTicks",
@@ -212,7 +213,7 @@ impl Settings {
                 None => warn_type(key, raw, "an integer"),
             },
             Kind::Choice(choices) => match raw.as_str() {
-                Some(v) if choices.contains(&v) => self.strategy = v.to_string(),
+                Some(v) if choices.contains(&v) => self.set_choice(key, v),
                 _ => warn_type(key, raw, &format!("one of {}", choices.join(", "))),
             },
             Kind::List { lowercase } => match list(raw, *lowercase) {
@@ -237,6 +238,12 @@ impl Settings {
             "cooldownSeconds" => self.cooldown_seconds = v,
             "hysteresisPct" => self.hysteresis_pct = v,
             _ => {}
+        }
+    }
+
+    fn set_choice(&mut self, key: &str, v: &str) {
+        if key == "strategy" {
+            self.strategy = v.to_string();
         }
     }
 
@@ -307,9 +314,19 @@ fn warn_type(key: &str, raw: &Value, expected: &str) {
 
 /// One provider's settings, or the defaults when the file (or the section) is
 /// not there. Never fails: a missing, corrupt or hand-mangled file degrades to
-/// default behaviour with a warning (cswap `_read_raw`, settings.py:275).
+/// default behaviour with a warning (cswap `_read_raw`, settings.py:275) — and
+/// that includes a `schemaVersion` this build does not know, whose keys are
+/// still read for whatever they are worth. Refusing to *read* a newer file
+/// would leave a policy verb with no policy at all; refusing to *write* one is
+/// `edit`'s job.
 pub fn load(home: &Home, provider: &str) -> Settings {
     let raw = read_lenient(&home.settings_file());
+    if let Some(version) = foreign_version(&raw) {
+        eprintln!(
+            "warning: settings.json is schemaVersion {version}, not {SCHEMA_VERSION}; \
+             reading it anyway"
+        );
+    }
     let mut settings = Settings::default();
     let Some(section) = section_of(&raw, provider) else {
         return settings;
@@ -372,8 +389,20 @@ pub fn read_strict(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
+/// The file's `schemaVersion` when it is present and is not the one this build
+/// writes.
+fn foreign_version(raw: &Map<String, Value>) -> Option<u64> {
+    raw.get("schemaVersion")
+        .and_then(Value::as_u64)
+        .filter(|v| *v != SCHEMA_VERSION as u64)
+}
+
 /// Read-modify-write `settings.json` under `<settings.json>.lock`, preserving
 /// every key the specs do not name.
+///
+/// A file stamped with another `schemaVersion` is refused rather than rewritten:
+/// this build would write v1 semantics into it and leave the stamp lying about
+/// what the file means.
 fn edit<T>(
     home: &Home,
     mutate: impl FnOnce(&mut Map<String, Value>) -> Result<(bool, T)>,
@@ -381,16 +410,17 @@ fn edit<T>(
     let path = home.settings_file();
     let _lock = FileLock::acquire(&path, LOCK_TIMEOUT)?;
     let mut raw = read_strict(&path)?;
+    if let Some(version) = foreign_version(&raw) {
+        return Err(SwapdError::new(
+            ErrorCode::Unsupported,
+            format!("settings.json is schemaVersion {version}; this build writes {SCHEMA_VERSION}"),
+        ));
+    }
     let (dirty, out) = mutate(&mut raw)?;
     if dirty {
-        raw.insert(
-            "schemaVersion".to_string(),
-            Value::from(
-                raw.get("schemaVersion")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(SCHEMA_VERSION as u64),
-            ),
-        );
+        // Always stamped, as `slots::update` stamps `slots.json`: the file this
+        // build wrote is a file this build's semantics describe.
+        raw.insert("schemaVersion".to_string(), Value::from(SCHEMA_VERSION));
         write_json_atomic(&path, &Value::Object(raw))?;
     }
     Ok(out)

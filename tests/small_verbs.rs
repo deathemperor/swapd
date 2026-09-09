@@ -366,6 +366,18 @@ fn alias_sets_clears_and_refuses_a_name_that_cannot_be_resolved() {
         .as_str()
         .unwrap()
         .contains("already used by slot 3"));
+    // `resolve` tries aliases before emails, so an alias spelled like another
+    // slot's address would send every `<ident>` verb — `remove` included — to
+    // the wrong account.
+    let err = fx.run_err(&["alias", "2", "THREE@example.com", "--json"]);
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("slot 3's email"),
+        "{}",
+        err["error"]["message"]
+    );
 
     let out = fx.run(&["alias", "2", "--unset", "--json"]);
     assert!(account(&out, 2)["alias"].is_null());
@@ -662,9 +674,19 @@ fn export_slot_names_one_account_and_a_missing_login_is_its_error() {
         "the active slot is not in this payload"
     );
 
-    // Named explicitly, an unreadable slot is an error…
+    // Named explicitly, a slot with nothing to export is an error — and one
+    // that exists says so, rather than borrowing `no-such-slot` from the slot
+    // number that is genuinely not in the table.
     let err = fx.run_err(&["export", "-", "--slot", "3", "--json"]);
-    assert_eq!(err["error"]["code"], "no-such-slot");
+    assert_eq!(err["error"]["code"], "invalid-input");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has no stored login"),
+        "{}",
+        err["error"]["message"]
+    );
     let err = fx.run_err(&["export", "-", "--slot", "9", "--json"]);
     assert_eq!(err["error"]["code"], "no-such-slot");
 
@@ -673,4 +695,61 @@ fn export_slot_names_one_account_and_a_missing_login_is_its_error() {
     let out = fx.run(&["export", file.to_str().unwrap(), "--json"]);
     assert_eq!(out["accounts"], 2);
     assert_eq!(out["warnings"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_keeps_the_row_when_the_credential_cannot_be_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    fx.board();
+    // Unlinking needs write permission on the directory, so this is a delete
+    // that fails after the row has been removed in memory.
+    let dir = fx.home.path().join("credentials");
+    let saved = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let err = fx.run_err(&["remove", "2", "--yes", "--json"]);
+    std::fs::set_permissions(&dir, saved).unwrap();
+
+    assert_eq!(err["error"]["code"], "io");
+    // The whole removal is one lock cycle: a delete that fails writes nothing,
+    // so the row still points at the credential that is still there.
+    assert_eq!(slot_of(&fx.slots(), 2)["email"], "two@example.com");
+    assert_eq!(fx.slots()["providers"]["claude"]["order"], json!([1, 2, 3]));
+    assert!(fx.credential(2).exists());
+}
+
+#[test]
+fn config_refuses_to_write_a_settings_file_from_another_schema() {
+    let fx = Fixture::new();
+    write(
+        &fx.home.path().join("settings.json"),
+        &json!({"schemaVersion": 2, "providers": {"claude": {"threshold": 95.0}}}).to_string(),
+    );
+
+    // Reading still works — a policy verb with no policy would be worse than
+    // one reading a file it half understands.
+    let out = fx.run(&["config", "list", "--json"]);
+    assert_eq!(setting(&out, "claude.threshold")["value"], 95.0);
+
+    // Writing does not: this build would put v1 semantics under a v2 stamp.
+    for args in [
+        vec!["config", "set", "claude.threshold", "60", "--json"],
+        vec!["config", "unset", "claude.threshold", "--json"],
+    ] {
+        let err = fx.run_err(&args);
+        assert_eq!(err["error"]["code"], "unsupported", "{args:?}");
+    }
+    assert_eq!(
+        fx.settings()["schemaVersion"],
+        2,
+        "and the file is untouched"
+    );
+
+    // A file this build wrote is always stamped with the version it means.
+    std::fs::remove_file(fx.home.path().join("settings.json")).unwrap();
+    fx.run(&["config", "set", "claude.threshold", "60", "--json"]);
+    assert_eq!(fx.settings()["schemaVersion"], 1);
 }

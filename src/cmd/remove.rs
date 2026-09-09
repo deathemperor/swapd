@@ -5,6 +5,10 @@
 //! else: `--yes` is the confirmation, and the active slot is refused outright
 //! so a `remove` can never leave the machine logged into an account swapd no
 //! longer knows.
+//!
+//! Row, credential and run profile all go inside one `slots.json` lock cycle,
+//! so a slot number cannot be handed to a new account (`add`) between freeing
+//! the row and deleting what it pointed at.
 
 use serde::Serialize;
 
@@ -32,10 +36,17 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str, yes: bool) -> Result<Rem
             "removing an account deletes its stored login; pass --yes to confirm",
         ));
     }
-    // The row goes first, under the lock. Bytes without a row are merely
-    // unreferenced, while a row whose credential has been deleted is a slot
-    // that cannot authenticate — so the order that survives a failure halfway
-    // is row, then secret, then profile.
+    // Everything in ONE `slots::update` cycle, so the whole removal is fenced
+    // by `slots.json`'s lock. Deleting the credential after the lock is
+    // released is a check-then-act: a concurrent `add` whose `next_free()`
+    // returns the slot just freed writes the NEW account's credential under
+    // the lock, and the trailing delete then erases it, leaving a row that
+    // cannot authenticate — exactly the state `slots::claim` writes the secret
+    // inside the lock to prevent.
+    //
+    // A delete that fails therefore aborts the removal: the closure returns
+    // `Err`, nothing is written, and the row still points at the credential
+    // that is still there.
     let (slot, email) = slots::update(&ctx.home.slots_file(), |file| {
         let provider = file.providers.entry(id.to_string()).or_default();
         let target = resolve(provider, id, ident)?;
@@ -51,24 +62,23 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str, yes: bool) -> Result<Rem
             .email
             .clone();
         provider.remove(target);
+        ctx.secrets.delete(&slot_key(id, target))?;
+        // The slot's run profile holds a copy of the credential (and whatever
+        // Claude Code wrote beside it), so forgetting the account has to take
+        // the profile with it. Already gone is fine.
+        let profile = ctx.home.profiles_dir().join(id).join(target.to_string());
+        match std::fs::remove_dir_all(&profile) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SwapdError::new(
+                    ErrorCode::Io,
+                    format!("{}: {e}", profile.display()),
+                ))
+            }
+        }
         Ok((true, (target, email)))
     })?;
-
-    ctx.secrets.delete(&slot_key(id, slot))?;
-    // The slot's run profile holds a copy of the credential (and whatever
-    // Claude Code wrote beside it), so forgetting the account has to take the
-    // profile with it. Already gone is fine.
-    let profile = ctx.home.profiles_dir().join(id).join(slot.to_string());
-    match std::fs::remove_dir_all(&profile) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(SwapdError::new(
-                ErrorCode::Io,
-                format!("{}: {e}", profile.display()),
-            ))
-        }
-    }
 
     // The usage row is left: rows are identity-guarded (`UsageStore::entries`
     // matches email and org), so a slot number reused by another account never

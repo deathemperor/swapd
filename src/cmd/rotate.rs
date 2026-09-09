@@ -8,19 +8,20 @@ use crate::driver::Driver;
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
 
-/// The strategy `--strategy` defaults to: the rotation order `list` already
-/// advertises as `nextCandidate`, and — since the two now share the collector's
-/// health rule (`collect::within_threshold`) — a plain `rotate` lands where the
-/// contract said it would.
+/// Which strategy a plain `rotate` uses is `settings.json`'s
+/// `<provider>.strategy` (cswap's `autoswitch.strategy`, default `best`),
+/// resolved in `main`; a knob the user can set and `rotate` ignores would be a
+/// silent no-op.
 ///
+/// `next-available` is the rotation order `list` advertises as `nextCandidate`,
+/// and — since the two share the collector's health rule
+/// (`collect::within_threshold`) — it lands where the contract said it would.
 /// `consume-first` is gated on the same threshold (brief step 5's "soonest 7d
 /// reset among healthy", cswap `autoswitch.py:2109-2113`), with cswap's
 /// `all_above` escape: when every candidate is above the threshold the gate is
 /// dropped rather than the answer withheld. `best` is ungated — it is asked for
 /// by name and already ranks by the most headroom, so only an exhausted window
 /// is out for it.
-pub const DEFAULT_STRATEGY: Strategy = Strategy::NextAvailable;
-
 pub fn run(ctx: &Ctx, provider: &dyn Driver, strategy: Strategy) -> Result<SwitchOutput> {
     // A collection pass first: ranking on a stale table would rotate onto an
     // account that is already spent. The pass respects the stored poll plans,

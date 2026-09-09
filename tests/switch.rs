@@ -672,28 +672,6 @@ fn rotate_fixture() -> Fixture {
 /// `next-available` answers with the collector's own health rule, so it skips
 /// an account `list` would not have called `nextCandidate` either.
 #[test]
-fn rotate_lands_on_a_preferred_account_first() {
-    // Slot 3 resets soonest, so plain consume-first takes it (the test above).
-    // `claude.preferred` names slot 2's email: a pinned account wins among the
-    // candidates the strategy's own gates already admit.
-    let fx = rotate_fixture();
-    write(
-        &fx.home.path().join("settings.json"),
-        &json!({
-            "schemaVersion": 1,
-            "providers": {"claude": {"preferred": "TWO@example.com"}},
-        })
-        .to_string(),
-    );
-
-    let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
-    assert_eq!(
-        out["to"]["slot"], 2,
-        "the pinned account outranks the reset"
-    );
-}
-
-#[test]
 fn rotate_next_available_skips_an_account_over_the_threshold() {
     let fx = rotate_fixture();
     // Slot 2 is next in rotation order after the active slot 1, but it is at
@@ -713,10 +691,32 @@ fn rotate_next_available_skips_an_account_over_the_threshold() {
     let listed = fx.run(&["list", "--json", "--provider", "claude"]);
     assert_eq!(listed["providers"][0]["nextCandidate"], 3);
 
-    let out = fx.run(&["rotate", "--json"]);
+    let out = fx.run(&["rotate", "--strategy", "next-available", "--json"]);
     assert_eq!(
         out["to"]["slot"], 3,
         "the account over the threshold is not available"
+    );
+}
+
+#[test]
+fn rotate_lands_on_a_preferred_account_first() {
+    // Slot 3 resets soonest, so plain consume-first takes it (the test above).
+    // `claude.preferred` names slot 2's email: a pinned account wins among the
+    // candidates the strategy's own gates already admit.
+    let fx = rotate_fixture();
+    write(
+        &fx.home.path().join("settings.json"),
+        &json!({
+            "schemaVersion": 1,
+            "providers": {"claude": {"preferred": "TWO@example.com"}},
+        })
+        .to_string(),
+    );
+
+    let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
+    assert_eq!(
+        out["to"]["slot"], 2,
+        "the pinned account outranks the reset"
     );
 }
 
@@ -742,7 +742,7 @@ fn rotate_next_available_agrees_with_list_on_a_stale_board() {
     let next_candidate = listed["providers"][0]["nextCandidate"].clone();
     assert_eq!(next_candidate, 2, "a reading this old is unknown, not 95%");
 
-    let out = fx.run(&["rotate", "--json"]);
+    let out = fx.run(&["rotate", "--strategy", "next-available", "--json"]);
     assert_eq!(
         out["to"]["slot"], next_candidate,
         "`next-available` must land where `nextCandidate` said"
@@ -838,6 +838,64 @@ fn rotate_consume_first_escapes_the_gate_when_every_candidate_is_above_it() {
     assert_eq!(out["to"]["slot"], 2, "most headroom, gate never applied");
 }
 
+/// `settings.json`'s `<provider>.strategy` IS the strategy a plain `rotate`
+/// uses: a knob the user can set and the verb ignores is a silent no-op.
+#[test]
+fn rotate_takes_its_default_strategy_from_settings() {
+    let fx = rotate_fixture();
+    // Slot 2 is next in the rotation order after the active slot 1; slot 3 has
+    // less headroom than slot 2, so `best` and `next-available` disagree.
+    let now = now_s();
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 60.0, "resetsAt": "2026-09-30T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 20.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+    }));
+    // The default is cswap's `best`: the most headroom.
+    let out = fx.run(&["rotate", "--json"]);
+    assert_eq!(out["to"]["slot"], 3, "settings default is `best`");
+
+    let fx = rotate_fixture();
+    fx.write_usage(json!({
+        "claude:1": {"email": "one@example.com", "org": "org-1", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 50.0, "resetsAt": "2026-09-20T00:00:00Z"}]},
+        "claude:2": {"email": "two@example.com", "org": "org-2", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 60.0, "resetsAt": "2026-09-30T00:00:00Z"}]},
+        "claude:3": {"email": "three@example.com", "org": "org-3", "fetchedAt": now - 5.0,
+            "lastGood": [{"kind": "7d", "pct": 20.0, "resetsAt": "2026-09-11T00:00:00Z"}]},
+    }));
+    fx.run(&[
+        "config",
+        "set",
+        "claude.strategy",
+        "next-available",
+        "--json",
+    ]);
+    let listed = fx.run(&["list", "--json", "--provider", "claude"]);
+    assert_eq!(listed["providers"][0]["nextCandidate"], 2);
+
+    let out = fx.run(&["rotate", "--json"]);
+    assert_eq!(
+        out["to"]["slot"], listed["providers"][0]["nextCandidate"],
+        "the stored strategy decides, and it lands where `list` said"
+    );
+
+    // An explicit `--strategy` still overrides the file.
+    let fx = rotate_fixture();
+    fx.run(&[
+        "config",
+        "set",
+        "claude.strategy",
+        "next-available",
+        "--json",
+    ]);
+    let out = fx.run(&["rotate", "--strategy", "consume-first", "--json"]);
+    assert_eq!(out["to"]["slot"], 3, "soonest weekly reset, as asked");
+}
+
 /// A candidate whose credential turns out to be dead is what rotation is FOR:
 /// the next one in the ranking is tried rather than the rotate failing.
 #[test]
@@ -853,7 +911,7 @@ fn rotate_skips_a_candidate_whose_refresh_token_is_dead() {
             .json_body(json!({ "error": "invalid_grant" }));
     });
 
-    let out = fx.run(&["rotate", "--json"]);
+    let out = fx.run(&["rotate", "--strategy", "next-available", "--json"]);
     token.assert_hits(1);
     assert_eq!(out["switched"], true);
     assert_eq!(out["to"]["slot"], 3, "the next candidate takes it");

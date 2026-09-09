@@ -150,6 +150,10 @@ pub fn compose(identity: &Identity, prior: Option<&Slot>, alias: Option<&str>, n
 /// An alias must name one account (cswap `_alias_in_use`) and must not be a
 /// number, which would be read as a slot before it could ever be read as an
 /// alias.
+///
+/// It must not be another slot's EMAIL either. `resolve` tries aliases before
+/// emails, so `alias 2 three@example.com` would make every `<ident>` verb —
+/// including `remove` — hit slot 2 when the user named slot 3 by its address.
 pub fn check_alias(slots: &ProviderSlots, alias: &str, owner: Option<u32>) -> Result<()> {
     let alias = alias.trim();
     if alias.is_empty() {
@@ -164,18 +168,24 @@ pub fn check_alias(slots: &ProviderSlots, alias: &str, owner: Option<u32>) -> Re
             format!("'{alias}' would be read as a slot number, not an alias"),
         ));
     }
+    let wanted = alias.to_lowercase();
     let clash = slots
         .slots
         .iter()
         .find(|(n, s)| {
             Some(**n) != owner
-                && s.alias.as_deref().map(str::to_lowercase) == Some(alias.to_lowercase())
+                && (s.alias.as_deref().map(str::to_lowercase) == Some(wanted.clone())
+                    || s.email.to_lowercase() == wanted)
         })
-        .map(|(n, _)| *n);
+        .map(|(n, s)| (*n, s.email.to_lowercase() == wanted));
     match clash {
-        Some(n) => Err(SwapdError::new(
+        Some((n, is_email)) => Err(SwapdError::new(
             ErrorCode::InvalidInput,
-            format!("alias '{alias}' is already used by slot {n}"),
+            if is_email {
+                format!("alias '{alias}' is slot {n}'s email address")
+            } else {
+                format!("alias '{alias}' is already used by slot {n}")
+            },
         )),
         None => Ok(()),
     }

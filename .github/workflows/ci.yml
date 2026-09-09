@@ -26,3 +26,5 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
+      - run: python3 -m unittest tests/parity_test.py
+        if: runner.os == 'Linux'

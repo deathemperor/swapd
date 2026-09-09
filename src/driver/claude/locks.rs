@@ -76,7 +76,7 @@ impl Drop for LockGuard {
         drop(self.toucher.take());
         // Identity, never mtime: our own toucher moves the mtime every few
         // seconds, so a timestamp could not tell "still ours" from "taken
-        // over". Windows keeps the unconditional removal (see swapd issue #6,
+        // over". Windows keeps the unconditional removal (see swapd issue #15,
         // which owns that platform's lock-directory handling).
         #[cfg(unix)]
         if self.id.is_some() && dir_id(&self.dir) != self.id {

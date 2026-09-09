@@ -24,7 +24,9 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 // through this.
 #[allow(dead_code)]
 /// Serialize `value` to `path` atomically: write to a tmp file in the same
-/// directory, then rename over the target. `0600` on unix.
+/// directory, then rename over the target. `0600` on unix. The parent
+/// directory must already exist (callers run `Home::ensure()` first); a
+/// missing directory surfaces as an `ErrorCode::Io` error.
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let bytes = serde_json::to_vec_pretty(value)?;
@@ -67,11 +69,14 @@ impl FileLock {
         lock_name.push(".lock");
         let lock_path: PathBuf = path.with_file_name(lock_name);
 
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path)?;
         let mut rw = fd_lock::RwLock::new(file);
 
         let start = Instant::now();
@@ -176,5 +181,13 @@ mod tests {
             Ok(_) => panic!("expected timeout"),
         }
         handle.join().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock_path = dir.path().join("slots.json.lock");
+            let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

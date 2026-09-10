@@ -117,18 +117,13 @@ matches on email alone when the org is empty, so slots key on email.
 `identity()` = `identity_offline()`; there is no network fallback
 (userinfo is only called by the CLI at login time).
 
-**Fingerprint.** `Login::fingerprint` (driver/mod.rs:23) is
-Claude-shaped: it hashes `/claudeAiOauth/refreshToken` and otherwise
-the whole blob. A Gemini envelope would hash the whole blob, which
-changes on every access-token refresh and would make every refresh
-look like a new account. Proposal: **move the pointer into the
-driver** — `Driver::fingerprint(&self, login: &Login) -> String`,
-Claude's impl unchanged, Gemini's hashing `/oauth_creds/refresh_token`
-(same `sha256:` / `sha256-full:` prefixes). 27 call sites in 11 files
-change from `login.fingerprint()` to `driver.fingerprint(&login)`;
-`Login::fingerprint` is deleted so no caller can pick the wrong one.
-This is the one **core** change the driver needs and it lands as its
-own task before the driver.
+**Fingerprint.** `Login::fingerprint` reads the refresh token through an
+ordered list of envelope pointers (`/claudeAiOauth/refreshToken`, then
+`/oauth_creds/refresh_token`), so a Gemini envelope keeps its fingerprint
+across access-token refreshes. Both envelopes are swapd's own formats, so
+core reads its own keys, never a provider's token. (Ruling 2026-09-10,
+replacing the earlier proposal to move the pointer into `Driver`: same
+behaviour, three lines instead of 27 call sites.)
 
 ## 5. Usage
 
@@ -221,7 +216,7 @@ token-shaped credential a user could paste (the pair is two files);
 
 ## 8. Core touchpoints (all small)
 
-1. `Driver::fingerprint` (§4) — the one refactor, its own task.
+1. `Login::fingerprint` gains the Gemini envelope pointer (§4).
 2. `driver::registry` / `provider_ids` add `"gemini"`; `config`
    validation picks it up for free.
 3. `paths.rs`: `refresh_lock_base` / `credentials_dir` / `profiles_dir`

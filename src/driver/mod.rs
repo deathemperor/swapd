@@ -17,17 +17,24 @@ pub struct Login {
 }
 
 impl Login {
-    /// Port of oauth.py:40-58: sha256 of `claudeAiOauth.refreshToken` when
-    /// present and non-empty, else sha256 of the raw bytes; empty bytes
-    /// fingerprint to "".
+    /// The refresh token's sha256 when the envelope carries one, else the
+    /// sha256 of the raw bytes; empty bytes fingerprint to "".
+    ///
+    /// Both pointers name keys of envelopes swapd itself writes (the Claude
+    /// envelope is Claude Code's blob plus `oauthAccount`; the Gemini envelope
+    /// is `{oauth_creds, google_account}`), so this is core reading its own
+    /// format, not a provider's token. A refresh token is the one member that
+    /// survives an access-token refresh, which is what makes it the identity
+    /// of a stored login across generations.
     pub fn fingerprint(&self) -> String {
+        const REFRESH_TOKEN_POINTERS: [&str; 2] =
+            ["/claudeAiOauth/refreshToken", "/oauth_creds/refresh_token"];
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.bytes) {
-            if let Some(token) = value
-                .pointer("/claudeAiOauth/refreshToken")
-                .and_then(|v| v.as_str())
-            {
-                if !token.is_empty() {
-                    return format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
+            for pointer in REFRESH_TOKEN_POINTERS {
+                if let Some(token) = value.pointer(pointer).and_then(|v| v.as_str()) {
+                    if !token.is_empty() {
+                        return format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
+                    }
                 }
             }
         }
@@ -381,6 +388,28 @@ mod tests {
         // printf 'rt-abc' | shasum -a 256
         let expected = "sha256:27b93a106171df007491f79034d9e4b1bdc0ab5743e7494e84622e6b7616d0cb";
         assert_eq!(login.fingerprint(), expected);
+    }
+
+    #[test]
+    fn fingerprint_uses_the_gemini_envelope_refresh_token() {
+        let login = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a1","refresh_token":"r-gem","expiry_date":1},"google_account":"you@example.com"}"#.to_string(),
+        };
+        let expected = format!("sha256:{}", hex::encode(Sha256::digest(b"r-gem")));
+        assert_eq!(login.fingerprint(), expected);
+        // An access-token-only refresh keeps the fingerprint.
+        let rotated = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a2","refresh_token":"r-gem","expiry_date":2},"google_account":"you@example.com"}"#.to_string(),
+        };
+        assert_eq!(rotated.fingerprint(), expected);
+    }
+
+    #[test]
+    fn fingerprint_of_a_gemini_envelope_without_a_refresh_token_is_the_full_hash() {
+        let login = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a1"},"google_account":null}"#.to_string(),
+        };
+        assert!(login.fingerprint().starts_with("sha256-full:"));
     }
 
     #[test]

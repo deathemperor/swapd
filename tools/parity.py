@@ -137,9 +137,27 @@ def _diff_window(prefix: str, cswap_win: dict | None, swapd_win: dict | None, ro
     if cswap_win is None and swapd_win is None:
         return
     _diff_pct(f"{prefix}.pct", (cswap_win or {}).get("pct"), (swapd_win or {}).get("pct"), rows)
-    _diff_scalar(
+    _diff_resets_at(
         f"{prefix}.resetsAt", (cswap_win or {}).get("resetsAt"), (swapd_win or {}).get("resetsAt"), rows
     )
+
+
+def _diff_resets_at(field: str, cswap_val, swapd_val, rows: list) -> None:
+    """`resetsAt` within one second is a match. The endpoint reports the
+    weekly reset with a sub-second fraction that lands either side of the hour
+    boundary from one fetch to the next (`…14:59:59.876` then `…15:00:00.045`),
+    so two engines that fetched at different moments disagree by a second at
+    seconds precision — swapd copies the value verbatim, per spec."""
+    if cswap_val is None or swapd_val is None:
+        verdict = "OK" if cswap_val == swapd_val else "MISMATCH"
+    else:
+        delta = abs(_epoch(cswap_val) - _epoch(swapd_val))
+        verdict = "OK" if delta <= 1.0 else "MISMATCH"
+    rows.append((field, cswap_val, swapd_val, verdict))
+
+
+def _epoch(normalized: str) -> float:
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00")).timestamp()
 
 
 def diff_account(cswap_row: dict, swapd_row: dict) -> list[tuple[str, object, object, str]]:

@@ -120,6 +120,21 @@ class DiffAccountTest(unittest.TestCase):
         row = next(r for r in rows if r[0] == "fiveHour.pct")
         self.assertEqual(row[3], "MISMATCH")
 
+    def test_resets_at_one_second_apart_is_ok(self):
+        # The endpoint's weekly reset straddles the hour boundary between fetches.
+        cswap = cswap_account()
+        cswap["usage"]["sevenDay"]["resetsAt"] = "2026-09-15T11:00:00Z"
+        rows = parity.diff_account(parity.map_cswap_account(cswap), parity.map_swapd_account(swapd_account()))
+        row = next(r for r in rows if r[0] == "sevenDay.resetsAt")
+        self.assertEqual(row[3], "OK")
+
+    def test_resets_at_two_seconds_apart_mismatches(self):
+        cswap = cswap_account()
+        cswap["usage"]["sevenDay"]["resetsAt"] = "2026-09-15T11:00:01Z"
+        rows = parity.diff_account(parity.map_cswap_account(cswap), parity.map_swapd_account(swapd_account()))
+        row = next(r for r in rows if r[0] == "sevenDay.resetsAt")
+        self.assertEqual(row[3], "MISMATCH")
+
     def test_resets_at_offset_vs_z_matches(self):
         cswap = cswap_account()
         cswap["usage"]["fiveHour"]["resetsAt"] = "2026-09-09T05:59:59+00:00"

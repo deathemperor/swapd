@@ -1582,13 +1582,18 @@ impl<'a> AutoEngine<'a> {
             return Ok(());
         }
         let slots = slots::load(&self.ctx.home, self.driver.id())?;
-        let mut released: Vec<(u32, String)> = Vec::new();
+        let mut released: Vec<(u32, String, &str)> = Vec::new();
         let mut moved: Vec<(u32, u32, Quarantine)> = Vec::new();
         for (key, entry) in &state.quarantine {
             let Ok(slot) = key.parse::<u32>() else {
                 continue;
             };
-            if self.stored_fingerprint(slot)? == entry.fingerprint {
+            // A slot with no row is never "unchanged", whatever its secret
+            // says: an absent secret and an entry recorded without a
+            // fingerprint both read `None` and would compare equal forever
+            // (#16).
+            let row_present = slots.slots.contains_key(&slot);
+            if row_present && self.stored_fingerprint(slot)? == entry.fingerprint {
                 continue;
             }
             // The scan below only runs here, on the rare mismatch path — the
@@ -1609,12 +1614,18 @@ impl<'a> AutoEngine<'a> {
                     continue;
                 }
             }
+            // No row and nowhere the credential went: the account is gone and
+            // the entry guards nothing.
+            if !row_present {
+                released.push((slot, String::new(), "account-removed"));
+                continue;
+            }
             let email = slots
                 .slots
                 .get(&slot)
                 .map(|s| s.email.clone())
                 .unwrap_or_default();
-            released.push((slot, email));
+            released.push((slot, email, "credentials-replaced"));
         }
         if released.is_empty() && moved.is_empty() {
             return Ok(());
@@ -1625,7 +1636,7 @@ impl<'a> AutoEngine<'a> {
             // is released, while the entry moving IN takes that same key), so
             // inserting first would have the release below delete the entry
             // that just moved onto it.
-            for (slot, _) in &released {
+            for (slot, _, _) in &released {
                 state.quarantine.remove(&slot.to_string());
             }
             for (old, _, _) in &moved {
@@ -1640,10 +1651,10 @@ impl<'a> AutoEngine<'a> {
                 "warning: quarantine for slot {old} followed its credential to slot {new_slot}"
             );
         }
-        for (slot, email) in released {
+        for (slot, email, reason) in released {
             self.emit(Event::Unquarantined {
                 account: SlotRef::numbered(slot, email),
-                reason: "credentials-replaced".to_string(),
+                reason: reason.to_string(),
             });
         }
         Ok(())

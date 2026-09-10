@@ -768,6 +768,39 @@ fn a_replaced_credential_releases_the_quarantine() {
     assert!(board.state().quarantine.is_empty());
 }
 
+/// A quarantine on a slot with neither a row nor a secret — the account was
+/// removed — is released on its own: the fingerprint comparison reads
+/// `None == None` there and would keep the entry forever (#16).
+#[test]
+fn a_removed_account_releases_its_quarantine() {
+    let board = Board::new();
+    board.set_state(&AutoState {
+        schema_version: 1,
+        quarantine: BTreeMap::from([(
+            "3".to_string(),
+            Quarantine {
+                reason: "invalid_grant".to_string(),
+                since: format_ts(T0).unwrap(),
+                fingerprint: None,
+            },
+        )]),
+        ..AutoState::default()
+    });
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    let released = board.last("account-unquarantined").unwrap();
+    assert_eq!(released["number"], 3);
+    assert_eq!(released["reason"], "account-removed");
+    assert!(board.state().quarantine.is_empty());
+}
+
 /// `add --slot n` can move an account with its secret (#3): the quarantine
 /// that condemned its credential generation must follow it to the new slot
 /// number instead of being dropped, or the dead lineage re-enters rotation

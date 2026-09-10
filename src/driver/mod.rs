@@ -2,6 +2,7 @@
 //! verbs resolve a provider through.
 
 pub mod claude;
+pub mod gemini;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

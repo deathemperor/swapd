@@ -188,7 +188,11 @@ impl GeminiDriver {
             &tmp,
             &Value::Object(envelope.oauth_creds.clone()).to_string(),
         )?;
-        fs::rename(&tmp, &creds_path)?;
+        if let Err(e) = fs::rename(&tmp, &creds_path) {
+            // Best effort: the rename's error is what gets reported either way.
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
 
         let accounts_path = paths::google_accounts(env)?;
         let mut accounts = read_optional(&accounts_path)?
@@ -370,11 +374,14 @@ mod tests {
         seed_live(home.path(), CREDS, Some(ACCOUNTS));
         let env = env_with(&home, []);
         fs::create_dir_all(paths::live_lock(&env).unwrap()).unwrap();
-        assert!(matches!(
-            GeminiDriver::for_tests()
-                .read_live_locked_with_timeout(&env, Duration::from_millis(200)),
-            Err(DriverError::Locked(_))
-        ));
+        match GeminiDriver::for_tests()
+            .read_live_locked_with_timeout(&env, Duration::from_millis(200))
+        {
+            Err(DriverError::Locked(msg)) => {
+                assert!(msg.starts_with("swapd holds "), "unexpected message: {msg}")
+            }
+            other => panic!("expected Locked, got {:?}", other.err()),
+        }
         // The unfenced read still answers.
         assert!(GeminiDriver::for_tests().read_live(&env).is_ok());
     }
@@ -395,6 +402,72 @@ mod tests {
         assert_eq!(
             GeminiDriver::for_tests().live_config_text(&env).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn write_live_removes_its_tmp_file_when_the_rename_fails() {
+        let home = temp_home();
+        seed_live(home.path(), CREDS, Some(ACCOUNTS));
+        let env = env_with(&home, []);
+        // Put a directory where the credential file belongs: `fs::rename` onto
+        // an existing directory fails (`IsADirectory`), portably on unix.
+        let creds_path = paths::oauth_creds(&env).unwrap();
+        fs::remove_file(&creds_path).unwrap();
+        fs::create_dir(&creds_path).unwrap();
+        let login = Login {
+            bytes: r#"{"oauth_creds":{"refresh_token":"rt-2"},"google_account":null}"#.to_string(),
+        };
+        assert!(GeminiDriver::for_tests().write_live(&env, &login).is_err());
+        let tmp = paths::gemini_dir(&env)
+            .unwrap()
+            .join(".oauth_creds.json.swapd-tmp");
+        assert!(
+            !tmp.exists(),
+            "the tmp file is cleaned up after a failed rename"
+        );
+    }
+
+    #[test]
+    fn write_live_rotates_old_only_when_the_account_changes() {
+        let home = temp_home();
+        seed_live(home.path(), CREDS, None);
+        fs::write(
+            home.path().join(".gemini").join("google_accounts.json"),
+            r#"{"active":"a@example.com","old":[]}"#,
+        )
+        .unwrap();
+        let env = env_with(&home, []);
+
+        let write = |account: &str| {
+            let bytes = format!(
+                r#"{{"oauth_creds":{{"refresh_token":"rt"}},"google_account":"{account}"}}"#
+            );
+            GeminiDriver::for_tests()
+                .write_live(&env, &Login { bytes })
+                .unwrap();
+        };
+        let old_field = || -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(paths::google_accounts(&env).unwrap()).unwrap(),
+            )
+            .unwrap()["old"]
+                .clone()
+        };
+
+        // Writing the account that is already active rotates nothing.
+        write("a@example.com");
+        assert_eq!(old_field(), serde_json::json!([]));
+
+        // Switching away rotates the outgoing account onto `old`.
+        write("b@example.com");
+        assert_eq!(old_field(), serde_json::json!(["a@example.com"]));
+
+        // Switching back rotates `b` in too, without re-adding `a`.
+        write("a@example.com");
+        assert_eq!(
+            old_field(),
+            serde_json::json!(["a@example.com", "b@example.com"])
         );
     }
 }

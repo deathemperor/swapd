@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -186,8 +187,16 @@ def build_diff(cswap_payload: dict, swapd_payload: dict) -> dict[str, list[tuple
     return diff
 
 
+# Parity is by definition the cswap-still-on flow: cswap owns the logins and
+# their single-use refresh grants, so every swapd subprocess here runs in
+# shadow (`SWAPD_SHADOW=1`: no refresh, no live-login write). An account whose
+# access token has expired reads `token-expired` on the swapd side until the
+# next export carries cswap's rotation — re-export before every run.
+_SWAPD_ENV = {**os.environ, "SWAPD_SHADOW": "1"}
+
+
 def _run_json(cmd: list[str]) -> dict:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=_SWAPD_ENV)
     if proc.returncode != 0:
         # Never relay stderr here: cswap's `list --json` never touches the
         # import file, but keeping the two failure paths identical means one
@@ -202,7 +211,12 @@ def _run_json(cmd: list[str]) -> dict:
 
 
 def _run_import(path: str) -> None:
-    proc = subprocess.run(["swapd", "import", path], capture_output=True, text=True)
+    # `-` relays this process's stdin, so `cswap export - | parity.py --import -`
+    # never puts a credentials file on disk.
+    stdin = sys.stdin.read() if path == "-" else None
+    proc = subprocess.run(
+        ["swapd", "import", path], input=stdin, capture_output=True, text=True, env=_SWAPD_ENV
+    )
     if proc.returncode != 0:
         # swapd import's error text can interpolate emails from the export
         # file (e.g. a duplicate-slot refusal) — never printed here.
@@ -230,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         "--import",
         dest="import_path",
         default=str(Path.home() / "swapd-import.json"),
-        help="export file to import before diffing (default ~/swapd-import.json)",
+        help="export file to import before diffing (default ~/swapd-import.json; `-` reads stdin)",
     )
     parser.add_argument("--no-import", action="store_true", help="skip the swapd import step")
     parser.add_argument("--json", action="store_true", help="print the diff as JSON instead of a table")

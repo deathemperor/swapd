@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod gemini;
+pub mod marker;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

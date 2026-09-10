@@ -134,14 +134,10 @@ refreshes. POST `retrieveUserQuota` with `{project, userAgent: "swapd/<version>"
 → `NeedsRefresh`; 429 → `Throttled { retry_after }` from the
 `RetryInfo.retryDelay` detail when present, else 60 s.
 
-**`project`.** The CLI passes the Code Assist project it resolved at
-login (`loadCodeAssist` → `cloudaicompanionProject`), which is not in
-`oauth_creds.json`. Two options: (a) call `loadCodeAssist` once per
-slot and cache the project id in the slot row (`slots.json` gains a
-provider-private `extra: {project}` field); (b) send an empty
-`project` and see what the server does. **(a)** is the proposal; the
-research did not test (b). *Open question for the user to confirm on
-a throwaway account.*
+**`project`.** `project` comes from one `loadCodeAssist` call per
+account, memoised in the driver for the process lifetime
+(`project_memo`); it is never persisted, so the slot row stays
+provider-neutral.
 
 Bucket → window mapping: one `Window` per bucket, `kind: Scoped`,
 `name: modelId` (or `tokenType` when `modelId` is absent), `pct = 100
@@ -259,12 +255,11 @@ provider (it is the user's own token).
 
 ## 10. Rulings on the two open questions (controller, under the user's "go")
 
-1. `project` for `retrieveUserQuota`: option (a) — one `loadCodeAssist`
-   call per slot, its `cloudaicompanionProject` cached in the slot row's
-   provider-private `extra.project`; the request shape is read from the
-   CLI source at `v0.46.0` during implementation. Option (b) is tried
-   first in the fixture test only as documentation of what an empty
-   `project` returns, never as the shipped path.
+1. `project` for `retrieveUserQuota`: one `loadCodeAssist` call per
+   account, its `cloudaicompanionProject` memoised in the driver
+   (`project_memo`) for the process lifetime, never in the slot row;
+   the request shape is read from the CLI source at `v0.46.0` during
+   implementation.
 2. `run` does not seed `trustedFolders.json`; `--skip-trust` only on
    `ignite`.
 3. Fixtures: until the user's captured files arrive, tests use synthetic

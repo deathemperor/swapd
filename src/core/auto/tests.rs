@@ -906,8 +906,8 @@ fn a_replaced_credential_is_still_released() {
 fn an_entry_without_a_fingerprint_is_released_not_moved() {
     let board = Board::new();
     // Slot 2's row is gone, but its secret happens to still be there (an
-    // orphan, as `slots::claim`'s doc says a crash can leave one) — any
-    // stored value at all mismatches a `None` entry.
+    // orphan, as `slots::claim`'s doc says a crash can leave one). A slot
+    // with no row is released whatever the secret says (#16).
     slots::update(&board.home().slots_file(), |file| {
         file.providers.get_mut("claude").unwrap().slots.remove(&2);
         Ok((true, ()))
@@ -956,7 +956,7 @@ fn an_entry_without_a_fingerprint_is_released_not_moved() {
 
     let released = board.last("account-unquarantined").unwrap();
     assert_eq!(released["number"], 2);
-    assert_eq!(released["reason"], "credentials-replaced");
+    assert_eq!(released["reason"], "account-removed", "no row: the account is gone (#16)");
     assert!(
         board.state().quarantine.is_empty(),
         "released, not re-keyed onto slot 3"

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::driver::claude::live::write_private_file;
 use crate::driver::gemini::live::{Envelope, OAUTH_PERSONAL};
-use crate::driver::gemini::{identity, usage, GeminiDriver};
+use crate::driver::gemini::{identity, oauth, usage, GeminiDriver};
 use crate::driver::marker;
 use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
 
@@ -162,8 +162,13 @@ pub fn run_profile(env: &Env, slot: u32, login: &Login) -> Result<RunProfile, Dr
         .to_string();
 
     let seeded = login.fingerprint();
+    // The marker alone is not enough: `ignite` refreshes without ever building
+    // a profile, and the caller marks the slot from there (`commit_profile`).
+    // The fingerprint is the refresh token, which a refresh keeps, so that
+    // marker matches this login exactly — only the empty directory says the
+    // credential was never written.
     let needs_seeding = match marker::read(&dir) {
-        Some(previous) => previous != seeded,
+        Some(previous) => previous != seeded || read_profile_login(&dir)?.is_none(),
         None => true,
     };
     if needs_seeding {
@@ -213,21 +218,52 @@ pub fn forget_profile(env: &Env, slot: u32) -> Result<(), DriverError> {
 /// synthesised so `auto`'s dead-strike logic needs no Gemini branch.
 const EXIT_AUTH_FAILED: i32 = 41;
 
+/// The usage call, refreshing once if it has to.
+///
+/// `usage` refuses a token inside google-auth-library's 5-minute skew buffer,
+/// while `cmd::login_to_run` refreshes only past the stated expiry — so for
+/// the last five minutes of every hour a perfectly good credential arrives
+/// here as `NeedsRefresh`. Answering 41 there would call a live account
+/// auth-dead (spec §7: 41 is `TokenDead`, or `NeedsRefresh` *after* a
+/// refresh). The rotation is reported whenever the refresh itself succeeded,
+/// including alongside a 41 — the token it replaced is already spent, and the
+/// caller persists `rotated` before it judges the exit code.
 pub fn ignite(
     driver: &GeminiDriver,
     _env: &Env,
     _slot: u32,
     login: &Login,
 ) -> Result<IgniteOutcome, DriverError> {
+    let dead = || {
+        Ok(IgniteOutcome {
+            exit_code: EXIT_AUTH_FAILED,
+            rotated: None,
+        })
+    };
     match usage::usage(driver, login) {
         Ok(_) => Ok(IgniteOutcome {
             exit_code: 0,
             rotated: None,
         }),
-        Err(DriverError::TokenDead | DriverError::NeedsRefresh) => Ok(IgniteOutcome {
-            exit_code: EXIT_AUTH_FAILED,
-            rotated: None,
-        }),
+        Err(DriverError::NeedsRefresh) => {
+            let refreshed = match oauth::refresh(&driver.endpoints, login) {
+                Ok(refreshed) => refreshed,
+                Err(DriverError::TokenDead) => return dead(),
+                // A throttled or unreachable token endpoint is not an answer
+                // about the credential; it propagates as the error it is.
+                Err(e) => return Err(e),
+            };
+            let exit_code = match usage::usage(driver, &refreshed) {
+                Ok(_) => 0,
+                Err(DriverError::TokenDead | DriverError::NeedsRefresh) => EXIT_AUTH_FAILED,
+                Err(e) => return Err(e),
+            };
+            Ok(IgniteOutcome {
+                exit_code,
+                rotated: Some(refreshed),
+            })
+        }
+        Err(DriverError::TokenDead) => dead(),
         Err(e) => Err(e),
     }
 }
@@ -369,6 +405,11 @@ mod tests {
             when.method(POST).path("/v1internal:retrieveUserQuota");
             then.status(200).body(include_str!("fixtures/quota.json"));
         });
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .body(include_str!("fixtures/token_invalid_grant.json"));
+        });
         let driver = GeminiDriver::new(GeminiEndpoints {
             oauth: server.base_url(),
             cloudcode: server.base_url(),
@@ -378,9 +419,59 @@ mod tests {
         let outcome = ignite(&driver, &env, 1, &login(4_102_444_800_000)).unwrap();
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.rotated.is_none());
-        // An expired login: 41, the CLI's FatalAuthenticationError code.
+        // An expired login whose refresh answers `invalid_grant`: 41, the
+        // CLI's FatalAuthenticationError code, and no rotation to persist.
         let outcome = ignite(&driver, &env, 1, &login(1_000)).unwrap();
         assert_eq!(outcome.exit_code, 41);
+        assert!(outcome.rotated.is_none());
+    }
+
+    #[test]
+    fn ignite_refreshes_an_expiring_login_once() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .body(include_str!("fixtures/token_refresh.json"));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .body(include_str!("fixtures/load_code_assist.json"));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:retrieveUserQuota");
+            then.status(200).body(include_str!("fixtures/quota.json"));
+        });
+        let driver = GeminiDriver::new(GeminiEndpoints {
+            oauth: server.base_url(),
+            cloudcode: server.base_url(),
+        });
+        let home = temp_home();
+        let env = env_with(&home, []);
+        let outcome = ignite(&driver, &env, 1, &login(1_000)).unwrap();
+        assert_eq!(outcome.exit_code, 0, "a refreshable login is not auth-dead");
+        let rotated = outcome.rotated.expect("the refresh is a rotation");
+        let v: serde_json::Value = serde_json::from_str(&rotated.bytes).unwrap();
+        assert_eq!(v["oauth_creds"]["access_token"], "at-2");
+        token.assert_hits(1);
+    }
+
+    #[test]
+    fn a_committed_profile_that_was_never_run_is_still_seeded() {
+        // `ignite` can rotate without ever building a profile, and the caller
+        // marks the slot from there. The marker matches (the fingerprint is
+        // the refresh token, which a refresh keeps), so only the empty
+        // directory says the profile still needs seeding.
+        let home = temp_home();
+        let env = env_with(&home, []);
+        commit_profile(&env, 7, &login(9_000)).unwrap();
+        let _ = run_profile(&env, 7, &login(9_000)).unwrap();
+        let creds = profile_dir(&env, 7)
+            .join(".gemini")
+            .join("oauth_creds.json");
+        assert!(creds.exists(), "the profile is seeded, not left empty");
     }
 
     #[test]

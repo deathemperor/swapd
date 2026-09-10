@@ -147,11 +147,20 @@ impl GeminiDriver {
     /// `read_live` under swapd's own live lock. `Locked` on timeout; a lock
     /// directory that cannot be created (read-only home) degrades to the
     /// unfenced read, as the Claude driver does.
+    ///
+    /// Taking the lock would `create_dir_all` its parent, so a machine with no
+    /// Gemini CLI at all is answered before that: a status verb must not
+    /// provision `~/.gemini/` for a tool the user never installed. The read
+    /// re-checks under the lock, so a credential appearing in between is still
+    /// read fenced.
     pub fn read_live_locked_with_timeout(
         &self,
         env: &Env,
         timeout: Duration,
     ) -> Result<Login, DriverError> {
+        if !paths::oauth_creds(env)?.exists() {
+            return Err(DriverError::NoLogin);
+        }
         let _guard = match take_live_lock(env, timeout) {
             Ok(guard) => guard,
             Err(DriverError::Io(e))
@@ -375,6 +384,20 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_locked_read_without_a_login_creates_no_directory() {
+        let home = temp_home();
+        let env = env_with(&home, []);
+        assert!(matches!(
+            GeminiDriver::for_tests().read_live_locked_with_timeout(&env, READ_TIMEOUT),
+            Err(DriverError::NoLogin)
+        ));
+        assert!(
+            !home.path().join(".gemini").exists(),
+            "a status verb provisions nothing for a CLI that is not installed"
+        );
     }
 
     #[test]

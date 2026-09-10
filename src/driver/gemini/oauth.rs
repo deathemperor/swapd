@@ -162,7 +162,7 @@ pub fn refresh(ep: &GeminiEndpoints, login: &Login) -> Result<Login, DriverError
         "expiry_date".to_string(),
         Value::from(now_ms() + (expires_in * 1000.0) as i64),
     );
-    for key in ["refresh_token", "id_token", "token_type"] {
+    for key in ["refresh_token", "id_token", "scope", "token_type"] {
         if let Some(v) = resp
             .get(key)
             .and_then(Value::as_str)
@@ -214,8 +214,12 @@ mod tests {
         );
         assert_eq!(v["oauth_creds"]["id_token"], "h.e30.s");
         assert_eq!(
-            v["oauth_creds"]["scope"], "openid",
-            "untouched members survive"
+            v["oauth_creds"]["scope"], "openid https://www.googleapis.com/auth/userinfo.email",
+            "the reply's scope is adopted"
+        );
+        assert_eq!(
+            v["oauth_creds"]["token_type"], "Bearer",
+            "untouched member survives (the reply omits it)"
         );
         assert_eq!(v["google_account"], "you@example.com");
         let expiry = v["oauth_creds"]["expiry_date"].as_i64().unwrap();

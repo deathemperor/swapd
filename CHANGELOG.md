@@ -18,3 +18,4 @@
 - Platforms: macOS, Linux, Windows.
 - `doctor` reports the live store, secrets backend, engine/auto lock state (with the daemon pid), profile dirs and the CLI version (#7).
 - unclaimed: a stashed login that matched no slot is recorded in a manifest, listed by `swapd unclaimed`, dropped with `--purge`, and carried by `export` (#2).
+- Gemini CLI accounts: `--provider gemini` for list, add, switch, refresh, ignite, run and auto, over the CLI's oauth-personal login.

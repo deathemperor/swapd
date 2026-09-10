@@ -223,6 +223,8 @@ struct ProviderStatus {
     installed: bool,
     path: Option<String>,
     version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 fn main() {
@@ -531,14 +533,34 @@ fn doctor(json: bool) -> Result<()> {
 
     let profiles = list_profiles(&home);
 
-    let (installed, path) = locate_claude(&home);
-    let version = path.as_deref().and_then(cli_version);
-    let providers = vec![ProviderStatus {
-        provider: "claude".to_string(),
-        installed,
-        path,
-        version,
-    }];
+    let providers = driver::registry(&env)
+        .iter()
+        .map(|d| {
+            let path = d.installed(&env).map(|p| p.to_string_lossy().into_owned());
+            let version = path.as_deref().and_then(cli_version);
+            let note = match d.id() {
+                "gemini"
+                    if env
+                        .vars
+                        .get("GEMINI_FORCE_ENCRYPTED_FILE_STORAGE")
+                        .is_some_and(|v| !v.is_empty()) =>
+                {
+                    Some(
+                        "GEMINI_FORCE_ENCRYPTED_FILE_STORAGE is set; encrypted credential storage is not supported"
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            };
+            ProviderStatus {
+                provider: d.id().to_string(),
+                installed: path.is_some(),
+                path,
+                version,
+                note,
+            }
+        })
+        .collect();
 
     let out = DoctorOutput {
         schema_version: output::SCHEMA_VERSION,
@@ -575,6 +597,9 @@ fn doctor(json: bool) -> Result<()> {
                 }
                 (Some(path), None) => println!("{}: installed ({})", p.provider, path),
                 (None, _) => println!("{}: not installed", p.provider),
+            }
+            if let Some(note) = &p.note {
+                println!("  note: {note}");
             }
         }
     }
@@ -702,16 +727,4 @@ fn cli_version(path: &str) -> Option<String> {
     stdout.read_to_string(&mut buf).ok()?;
     let first_line = buf.lines().next()?.trim();
     (!first_line.is_empty()).then(|| first_line.to_string())
-}
-
-/// Find the `claude` binary this environment would run.
-///
-/// The same `resolve_cli` the driver's `installed()` and its igniter use, fed
-/// the same kind of `Env`, so doctor cannot disagree with what a run would
-/// actually execute.
-fn locate_claude(home: &Home) -> (bool, Option<String>) {
-    match driver::claude::run::resolve_cli(&driver::Env::current(home)) {
-        Some(path) => (true, Some(path.to_string_lossy().into_owned())),
-        None => (false, None),
-    }
 }

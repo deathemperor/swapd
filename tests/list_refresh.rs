@@ -202,7 +202,10 @@ impl Fixture {
     }
 
     fn list(&self) -> serde_json::Value {
-        self.run(&["list", "--json"])
+        // This fixture only ever seeds Claude accounts; scope to it so the
+        // registry's other drivers (gemini) don't add a row this suite never
+        // set up.
+        self.run(&["--provider", "claude", "list", "--json"])
     }
 
     fn run(&self, args: &[&str]) -> serde_json::Value {

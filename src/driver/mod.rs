@@ -361,9 +361,10 @@ pub fn live_is_older(driver: &dyn Driver, live: &Login, stored: &Login) -> bool 
 /// one the verb's context carries, so nothing can answer from a different
 /// environment than the run uses.
 pub fn registry(env: &Env) -> Vec<Box<dyn Driver>> {
-    vec![Box::new(claude::live::ClaudeDriver::default_for_platform(
-        env,
-    ))]
+    vec![
+        Box::new(claude::live::ClaudeDriver::default_for_platform(env)),
+        Box::new(gemini::GeminiDriver::default_for_platform(env)),
+    ]
 }
 
 pub fn by_id(id: &str, env: &Env) -> Option<Box<dyn Driver>> {
@@ -375,7 +376,7 @@ pub fn by_id(id: &str, env: &Env) -> Option<Box<dyn Driver>> {
 /// validates `<provider>.<key>`) does not have to invent an `Env` to build a
 /// driver it will not use.
 pub fn provider_ids() -> &'static [&'static str] {
-    &["claude"]
+    &["claude", "gemini"]
 }
 
 #[cfg(test)]
@@ -452,9 +453,10 @@ mod tests {
         };
         let env = Env::current(&home);
         let drivers = registry(&env);
-        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers.len(), 2);
         assert_eq!(drivers[0].id(), "claude");
         assert!(by_id("claude", &env).is_some());
+        assert!(by_id("gemini", &env).is_some());
         assert!(by_id("codex", &env).is_none());
     }
 
@@ -471,6 +473,26 @@ mod tests {
             Caps {
                 ignite: true,
                 add_token: true,
+                prefer: true,
+                refresh: true,
+                run: true,
+            }
+        );
+    }
+
+    #[test]
+    fn gemini_supports_every_verb_but_add_token() {
+        let home = tempfile::TempDir::new().unwrap();
+        let env = Env {
+            home: home.path().to_path_buf(),
+            vars: Default::default(),
+        };
+        let caps = by_id("gemini", &env).unwrap().capabilities();
+        assert_eq!(
+            caps,
+            Caps {
+                ignite: true,
+                add_token: false,
                 prefer: true,
                 refresh: true,
                 run: true,

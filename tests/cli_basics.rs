@@ -3,14 +3,17 @@ use assert_cmd::Command;
 /// A `doctor --json` invocation with the same hermetic contract every other
 /// suite uses: a fresh `SWAPD_HOME`, `SWAPD_SECRETS=file`,
 /// `SWAPD_LIVE_STORE=file`, `HOME` pointed at a temp dir so a real
-/// `~/.claude*` is never read, and `CLAUDE_CONFIG_DIR` removed so a
-/// developer's own override can't leak in either.
+/// `~/.claude*` is never read, `CLAUDE_CONFIG_DIR` removed so a developer's
+/// own override can't leak in either, and `SWAPD_GEMINI_CLI` pointed at a
+/// path that doesn't exist so `doctor` never finds and runs a real `gemini`
+/// on a dev machine's PATH.
 fn doctor_cmd(home: &std::path::Path, claude_home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("swapd").unwrap();
     cmd.env("SWAPD_HOME", home)
         .env("SWAPD_SECRETS", "file")
         .env("SWAPD_LIVE_STORE", "file")
         .env("HOME", claude_home)
+        .env("SWAPD_GEMINI_CLI", home.join("no-such-gemini"))
         .env_remove("CLAUDE_CONFIG_DIR")
         .args(["doctor", "--json"]);
     cmd
@@ -48,10 +51,11 @@ fn doctor_reports_home_under_swapd_home() {
     let out = Command::cargo_bin("swapd")
         .unwrap()
         .env("SWAPD_HOME", tmp.path())
-        // `doctor` now runs `<cli> --version`; naming a path that doesn't
-        // exist keeps this test from finding and running the real `claude`
-        // on a dev machine's PATH.
+        // `doctor` now runs `<cli> --version`; naming paths that don't exist
+        // keeps this test from finding and running a real `claude` or
+        // `gemini` on a dev machine's PATH.
         .env("SWAPD_CLAUDE_CLI", tmp.path().join("no-such-claude"))
+        .env("SWAPD_GEMINI_CLI", tmp.path().join("no-such-gemini"))
         .args(["doctor", "--json"])
         .output()
         .unwrap();

@@ -5,11 +5,6 @@
 //! the network, `oauth` refreshes, `usage` asks Code Assist for quota (and is
 //! the igniter), `run` builds per-slot `GEMINI_CLI_HOME` profiles.
 
-// Nothing outside this module constructs GeminiDriver until Task 7 registers
-// it, so every item under here reads as dead code to a bin-only crate. Task 7
-// removes this line.
-#![allow(dead_code)]
-
 pub mod identity;
 pub mod live;
 pub mod oauth;

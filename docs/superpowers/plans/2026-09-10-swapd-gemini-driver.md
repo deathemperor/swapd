@@ -84,7 +84,7 @@ Ruling (controller, 2026-09-10): the spec proposed moving the fingerprint into `
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test --lib driver::tests::fingerprint_uses_the_gemini`
+Run: `cargo test driver::tests::fingerprint_uses_the_gemini`
 Expected: FAIL — the first assertion gets a `sha256-full:` value.
 
 - [ ] **Step 3: Implement**
@@ -125,7 +125,7 @@ Replace the body of `Login::fingerprint` with:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test --lib driver::tests`
+Run: `cargo test driver::tests`
 Expected: PASS, every pre-existing fingerprint test still green.
 
 - [ ] **Step 5: Amend the spec** — in the sub-spec's §4 replace the paragraph beginning "**Fingerprint.** `Login::fingerprint` (driver/mod.rs:23) is Claude-shaped" with:
@@ -391,7 +391,7 @@ mod tests {
 
 - [ ] **Step 3: Run to verify they fail**
 
-Run: `cargo test --lib driver::gemini`
+Run: `cargo test driver::gemini`
 Expected: compile errors (module missing).
 
 - [ ] **Step 4: Implement `paths.rs`**
@@ -764,7 +764,7 @@ For THIS task only, so the crate compiles before Tasks 3–6 land, create the fo
 
 - [ ] **Step 7: Run the tests**
 
-Run: `cargo test --lib driver::gemini`
+Run: `cargo test driver::gemini`
 Expected: PASS (paths + live tests).
 
 - [ ] **Step 8: Gates and commit**
@@ -841,7 +841,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — `cargo test --lib driver::gemini::identity` → FAIL/compile error.
+- [ ] **Step 2: Run to verify they fail** — `cargo test driver::gemini::identity` → FAIL/compile error.
 
 - [ ] **Step 3: Implement**
 
@@ -907,7 +907,7 @@ pub fn expires_at(login: &Login) -> Option<f64> {
 }
 ```
 
-- [ ] **Step 4: Run the tests** — `cargo test --lib driver::gemini` → PASS.
+- [ ] **Step 4: Run the tests** — `cargo test driver::gemini` → PASS.
 
 - [ ] **Step 5: Gates and commit**
 
@@ -934,7 +934,7 @@ git commit -m "gemini: identity from the cached account or the id_token, expiry 
 
 `token_refresh.json`:
 ```json
-{"access_token":"at-2","expires_in":3599,"scope":"openid https://www.googleapis.com/auth/userinfo.email","token_type":"Bearer","id_token":"h.e30.s"}
+{"access_token":"at-2","expires_in":3599,"scope":"openid https://www.googleapis.com/auth/userinfo.email","id_token":"h.e30.s"}
 ```
 `token_invalid_grant.json`:
 ```json
@@ -976,7 +976,8 @@ mod tests {
         assert_eq!(v["oauth_creds"]["access_token"], "at-2");
         assert_eq!(v["oauth_creds"]["refresh_token"], "rt-1", "kept from the input");
         assert_eq!(v["oauth_creds"]["id_token"], "h.e30.s");
-        assert_eq!(v["oauth_creds"]["scope"], "openid", "untouched members survive");
+        assert_eq!(v["oauth_creds"]["scope"], "openid https://www.googleapis.com/auth/userinfo.email", "the reply's scope is adopted");
+        assert_eq!(v["oauth_creds"]["token_type"], "Bearer", "a member the reply never mentions survives");
         assert_eq!(v["google_account"], "you@example.com");
         let expiry = v["oauth_creds"]["expiry_date"].as_i64().unwrap();
         assert!(expiry >= before + 3_599_000 && expiry <= now_ms() + 3_599_000);
@@ -1057,7 +1058,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run to verify they fail** — `cargo test --lib driver::gemini::oauth` → FAIL.
+- [ ] **Step 3: Run to verify they fail** — `cargo test driver::gemini::oauth` → FAIL.
 
 - [ ] **Step 4: Implement** — `src/http.rs` `base_url_from` match gains:
 
@@ -1221,7 +1222,7 @@ pub fn refresh(ep: &GeminiEndpoints, login: &Login) -> Result<Login, DriverError
 
 Replace the two `<copy verbatim from the source>` placeholders by fetching `https://raw.githubusercontent.com/google-gemini/gemini-cli/85b0c55c126a4992b51d140e357ae9db5f9c2d7f/packages/core/src/code_assist/oauth2.ts` (read-only, one `curl`) and copying `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. Do not paste either value anywhere but the two `const`s.
 
-- [ ] **Step 5: Run the tests** — `cargo test --lib driver::gemini` and `cargo test --lib http` → PASS.
+- [ ] **Step 5: Run the tests** — `cargo test driver::gemini` and `cargo test http` → PASS.
 
 - [ ] **Step 6: Gates and commit**
 
@@ -1370,7 +1371,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run to verify they fail** — `cargo test --lib driver::gemini::usage` → FAIL.
+- [ ] **Step 3: Run to verify they fail** — `cargo test driver::gemini::usage` → FAIL.
 
 - [ ] **Step 4: Implement**
 
@@ -1514,7 +1515,7 @@ pub fn usage(driver: &GeminiDriver, login: &Login) -> Result<Usage, DriverError>
 }
 ```
 
-- [ ] **Step 5: Run the tests** — `cargo test --lib driver::gemini` → PASS (`remainingAmount 180 / remainingFraction 0.9 = limit 200`, `used 20`).
+- [ ] **Step 5: Run the tests** — `cargo test driver::gemini` → PASS (`remainingAmount 180 / remainingFraction 0.9 = limit 200`, `used 20`).
 
 - [ ] **Step 6: Amend the spec §5** — replace the "**`project`.**" paragraph with: "`project` comes from one `loadCodeAssist` call per account, memoised in the driver for the process lifetime (`project_memo`); it is never persisted, so the slot row stays provider-neutral." Delete §8's mention of `slots.json` gaining a field (there is none).
 
@@ -1577,7 +1578,7 @@ pub fn write(dir: &Path, fingerprint: &str) -> Result<(), DriverError> {
 }
 ```
 
-In `src/driver/claude/run.rs` delete `SEED_MARKER`, `marker_path`, `read_marker`, `write_marker` and replace their uses with `crate::driver::marker::{read, write}` (keep the call sites' semantics: `read_marker(&dir)` → `marker::read(&dir)`, `write_marker(&dir, fp)` → `marker::write(&dir, fp)`). Confirm `read_marker`'s previous body did the same trim/filter (lines 400-407) — if it did not filter empty, keep the new behaviour and note it in the report. Run `cargo test --lib driver::claude::run` → PASS before going on.
+In `src/driver/claude/run.rs` delete `SEED_MARKER`, `marker_path`, `read_marker`, `write_marker` and replace their uses with `crate::driver::marker::{read, write}` (keep the call sites' semantics: `read_marker(&dir)` → `marker::read(&dir)`, `write_marker(&dir, fp)` → `marker::write(&dir, fp)`). Confirm `read_marker`'s previous body did the same trim/filter (lines 400-407) — if it did not filter empty, keep the new behaviour and note it in the report. Run `cargo test driver::claude::run` → PASS before going on.
 
 - [ ] **Step 2: Write the failing tests** at the end of `gemini/run.rs`:
 
@@ -1704,7 +1705,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run to verify they fail** — `cargo test --lib driver::gemini::run` → FAIL.
+- [ ] **Step 3: Run to verify they fail** — `cargo test driver::gemini::run` → FAIL.
 
 - [ ] **Step 4: Implement `gemini/run.rs`**
 
@@ -1905,7 +1906,7 @@ pub fn ignite(driver: &GeminiDriver, _env: &Env, _slot: u32, login: &Login) -> R
 }
 ```
 
-- [ ] **Step 5: Run the tests** — `cargo test --lib driver::gemini` and `cargo test --lib driver::claude::run` → PASS.
+- [ ] **Step 5: Run the tests** — `cargo test driver::gemini` and `cargo test driver::claude::run` → PASS.
 
 - [ ] **Step 6: Gates and commit**
 

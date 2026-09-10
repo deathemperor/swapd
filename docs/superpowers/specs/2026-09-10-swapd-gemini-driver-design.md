@@ -102,9 +102,14 @@ for `export --full`), `None` when absent.
 `false` — `GEMINI_API_KEY`/Vertex modes never appear in
 `oauth_creds.json`; they live in env vars and `settings.json`
 `security.auth.selectedType`, which swapd reads only to refuse
-(`selectedType != "oauth-personal"` → `NoLogin` with reason
-`auth-type-not-oauth`; a new reason string, same `NoLogin` class —
-listed as the contract addition in §8).
+(`selectedType != "oauth-personal"` → `NoLogin`, as does the encrypted
+store under `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE`). Both are the plain
+`NoLogin` class with no reason string: `list` without `--provider` fans
+out over every driver and gives up on the first hard error, so anything
+harsher blanks the Claude board of a user who merely runs the Gemini CLI
+on an API key. `doctor` carries the reason for both — a note naming the
+flag, or `"gemini is configured for <type> auth; only oauth-personal is
+managed"`.
 
 ## 4. Identity and fingerprint
 
@@ -217,8 +222,9 @@ token-shaped credential a user could paste (the pair is two files);
    validation picks it up for free.
 3. `paths.rs`: `refresh_lock_base` / `credentials_dir` / `profiles_dir`
    already take the provider; nothing new.
-4. `contract`: no new fields; one new `NoLogin` reason string,
-   `auth-type-not-oauth` (§3). `activeUnreadable` reasons are reused:
+4. `contract`: no new fields and no new reason string — the auth-type
+   and encrypted-store refusals are plain `NoLogin`, with `doctor`
+   carrying the reason (§3). `activeUnreadable` reasons are reused:
    a held `.swapd-live.lock` is swapd's own lock, so it reports
    `switch-in-progress`; `cli-busy` stays reserved for a CLI-owned
    lock (#8's definition), of which Gemini has none.

@@ -133,6 +133,57 @@ fn doctor_lists_gemini_and_flags_encrypted_storage() {
     assert!(claude.get("note").is_none() || claude["note"].is_null());
 }
 
+/// A machine whose Gemini CLI is on an API key has no login swapd manages —
+/// but `list` without `--provider` fans out over every driver, so anything
+/// harsher than `NoLogin` would take the Claude row down with it (B1).
+#[test]
+fn list_without_a_provider_survives_an_api_key_gemini() {
+    let home = TempDir::new().unwrap();
+    let gh = TempDir::new().unwrap();
+    let dir = gh.path().join(".gemini");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("settings.json"),
+        r#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#,
+    )
+    .unwrap();
+    let out = swapd(&home, &gh)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let list = json(&out.get_output().stdout);
+    let providers = list["providers"].as_array().unwrap();
+    assert!(
+        providers.iter().any(|p| p["provider"] == "claude"),
+        "the claude row survives"
+    );
+    let gemini = providers
+        .iter()
+        .find(|p| p["provider"] == "gemini")
+        .expect("gemini row");
+    assert!(
+        gemini.get("activeSlot").is_none() || gemini["activeSlot"].is_null(),
+        "no login swapd manages"
+    );
+
+    // `doctor` is where the reason surfaces.
+    let out = swapd(&home, &gh)
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let doc = json(&out.get_output().stdout);
+    let note = doc["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "gemini")
+        .expect("gemini row")["note"]
+        .as_str()
+        .expect("a note naming the auth type")
+        .to_string();
+    assert!(note.contains("gemini-api-key"), "unexpected note: {note}");
+}
+
 #[test]
 fn add_token_is_refused_for_gemini() {
     let home = TempDir::new().unwrap();

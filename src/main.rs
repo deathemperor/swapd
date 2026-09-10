@@ -538,6 +538,9 @@ fn doctor(json: bool) -> Result<()> {
         .map(|d| {
             let path = d.installed(&env).map(|p| p.to_string_lossy().into_owned());
             let version = path.as_deref().and_then(cli_version);
+            // Both Gemini notes explain the same symptom — `list` shows the
+            // provider with no login — which `read_live` reports as a plain
+            // `NoLogin` so it cannot take the other providers down with it.
             let note = match d.id() {
                 "gemini"
                     if env
@@ -550,6 +553,13 @@ fn doctor(json: bool) -> Result<()> {
                             .to_string(),
                     )
                 }
+                "gemini" => driver::gemini::live::selected_auth_type(&env)
+                    .ok()
+                    .flatten()
+                    .filter(|kind| kind != driver::gemini::live::OAUTH_PERSONAL)
+                    .map(|kind| {
+                        format!("gemini is configured for {kind} auth; only oauth-personal is managed")
+                    }),
                 _ => None,
             };
             ProviderStatus {

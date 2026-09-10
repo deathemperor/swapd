@@ -81,7 +81,8 @@ fn read_optional(path: &Path) -> Result<Option<String>, DriverError> {
 }
 
 /// `security.auth.selectedType` from the user settings, when the file says.
-fn selected_auth_type(env: &Env) -> Result<Option<String>, DriverError> {
+/// `doctor` reads it too, to say why a Gemini install reports no login.
+pub(crate) fn selected_auth_type(env: &Env) -> Result<Option<String>, DriverError> {
     let Some(text) = read_optional(&paths::settings(env)?)? else {
         return Ok(None);
     };
@@ -93,22 +94,25 @@ fn selected_auth_type(env: &Env) -> Result<Option<String>, DriverError> {
 }
 
 impl GeminiDriver {
-    /// The pair as an envelope. `NoLogin` when there is no credential file;
-    /// `Invalid("auth-type-not-oauth")` when the CLI is configured for another
-    /// auth mode; `Unsupported` under the encrypted-storage flag (#13 ruling 5).
+    /// The pair as an envelope. `NoLogin` for every install swapd manages no
+    /// login on: no credential file, another auth mode
+    /// (`selectedType != "oauth-personal"`), or the encrypted store
+    /// (#13 ruling 5) — spec §3. All three are one class on purpose: `list`
+    /// without `--provider` fans out over every driver and gives up on the
+    /// first hard error, so a harsher class here blanks the Claude board of a
+    /// user who merely runs the Gemini CLI on an API key. `doctor` is where
+    /// the reason surfaces.
     pub fn read_live(&self, env: &Env) -> Result<Login, DriverError> {
         if env
             .vars
             .get("GEMINI_FORCE_ENCRYPTED_FILE_STORAGE")
             .is_some_and(|v| !v.is_empty() && v != "false" && v != "0")
         {
-            return Err(DriverError::Unsupported(
-                "gemini encrypted credential storage (GEMINI_FORCE_ENCRYPTED_FILE_STORAGE)",
-            ));
+            return Err(DriverError::NoLogin);
         }
         if let Some(kind) = selected_auth_type(env)? {
             if kind != OAUTH_PERSONAL {
-                return Err(DriverError::Invalid("auth-type-not-oauth".to_string()));
+                return Err(DriverError::NoLogin);
             }
         }
         let Some(creds) = read_optional(&paths::oauth_creds(env)?)? else {
@@ -309,10 +313,15 @@ mod tests {
             r#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#,
         )
         .unwrap();
-        match GeminiDriver::for_tests().read_live(&env_with(&home, [])) {
-            Err(DriverError::Invalid(msg)) => assert_eq!(msg, "auth-type-not-oauth"),
-            other => panic!("expected auth-type-not-oauth, got {:?}", other.err()),
-        }
+        assert!(matches!(
+            GeminiDriver::for_tests().read_live(&env_with(&home, [])),
+            Err(DriverError::NoLogin)
+        ));
+        assert_eq!(
+            selected_auth_type(&env_with(&home, [])).unwrap().as_deref(),
+            Some("gemini-api-key"),
+            "doctor reads the reason from here"
+        );
     }
 
     #[test]
@@ -322,7 +331,7 @@ mod tests {
         let env = env_with(&home, [("GEMINI_FORCE_ENCRYPTED_FILE_STORAGE", "true")]);
         assert!(matches!(
             GeminiDriver::for_tests().read_live(&env),
-            Err(DriverError::Unsupported(_))
+            Err(DriverError::NoLogin)
         ));
     }
 

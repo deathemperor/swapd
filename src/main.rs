@@ -314,12 +314,14 @@ fn run(cli: &Cli) -> Result<()> {
             emit(&out, cli.json, || cmd::import::print_human(&out))
         }
         Command::Switch { ident } => {
+            refuse_in_shadow("switch")?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
             let out = cmd::switch::run(&ctx, driver.as_ref(), ident)?;
             emit(&out, cli.json, || cmd::switch::print_human(&out))
         }
         Command::Auto => {
+            refuse_in_shadow("auto")?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
             // The refusal is an EVENT on the stream, not an error envelope: a
@@ -331,12 +333,14 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Command::Ignite { ident } => {
+            refuse_in_shadow("ignite")?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
             let out = cmd::ignite::run(&ctx, driver.as_ref(), ident)?;
             emit(&out, cli.json, || cmd::ignite::print_human(&out))
         }
         Command::Run { ident, args } => {
+            refuse_in_shadow("run")?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
             // The child's code is the verb's: `swapd run` is a wrapper, and a
@@ -348,6 +352,7 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Command::Rotate { strategy } => {
+            refuse_in_shadow("rotate")?;
             // Parsed before the data dir is created: a bad strategy is a
             // rejected command, and a rejected command leaves nothing behind.
             let named = strategy
@@ -485,6 +490,21 @@ fn single_driver(cli: &Cli) -> Result<Box<dyn driver::Driver>> {
 
 /// The environment a driver is built from: swapd's home (resolved, not
 /// created) plus this process's variables, captured once.
+/// The verbs that write the live login are refused while `SWAPD_SHADOW` is
+/// set (`driver::Env::shadow`): the login belongs to another tool.
+fn refuse_in_shadow(verb: &str) -> Result<()> {
+    let value = std::env::var("SWAPD_SHADOW").ok();
+    if driver::shadow_flag(value.as_deref()) {
+        return Err(SwapdError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "`{verb}` is refused while SWAPD_SHADOW is set: another tool owns the live login; unset it first"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn env_snapshot() -> Result<driver::Env> {
     Ok(driver::Env::current(&Home::resolve()?))
 }

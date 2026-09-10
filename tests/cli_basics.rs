@@ -261,3 +261,32 @@ fn doctor_refuses_an_unknown_secrets_backend() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "invalid-input");
 }
+
+/// `SWAPD_SHADOW` makes every live-writing verb a rejected command: the login
+/// belongs to another tool for as long as the flag is set.
+#[test]
+fn switch_is_refused_while_swapd_shadow_is_set() {
+    let home = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("swapd")
+        .unwrap()
+        .env("SWAPD_HOME", home.path())
+        .env("SWAPD_SECRETS", "file")
+        .env("SWAPD_LIVE_STORE", "file")
+        .env("SWAPD_SHADOW", "1")
+        .env("HOME", claude_home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .args(["switch", "1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid-input");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("SWAPD_SHADOW"),
+        "{v}"
+    );
+}

@@ -350,7 +350,9 @@ pub fn prepare(
                 .is_some_and(|stored| crate::driver::live_is_older(provider, &live, stored));
             match (older, stored, stored_fingerprint) {
                 (true, Some(stored), fingerprint) => {
-                    heal_live = true;
+                    // In shadow the newer copy is still the one fetched with,
+                    // but the live store belongs to whoever owns the login.
+                    heal_live = !ctx.env.shadow();
                     (Some(stored), fingerprint)
                 }
                 (_, _, fingerprint) => {
@@ -776,6 +778,16 @@ fn fetch_one(
             record_success(ctx, st, claim, usage.windows)?;
             Ok(Fetched {
                 sentinel: None,
+                live_synced,
+            })
+        }
+        Err(DriverError::NeedsRefresh) if ctx.env.shadow() => {
+            // Shadow: the grant is another tool's to spend. Not a failed
+            // fetch — no strike, no backoff — the account is unmeasured until
+            // an import brings the owner's rotation, and says so.
+            ctx.store.release(&st.key, claim)?;
+            Ok(Fetched {
+                sentinel: Some(UsageStatus::TokenExpired),
                 live_synced,
             })
         }

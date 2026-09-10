@@ -755,3 +755,44 @@ fn the_active_slot_is_stale_while_claude_code_holds_its_own_locks() {
             .unwrap();
     assert!(slots["providers"]["claude"]["slots"]["2"]["fingerprint"].is_null());
 }
+
+/// `SWAPD_SHADOW=1` (phase 1, cswap still owning the logins): an expired
+/// credential is `token-expired` without a single request — the driver
+/// answers `NeedsRefresh` off `expiresAt`, and the refresh that would follow
+/// is the one thing shadow never does — and the live login is left
+/// byte-for-byte as it was.
+#[test]
+fn shadow_list_never_posts_a_refresh_or_writes_the_live_login() {
+    let fx = Fixture::new();
+    fx.write_login(1, EXPIRED_MS);
+    fx.write_login(2, EXPIRED_MS);
+    fx.write_live_login("two@example.com", "org-2", "tok-2", "rt-2", EXPIRED_MS);
+    let live_path = fx.claude_home.path().join(".claude/.credentials.json");
+    let live_before = std::fs::read_to_string(&live_path).unwrap();
+    let one = fx.usage_mock(1, 401, json!({"error": "expired"}));
+    let two = fx.usage_mock(2, 401, json!({"error": "expired"}));
+    let token = fx.server.mock(|when, then| {
+        when.method(POST).path("/v1/oauth/token");
+        then.status(200).json_body(json!({}));
+    });
+
+    let out = fx
+        .cmd()
+        .env("SWAPD_SHADOW", "1")
+        .args(["--provider", "claude", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(account(&payload, 1)["usageStatus"], "token-expired");
+    assert_eq!(account(&payload, 2)["usageStatus"], "token-expired");
+    one.assert_hits(0);
+    two.assert_hits(0);
+    token.assert_hits(0);
+    assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live_before);
+}

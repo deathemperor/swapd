@@ -708,3 +708,61 @@ fn a_failing_successor_re_read_cannot_fail_a_single_pass_collect() {
         "the fetch it failed after was still recorded: {rows}"
     );
 }
+
+/// `SWAPD_SHADOW`: the grant belongs to another tool. An expired credential
+/// is reported, never refreshed — a single-use refresh token spent here would
+/// kill the owner's copy — and the live store is never written.
+#[test]
+fn shadow_never_refreshes_an_expired_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+    ctx.env
+        .vars
+        .insert("SWAPD_SHADOW".to_string(), "1".to_string());
+    // Nothing usable: an ordinary pass would refresh rt-1 here.
+    let live = login_for("one@example.com", "rt-1");
+    let driver = FakeDriver::new(&live);
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert!(driver.refreshes.lock().unwrap().is_empty());
+    assert!(driver.writes.lock().unwrap().is_empty());
+    assert_eq!(driver.live_bytes().unwrap(), live);
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::TokenExpired);
+    // Unmeasured, not failed: no strike, no backoff, and the claim went back,
+    // so the next pass fetches it the moment the owner's rotation is imported.
+    driver.usable.lock().unwrap().insert("rt-1".to_string());
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+    assert!(driver.refreshes.lock().unwrap().is_empty());
+}
+
+/// The same flag on the heal path: the slot holds the newer generation, the
+/// live store the spent one, and in shadow the divergence is left alone.
+#[test]
+fn shadow_never_heals_the_live_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_for(dir.path());
+    ctx.env
+        .vars
+        .insert("SWAPD_SHADOW".to_string(), "1".to_string());
+    let stored = login_expiring("one@example.com", "rt-1", 2_000_000_000_000);
+    let live = login_expiring("one@example.com", "rt-0", 1_000_000_000_000);
+    ctx.secrets.set(&slot_key("claude", 1), &stored).unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        provider.insert(1, slot_row("one@example.com"));
+        provider.active_slot = Some(1);
+        Ok((true, ()))
+    })
+    .unwrap();
+    // The newer generation still serves usage: fetched with, nothing written.
+    let driver = FakeDriver::new(&live).usable("rt-1");
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert!(driver.writes.lock().unwrap().is_empty());
+    assert!(driver.refreshes.lock().unwrap().is_empty());
+    assert_eq!(driver.live_bytes().unwrap(), live);
+    assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+}

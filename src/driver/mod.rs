@@ -128,6 +128,18 @@ pub struct Env {
 }
 
 impl Env {
+    /// `SWAPD_SHADOW=1`: another tool (cswap, during phase 1) owns the live
+    /// login and the refresh grants. A refresh token is single-use, so a
+    /// refresh swapd made would kill that tool's copy; in shadow the
+    /// collector never refreshes and never writes the live store, and every
+    /// verb that would (`switch`, `auto`, `ignite`, `run`, `rotate`) is
+    /// refused. `list`, `refresh` and `import` still work, read-only toward
+    /// the endpoint: an expired credential reads `token-expired` until the
+    /// next import brings the owner's rotation.
+    pub fn shadow(&self) -> bool {
+        shadow_flag(self.vars.get("SWAPD_SHADOW").map(String::as_str))
+    }
+
     /// Snapshot the process environment.
     ///
     /// `vars_os`, not `vars`: the latter PANICS on a value that is not valid
@@ -150,6 +162,11 @@ impl Env {
 
 /// Reads a run profile's credential back after the child exits (see
 /// `RunProfile::read_back`).
+/// The `SWAPD_SHADOW` values that mean on (`Env::shadow`).
+pub fn shadow_flag(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true"))
+}
+
 pub type ReadBack = Box<dyn Fn() -> Result<Option<Login>, DriverError> + Send>;
 
 /// What one `ignite` run produced.

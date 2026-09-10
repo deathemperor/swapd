@@ -113,8 +113,19 @@ the provider's own login files (Claude Code's `.credentials.json`,
    `python3 tools/parity.py` — it re-runs the import, then diffs
    `swapd list --json --provider claude` against `cswap list --json`
    (usage percentages, reset times, active slot, alias) and exits 1 on
-   any mismatch.
-4. Point Infinitus at the swapd engine, in its Engines pane.
+   any mismatch. To keep the credentials off disk, pipe the export
+   straight through: `cswap export - | python3 tools/parity.py --import -`.
+4. While cswap is still the tool switching accounts, keep swapd in
+   shadow: `export SWAPD_SHADOW=1` (parity.py sets it on its own swapd
+   calls). A Claude refresh token is single-use, so a refresh swapd made
+   would kill cswap's copy of that account; in shadow, `list` and
+   `refresh` never refresh and never write Claude Code's live login, and
+   `switch`, `auto`, `ignite`, `run` and `rotate` are refused. An account
+   whose access token has expired reads `token-expired` on the swapd
+   side until the next export carries cswap's rotation, so re-export
+   before every parity run.
+5. Point Infinitus at the swapd engine, in its Engines pane, and unset
+   `SWAPD_SHADOW` once cswap is off.
 
 swapd never reads cswap's state directly. The only two touchpoints
 between the two tools are the export file you produce by hand and, only

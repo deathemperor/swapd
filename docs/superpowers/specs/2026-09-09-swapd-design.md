@@ -342,8 +342,9 @@ accepts cswap's `{"version":…, "accounts":[…]}` as provider `claude`.
    criterion: a week of parity on this Mac, the ignite fix live.
 2. **Rest of the verbs** (reorder, hold, alias, icon, prefer, remove,
    export, history, notify, doctor) and cutover: cswap off by default.
-3. **Codex driver** (sub-spec first). 4. **Kiro**. 5. **Gemini**.
-6. **Grok** (xAI official CLI). Each driver ships with its fixtures
+3. **Gemini driver** (sub-spec first; user ruling 2026-09-10 on #13:
+   the simplest store goes first). 4. **Codex**. 5. **Grok** (xAI
+   official CLI). 6. **Kiro** (last: closed source, best effort). Each driver ships with its fixtures
    and its Engines-pane row; the phone shows it through `windows`.
 
 ## 12. Out of scope

@@ -377,6 +377,38 @@ mod tests {
     }
 
     #[test]
+    fn read_back_treats_a_missing_baseline_expiry_as_older() {
+        // A login the CLI never dated: anything the profile holds afterwards
+        // is a later generation, and a profile still holding an undated
+        // credential is not.
+        let home = temp_home();
+        let env = env_with(&home, []);
+        let undated = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"at-1","refresh_token":"rt-1"},"google_account":"you@example.com"}"#.to_string(),
+        };
+        let profile = run_profile(&env, 5, &undated).unwrap();
+        let read_back = profile.read_back.as_ref().unwrap();
+        let creds = profile_dir(&env, 5)
+            .join(".gemini")
+            .join("oauth_creds.json");
+
+        fs::write(
+            &creds,
+            r#"{"access_token":"at-2","refresh_token":"rt-1","expiry_date":9000}"#,
+        )
+        .unwrap();
+        let rotated = read_back().unwrap().expect("any expiry beats none");
+        let v: serde_json::Value = serde_json::from_str(&rotated.bytes).unwrap();
+        assert_eq!(v["oauth_creds"]["access_token"], "at-2");
+
+        fs::write(&creds, r#"{"access_token":"at-3","refresh_token":"rt-1"}"#).unwrap();
+        assert!(
+            read_back().unwrap().is_none(),
+            "still undated: nothing to report as newer"
+        );
+    }
+
+    #[test]
     fn commit_and_forget_profile() {
         let home = temp_home();
         let env = env_with(&home, []);

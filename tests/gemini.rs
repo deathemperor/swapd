@@ -131,6 +131,21 @@ fn doctor_lists_gemini_and_flags_encrypted_storage() {
         .find(|p| p["provider"] == "claude")
         .expect("claude row");
     assert!(claude.get("note").is_none() || claude["note"].is_null());
+
+    // Without the flag there is nothing to report: the note is the reason a
+    // provider has no managed login, not a permanent label on the row.
+    let out = swapd(&home, &gh)
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let doc = json(&out.get_output().stdout);
+    let gemini = doc["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "gemini")
+        .expect("gemini row");
+    assert!(gemini.get("note").is_none() || gemini["note"].is_null());
 }
 
 /// A machine whose Gemini CLI is on an API key has no login swapd manages —

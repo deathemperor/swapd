@@ -160,15 +160,25 @@ pub fn windows_at(raw: &Value, fetched_at: f64) -> Vec<Window> {
 /// name; the sentinel `all` matches every scoped window the account reports).
 /// `spend` — pay-as-you-go extra-usage credits — is a separate axis and is
 /// deliberately excluded.
+///
+/// An account that reports NO account-wide window at all — the Gemini shape,
+/// one scoped bucket per model — is gated by every named bucket instead.
+/// Otherwise nothing gates it, `headroom` is `None` forever and `auto` can
+/// never judge it exhausted. A Claude reply always carries the 5-hour and
+/// 7-day windows, so this arm never fires for it and `models` narrows there
+/// exactly as before.
 pub fn relevant<'a>(windows: &'a [Window], models: &[String]) -> Vec<&'a Window> {
     let wanted: Vec<String> = models.iter().map(|m| m.to_lowercase()).collect();
     let match_all = wanted.iter().any(|m| m == "all");
+    let account_wide = windows
+        .iter()
+        .any(|w| matches!(w.kind, WindowKind::FiveHour | WindowKind::SevenDay));
     windows
         .iter()
         .filter(|w| match w.kind {
             WindowKind::FiveHour | WindowKind::SevenDay => true,
             WindowKind::Scoped => match &w.name {
-                Some(name) => match_all || wanted.contains(&name.to_lowercase()),
+                Some(name) => !account_wide || match_all || wanted.contains(&name.to_lowercase()),
                 None => false,
             },
             _ => false,
@@ -439,6 +449,43 @@ mod tests {
 
         // No window data at all is "unknown", not "wide open".
         assert_eq!(headroom(&[], &[]), None);
+    }
+
+    fn window(kind: WindowKind, name: Option<&str>, pct: f64) -> Window {
+        Window {
+            kind,
+            name: name.map(str::to_string),
+            pct,
+            resets_at: None,
+            pace: None,
+            used: None,
+            limit: None,
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn an_all_scoped_account_is_gated_by_every_named_bucket() {
+        // A provider whose usage call reports only per-model buckets (Gemini):
+        // with no account-wide window to gate on, every named bucket does.
+        let windows = vec![
+            window(WindowKind::Scoped, Some("gemini-2.5-pro"), 10.0),
+            window(WindowKind::Scoped, Some("gemini-2.5-flash"), 75.0),
+            window(WindowKind::Scoped, Some("CREDITS"), 40.0),
+        ];
+        assert_eq!(relevant(&windows, &[]).len(), 3);
+        assert_eq!(headroom(&windows, &[]), Some(25.0));
+    }
+
+    #[test]
+    fn models_still_narrow_an_account_with_a_five_hour_window() {
+        let windows = vec![
+            window(WindowKind::FiveHour, None, 10.0),
+            window(WindowKind::Scoped, Some("opus"), 90.0),
+            window(WindowKind::Scoped, Some("sonnet"), 50.0),
+        ];
+        assert_eq!(headroom(&windows, &[]), Some(90.0), "5h alone");
+        assert_eq!(headroom(&windows, &models(&["opus"])), Some(10.0));
     }
 
     #[test]

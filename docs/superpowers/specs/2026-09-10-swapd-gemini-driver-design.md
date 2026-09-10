@@ -155,6 +155,13 @@ buckets have no start, so the Gemini driver leaves `pace: None`. The Infinitus a
 `Scoped` windows by name (Claude's `opus` / `sonnet` scoped windows
 use the same path).
 
+**Which windows gate the account.** A Gemini reply carries no 5-hour
+and no 7-day window, so `usage::relevant` gates the account on every
+NAMED scoped bucket it reports — the `models` setting narrows only an
+account that has account-wide windows to fall back on. Without that
+rule a Gemini account's headroom is `None` forever and `auto` can
+never judge it exhausted.
+
 Cadence: the collector's usage cadence (spec §6) applies; the CLI's
 own 30 s throttle is a hint that anything faster is unwelcome.
 

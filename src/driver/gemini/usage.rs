@@ -98,7 +98,8 @@ pub fn fetch_quota(
 
 /// One `Scoped` window per named bucket. `pct` is used, not remaining;
 /// `used`/`limit` only when the server sent an amount to derive them from;
-/// no pace (a bucket has no start).
+/// no pace (a bucket has no start). A named bucket the server sent no
+/// remaining figures for at all reads as exhausted, not as absent.
 pub fn windows_at(raw: &Value) -> Vec<Window> {
     let mut out = Vec::new();
     let Some(buckets) = raw.get("buckets").and_then(Value::as_array) else {
@@ -121,7 +122,17 @@ pub fn windows_at(raw: &Value) -> Vec<Window> {
             .get("remainingAmount")
             .and_then(Value::as_str)
             .and_then(|s| s.parse::<f64>().ok());
-        let Some(remaining) = fraction else { continue };
+        // `retrieveUserQuota` is a protobuf-JSON endpoint, and proto3 JSON
+        // omits default-valued fields: the bucket with NO `remainingFraction`
+        // is the one that has none left, not one to be silently dropped —
+        // dropping it reports an exhausted account as having fewer windows.
+        // A positive `remainingAmount` with no fraction still cannot be
+        // placed (there is no limit to divide by), so that one is skipped.
+        let remaining = match (fraction, amount) {
+            (Some(fraction), _) => fraction,
+            (None, Some(amount)) if amount > 0.0 => continue,
+            (None, _) => 0.0,
+        };
         let pct = ((1.0 - remaining.clamp(0.0, 1.0)) * 100.0).clamp(0.0, 100.0);
         let (used, limit) = match amount {
             Some(amount) if remaining > 0.0 => {
@@ -232,6 +243,24 @@ mod tests {
             "tokenType names an unnamed-model bucket"
         );
         assert!((windows[2].pct - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_bucket_without_a_fraction_is_exhausted() {
+        let raw = serde_json::json!({"buckets": [
+            {"modelId": "gemini-2.5-pro", "resetTime": "2026-09-11T00:00:00Z"},
+            {"modelId": "x", "remainingAmount": "5"},
+        ]});
+        let windows = windows_at(&raw);
+        assert_eq!(windows.len(), 1, "the unplaceable bucket is dropped");
+        assert_eq!(windows[0].name.as_deref(), Some("gemini-2.5-pro"));
+        assert!((windows[0].pct - 100.0).abs() < 1e-9);
+        assert_eq!(windows[0].used, None);
+        assert_eq!(windows[0].limit, None);
+        assert_eq!(
+            windows[0].resets_at.as_deref(),
+            Some("2026-09-11T00:00:00Z")
+        );
     }
 
     #[test]

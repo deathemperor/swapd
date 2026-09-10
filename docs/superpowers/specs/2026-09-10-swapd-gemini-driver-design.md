@@ -1,6 +1,6 @@
 # swapd — Gemini CLI driver (sub-spec, 2026-09-10)
 
-**Status: rulings applied, awaiting the user's spec review.** Written
+**Status: approved by the user 2026-09-10 ("go").** Written
 from the research in swapd #11; the phase-2 decisions in #13 were
 ruled on by the user on 2026-09-10 and are folded in below. No plan,
 no code, until the user has reviewed this file. Every fact about the
@@ -262,10 +262,16 @@ provider (it is the user's own token).
   compare against; parity for this driver is the fixture suite.
 - Gates unchanged: fmt, clippy (both targets), test on three OSes.
 
-## 10. Open questions for the user
+## 10. Rulings on the two open questions (controller, under the user's "go")
 
-1. `project` for `retrieveUserQuota` (§5): confirm option (a) on a
-   throwaway account, or test (b).
-2. Whether `run` should seed `trustedFolders.json` for the profile so
-   a headless `run` in an untrusted cwd does not stop on the trust
-   prompt (proposal: no; `--skip-trust` only on `ignite`).
+1. `project` for `retrieveUserQuota`: option (a) — one `loadCodeAssist`
+   call per slot, its `cloudaicompanionProject` cached in the slot row's
+   provider-private `extra.project`; the request shape is read from the
+   CLI source at `v0.46.0` during implementation. Option (b) is tried
+   first in the fixture test only as documentation of what an empty
+   `project` returns, never as the shipped path.
+2. `run` does not seed `trustedFolders.json`; `--skip-trust` only on
+   `ignite`.
+3. Fixtures: until the user's captured files arrive, tests use synthetic
+   files built from the key names in #11; the captured files replace
+   them if the structure differs.

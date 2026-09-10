@@ -1,26 +1,24 @@
-# swapd — Gemini CLI driver (DRAFT sub-spec, 2026-09-10)
+# swapd — Gemini CLI driver (sub-spec, 2026-09-10)
 
-**Status: proposal, not approved.** Written from the research in
-swapd #11 and the phase-2 decision list in #13 while the user was
-away. It stops at the spec-review gate: no plan, no code, until the
-user has answered #13 and reviewed this file. Every fact about the
-CLI below is cited to `google-gemini/gemini-cli` at tag `v0.46.0`
-(the installed version) via #11; nothing here was read from the
-user's real `~/.gemini` beyond key names.
+**Status: rulings applied, awaiting the user's spec review.** Written
+from the research in swapd #11; the phase-2 decisions in #13 were
+ruled on by the user on 2026-09-10 and are folded in below. No plan,
+no code, until the user has reviewed this file. Every fact about the
+CLI is cited to `google-gemini/gemini-cli` at tag `v0.46.0` (the
+installed version) via #11; nothing here was read from the user's
+real `~/.gemini` beyond key names.
 
-## 0. Assumptions this draft makes about #13
+## 0. Rulings from #13 this spec rests on
 
-| #13 item | assumed answer | where it bites |
+| #13 item | ruling | where it lands |
 |---|---|---|
-| 1 igniter may cost money | **1a**: a metered call is acceptable *as the igniter*; the usage call is the igniter | §6, §7 |
-| 2 swapd-owned locks | **yes**: `read_live_locked`/`write_live` take a swapd-owned mkdir lock next to the CLI's credential file | §3 |
-| 3 identity without network | Gemini has `google_accounts.json`; nothing to decide | §4 |
-| 4 ordering | **Gemini first** (simplest store), ahead of Codex — an assumption; the spec's §11 order would need amending | — |
-| 9 quota window | **from `resetTime` only**, no hardcoded window; buckets map to `WindowKind::Scoped` named by `modelId` | §5 |
+| 1 igniter may cost money | yes; the usage call is the igniter | §6, §7 |
+| 2 swapd-owned locks | yes: `read_live_locked`/`write_live` take a swapd-owned mkdir lock next to the CLI's credential file | §3 |
+| 3 identity without network | `google_accounts.json`, `id_token` claims as fallback | §4 |
+| 4 ordering | Gemini first, then Codex, Grok, Kiro; the main spec's §11 is amended in the same commit | — |
+| 5 encrypted / keyring stores | refused with a clear error in the first cut; `doctor` lists it | §3, §10 |
+| 9 quota window | from `resetTime` only, no hardcoded window; buckets map to `WindowKind::Scoped` named by `modelId` | §5 |
 | 10 fixtures | captured by the user from a throwaway login on a throwaway `GEMINI_CLI_HOME`, structure only | §9 |
-
-If any of those answers change, the section it bites is rewritten;
-the rest stands.
 
 ## 1. Goal
 
@@ -79,14 +77,14 @@ bytes are an **envelope** (as for Claude, spec §5):
 `identity_offline` falls back to the `id_token` claims, §4).
 `Invalid` when `oauth_creds.json` is not a JSON object.
 `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE` set → `Unsupported` in this
-cut (matches the #13 item 5 recommendation for Codex keyring).
+cut (#13 ruling 5; `doctor` reports it).
 
 `read_live_locked(env)`: same read under a swapd-owned mkdir lock
 `<home>/.gemini/.swapd-live.lock` (stale after 60 s, the Claude
 driver's `locks.rs` handshake reused verbatim). The CLI does not take
 this lock — it exists so swapd's own writer (`switch`) and readers
 (`list`, the collector) never see the pair half-written, and the
-`Locked` degrade path in core keeps working. *Assumes #13 item 2.*
+`Locked` degrade path in core keeps working. (#13 ruling 2.)
 
 `write_live(env, login)`: under the same lock, write
 `oauth_creds.json` (tmp + rename, mode 600) then `google_accounts.json`
@@ -201,16 +199,17 @@ so the CLI never opens the auth picker; `trustedFolders.json` is not
 seeded (`--skip-trust` on ignite; `run` inherits the user's cwd and
 their trust answer is theirs to give).
 
-`ignite(env, slot, login)`: *under assumption 1a* the igniter is the
+`ignite(env, slot, login)`: under #13 ruling 1 the igniter is the
 **usage call** (`usage()` with a fresh-if-needed token), not a
 `gemini -p` turn: it costs no model tokens, exercises the same bearer
 token, and returns quota. `IgniteOutcome { exit_code: 0 | 41,
 rotated }` — 41 synthesised from `TokenDead`/`NeedsRefresh`-after-
 refresh so `auto`'s dead-strike logic (which keys on the exit code)
-needs no Gemini branch. If the user answers 1b (no metered calls),
-`ignite` becomes `gemini -p "." --skip-trust -o json` in the profile
-(one prompt is the whole turn; the CLI has no max-turns flag) and
-exit 41 is read straight off the child.
+needs no Gemini branch. (Had ruling 1 gone the other way,
+`ignite` would have been `gemini -p "." --skip-trust -o json` in the profile
+(one prompt is the whole turn; the CLI has no max-turns flag) with
+exit 41 read straight off the child — recorded so the alternative is
+not re-derived.)
 
 `forget_profile`: `remove_dir_all` of the profile dir; nothing lives
 outside it (no keychain migration on this store).
@@ -265,11 +264,8 @@ provider (it is the user's own token).
 
 ## 10. Open questions for the user
 
-1. #13 items 1, 2, 4, 9, 10 (assumed above).
-2. `project` for `retrieveUserQuota` (§5): confirm option (a) on a
+1. `project` for `retrieveUserQuota` (§5): confirm option (a) on a
    throwaway account, or test (b).
-3. Whether to support `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE` in the
-   first cut (proposal: `Unsupported`, listed in `doctor`).
-4. Whether `run` should seed `trustedFolders.json` for the profile so
+2. Whether `run` should seed `trustedFolders.json` for the profile so
    a headless `run` in an untrusted cwd does not stop on the trust
    prompt (proposal: no; `--skip-trust` only on `ignite`).

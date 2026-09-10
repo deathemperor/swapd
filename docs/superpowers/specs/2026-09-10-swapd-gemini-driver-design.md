@@ -51,6 +51,13 @@ Engines pane gains a row.
   `refresh_token, client_id, client_secret, grant_type=refresh_token`;
   the client id and the (deliberately public, installed-app) secret
   are constants in `packages/core/src/code_assist/oauth2.ts:76-85`.
+  swapd does NOT compile them in (a public repository must not carry
+  another product's OAuth client; GitHub push protection refuses it):
+  the driver reads the pair from the installed CLI's bundle — the one
+  `GOCSPX-` secret and the client id declared beside it — or from
+  `SWAPD_GEMINI_OAUTH_CLIENT_ID` / `SWAPD_GEMINI_OAUTH_CLIENT_SECRET`
+  (`SWAPD_GEMINI_BUNDLE_DIR` points tests at a synthetic bundle).
+  `doctor` notes an installed CLI whose bundle yields no client.
   A refresh response may **omit** `refresh_token` (PR #26924): the
   stored one is kept. Access tokens last ~1 h.
 - Igniter: `gemini -p "hi" --skip-trust` under `GEMINI_CLI_HOME`.
@@ -102,9 +109,14 @@ for `export --full`), `None` when absent.
 `false` — `GEMINI_API_KEY`/Vertex modes never appear in
 `oauth_creds.json`; they live in env vars and `settings.json`
 `security.auth.selectedType`, which swapd reads only to refuse
-(`selectedType != "oauth-personal"` → `NoLogin` with reason
-`auth-type-not-oauth`; a new reason string, same `NoLogin` class —
-listed as the contract addition in §8).
+(`selectedType != "oauth-personal"` → `NoLogin`, as does the encrypted
+store under `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE`). Both are the plain
+`NoLogin` class with no reason string: `list` without `--provider` fans
+out over every driver and gives up on the first hard error, so anything
+harsher blanks the Claude board of a user who merely runs the Gemini CLI
+on an API key. `doctor` carries the reason for both — a note naming the
+flag, or `"gemini is configured for <type> auth; only oauth-personal is
+managed"`.
 
 ## 4. Identity and fingerprint
 
@@ -117,18 +129,13 @@ matches on email alone when the org is empty, so slots key on email.
 `identity()` = `identity_offline()`; there is no network fallback
 (userinfo is only called by the CLI at login time).
 
-**Fingerprint.** `Login::fingerprint` (driver/mod.rs:23) is
-Claude-shaped: it hashes `/claudeAiOauth/refreshToken` and otherwise
-the whole blob. A Gemini envelope would hash the whole blob, which
-changes on every access-token refresh and would make every refresh
-look like a new account. Proposal: **move the pointer into the
-driver** — `Driver::fingerprint(&self, login: &Login) -> String`,
-Claude's impl unchanged, Gemini's hashing `/oauth_creds/refresh_token`
-(same `sha256:` / `sha256-full:` prefixes). 27 call sites in 11 files
-change from `login.fingerprint()` to `driver.fingerprint(&login)`;
-`Login::fingerprint` is deleted so no caller can pick the wrong one.
-This is the one **core** change the driver needs and it lands as its
-own task before the driver.
+**Fingerprint.** `Login::fingerprint` reads the refresh token through an
+ordered list of envelope pointers (`/claudeAiOauth/refreshToken`, then
+`/oauth_creds/refresh_token`), so a Gemini envelope keeps its fingerprint
+across access-token refreshes. Both envelopes are swapd's own formats, so
+core reads its own keys, never a provider's token. (Ruling 2026-09-10,
+replacing the earlier proposal to move the pointer into `Driver`: same
+behaviour, three lines instead of 27 call sites.)
 
 ## 5. Usage
 
@@ -139,14 +146,10 @@ refreshes. POST `retrieveUserQuota` with `{project, userAgent: "swapd/<version>"
 → `NeedsRefresh`; 429 → `Throttled { retry_after }` from the
 `RetryInfo.retryDelay` detail when present, else 60 s.
 
-**`project`.** The CLI passes the Code Assist project it resolved at
-login (`loadCodeAssist` → `cloudaicompanionProject`), which is not in
-`oauth_creds.json`. Two options: (a) call `loadCodeAssist` once per
-slot and cache the project id in the slot row (`slots.json` gains a
-provider-private `extra: {project}` field); (b) send an empty
-`project` and see what the server does. **(a)** is the proposal; the
-research did not test (b). *Open question for the user to confirm on
-a throwaway account.*
+**`project`.** `project` comes from one `loadCodeAssist` call per
+account, memoised in the driver for the process lifetime
+(`project_memo`); it is never persisted, so the slot row stays
+provider-neutral.
 
 Bucket → window mapping: one `Window` per bucket, `kind: Scoped`,
 `name: modelId` (or `tokenType` when `modelId` is absent), `pct = 100
@@ -158,6 +161,13 @@ does it in `usage::windows_at` from the window's start); Gemini
 buckets have no start, so the Gemini driver leaves `pace: None`. The Infinitus adapter already renders
 `Scoped` windows by name (Claude's `opus` / `sonnet` scoped windows
 use the same path).
+
+**Which windows gate the account.** A Gemini reply carries no 5-hour
+and no 7-day window, so `usage::relevant` gates the account on every
+NAMED scoped bucket it reports — the `models` setting narrows only an
+account that has account-wide windows to fall back on. Without that
+rule a Gemini account's headroom is `None` forever and `auto` can
+never judge it exhausted.
 
 Cadence: the collector's usage cadence (spec §6) applies; the CLI's
 own 30 s throttle is a hint that anything faster is unwelcome.
@@ -221,13 +231,14 @@ token-shaped credential a user could paste (the pair is two files);
 
 ## 8. Core touchpoints (all small)
 
-1. `Driver::fingerprint` (§4) — the one refactor, its own task.
+1. `Login::fingerprint` gains the Gemini envelope pointer (§4).
 2. `driver::registry` / `provider_ids` add `"gemini"`; `config`
    validation picks it up for free.
 3. `paths.rs`: `refresh_lock_base` / `credentials_dir` / `profiles_dir`
    already take the provider; nothing new.
-4. `contract`: no new fields; one new `NoLogin` reason string,
-   `auth-type-not-oauth` (§3). `activeUnreadable` reasons are reused:
+4. `contract`: no new fields and no new reason string — the auth-type
+   and encrypted-store refusals are plain `NoLogin`, with `doctor`
+   carrying the reason (§3). `activeUnreadable` reasons are reused:
    a held `.swapd-live.lock` is swapd's own lock, so it reports
    `switch-in-progress`; `cli-busy` stays reserved for a CLI-owned
    lock (#8's definition), of which Gemini has none.
@@ -264,12 +275,11 @@ provider (it is the user's own token).
 
 ## 10. Rulings on the two open questions (controller, under the user's "go")
 
-1. `project` for `retrieveUserQuota`: option (a) — one `loadCodeAssist`
-   call per slot, its `cloudaicompanionProject` cached in the slot row's
-   provider-private `extra.project`; the request shape is read from the
-   CLI source at `v0.46.0` during implementation. Option (b) is tried
-   first in the fixture test only as documentation of what an empty
-   `project` returns, never as the shipped path.
+1. `project` for `retrieveUserQuota`: one `loadCodeAssist` call per
+   account, its `cloudaicompanionProject` memoised in the driver
+   (`project_memo`) for the process lifetime, never in the slot row;
+   the request shape is read from the CLI source at `v0.46.0` during
+   implementation.
 2. `run` does not seed `trustedFolders.json`; `--skip-trust` only on
    `ignite`.
 3. Fixtures: until the user's captured files arrive, tests use synthetic

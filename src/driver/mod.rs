@@ -2,6 +2,8 @@
 //! verbs resolve a provider through.
 
 pub mod claude;
+pub mod gemini;
+pub mod marker;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,17 +19,24 @@ pub struct Login {
 }
 
 impl Login {
-    /// Port of oauth.py:40-58: sha256 of `claudeAiOauth.refreshToken` when
-    /// present and non-empty, else sha256 of the raw bytes; empty bytes
-    /// fingerprint to "".
+    /// The refresh token's sha256 when the envelope carries one, else the
+    /// sha256 of the raw bytes; empty bytes fingerprint to "".
+    ///
+    /// Both pointers name keys of envelopes swapd itself writes (the Claude
+    /// envelope is Claude Code's blob plus `oauthAccount`; the Gemini envelope
+    /// is `{oauth_creds, google_account}`), so this is core reading its own
+    /// format, not a provider's token. A refresh token is the one member that
+    /// survives an access-token refresh, which is what makes it the identity
+    /// of a stored login across generations.
     pub fn fingerprint(&self) -> String {
+        const REFRESH_TOKEN_POINTERS: [&str; 2] =
+            ["/claudeAiOauth/refreshToken", "/oauth_creds/refresh_token"];
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.bytes) {
-            if let Some(token) = value
-                .pointer("/claudeAiOauth/refreshToken")
-                .and_then(|v| v.as_str())
-            {
-                if !token.is_empty() {
-                    return format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
+            for pointer in REFRESH_TOKEN_POINTERS {
+                if let Some(token) = value.pointer(pointer).and_then(|v| v.as_str()) {
+                    if !token.is_empty() {
+                        return format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
+                    }
                 }
             }
         }
@@ -352,9 +361,10 @@ pub fn live_is_older(driver: &dyn Driver, live: &Login, stored: &Login) -> bool 
 /// one the verb's context carries, so nothing can answer from a different
 /// environment than the run uses.
 pub fn registry(env: &Env) -> Vec<Box<dyn Driver>> {
-    vec![Box::new(claude::live::ClaudeDriver::default_for_platform(
-        env,
-    ))]
+    vec![
+        Box::new(claude::live::ClaudeDriver::default_for_platform(env)),
+        Box::new(gemini::GeminiDriver::default_for_platform(env)),
+    ]
 }
 
 pub fn by_id(id: &str, env: &Env) -> Option<Box<dyn Driver>> {
@@ -366,7 +376,7 @@ pub fn by_id(id: &str, env: &Env) -> Option<Box<dyn Driver>> {
 /// validates `<provider>.<key>`) does not have to invent an `Env` to build a
 /// driver it will not use.
 pub fn provider_ids() -> &'static [&'static str] {
-    &["claude"]
+    &["claude", "gemini"]
 }
 
 #[cfg(test)]
@@ -381,6 +391,28 @@ mod tests {
         // printf 'rt-abc' | shasum -a 256
         let expected = "sha256:27b93a106171df007491f79034d9e4b1bdc0ab5743e7494e84622e6b7616d0cb";
         assert_eq!(login.fingerprint(), expected);
+    }
+
+    #[test]
+    fn fingerprint_uses_the_gemini_envelope_refresh_token() {
+        let login = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a1","refresh_token":"r-gem","expiry_date":1},"google_account":"you@example.com"}"#.to_string(),
+        };
+        let expected = format!("sha256:{}", hex::encode(Sha256::digest(b"r-gem")));
+        assert_eq!(login.fingerprint(), expected);
+        // An access-token-only refresh keeps the fingerprint.
+        let rotated = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a2","refresh_token":"r-gem","expiry_date":2},"google_account":"you@example.com"}"#.to_string(),
+        };
+        assert_eq!(rotated.fingerprint(), expected);
+    }
+
+    #[test]
+    fn fingerprint_of_a_gemini_envelope_without_a_refresh_token_is_the_full_hash() {
+        let login = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a1"},"google_account":null}"#.to_string(),
+        };
+        assert!(login.fingerprint().starts_with("sha256-full:"));
     }
 
     #[test]
@@ -421,9 +453,10 @@ mod tests {
         };
         let env = Env::current(&home);
         let drivers = registry(&env);
-        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers.len(), 2);
         assert_eq!(drivers[0].id(), "claude");
         assert!(by_id("claude", &env).is_some());
+        assert!(by_id("gemini", &env).is_some());
         assert!(by_id("codex", &env).is_none());
     }
 
@@ -440,6 +473,26 @@ mod tests {
             Caps {
                 ignite: true,
                 add_token: true,
+                prefer: true,
+                refresh: true,
+                run: true,
+            }
+        );
+    }
+
+    #[test]
+    fn gemini_supports_every_verb_but_add_token() {
+        let home = tempfile::TempDir::new().unwrap();
+        let env = Env {
+            home: home.path().to_path_buf(),
+            vars: Default::default(),
+        };
+        let caps = by_id("gemini", &env).unwrap().capabilities();
+        assert_eq!(
+            caps,
+            Caps {
+                ignite: true,
+                add_token: false,
                 prefer: true,
                 refresh: true,
                 run: true,

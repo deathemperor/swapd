@@ -69,11 +69,6 @@ pub const AUTH_OVERRIDE_ENV_VARS: [&str; 5] = [
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 ];
 
-/// Records the fingerprint of the credential swapd last seeded into a profile,
-/// so a later launch can tell "never seeded" and "seeded something else" from
-/// "already holds this login, possibly rotated past it".
-const SEED_MARKER: &str = ".swapd-seeded";
-
 /// One `claude -p` run is a real model turn: it can sit in a queue, so the
 /// budget is generous. It is bounded all the same — an igniter that never
 /// returns would wedge the verb that called it.
@@ -285,13 +280,13 @@ pub fn run_profile(
     if needs_seeding(driver, &profile_env, &dir, &seeded)? {
         live::write_credentials_file(&profile_env, &credential)?;
         seed_profile_config(env, &profile_env, oauth_account)?;
-        write_marker(&dir, &seeded)?;
+        crate::driver::marker::write(&dir, &seeded)?;
     }
 
     // What the profile is known to hold going in. The marker wins when it
     // disagrees with the passed login: the profile may have rotated past it, and
     // that rotation is what the read-back is for.
-    let baseline = read_marker(&dir).unwrap_or(seeded);
+    let baseline = crate::driver::marker::read(&dir).unwrap_or(seeded);
 
     let read_driver = ClaudeDriver::new(driver.store.clone(), driver.endpoints.clone());
     let read_env = env.clone();
@@ -376,7 +371,7 @@ fn needs_seeding(
     // Marker from another credential lineage: whatever the profile holds is not
     // this login's, so it is not a rotation of it — it is a slot re-pointed at a
     // different account, and the profile has to follow.
-    if read_marker(dir).is_some_and(|previous| previous != seeded) {
+    if crate::driver::marker::read(dir).is_some_and(|previous| previous != seeded) {
         return Ok(true);
     }
     // An unreadable keychain answers "has material": re-seeding over a profile
@@ -391,23 +386,6 @@ fn needs_seeding(
         Err(_) => true,
     };
     Ok(!has_material)
-}
-
-fn marker_path(dir: &Path) -> PathBuf {
-    dir.join(SEED_MARKER)
-}
-
-fn read_marker(dir: &Path) -> Option<String> {
-    fs::read_to_string(marker_path(dir))
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
-/// Record what the profile now holds. A fingerprint is a hash, not a secret, but
-/// it sits beside the credential and inherits its mode.
-fn write_marker(dir: &Path, fingerprint: &str) -> Result<(), DriverError> {
-    live::write_private_file(&marker_path(dir), fingerprint)
 }
 
 /// The profile's credential if Claude Code rotated past `baseline`, else `None`.
@@ -441,7 +419,7 @@ fn rotated_login(
 /// has, so the profile keeps the newer one and the next run hands it back again
 /// — the rotation survives a failed persist instead of being seeded over.
 pub fn commit_profile(env: &Env, slot: u32, login: &Login) -> Result<(), DriverError> {
-    write_marker(&profile_dir(env, slot), &login.fingerprint())
+    crate::driver::marker::write(&profile_dir(env, slot), &login.fingerprint())
 }
 
 impl ClaudeDriver {
@@ -1016,7 +994,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         assert_eq!(
-            fs::read_to_string(dir.join(SEED_MARKER)).unwrap(),
+            fs::read_to_string(dir.join(crate::driver::marker::MARKER)).unwrap(),
             login().fingerprint()
         );
     }
@@ -1345,7 +1323,7 @@ mod tests {
         // it ahead of the store the moment a persist failed.
         let dir = env.home.join("profiles/claude/8");
         assert_eq!(
-            fs::read_to_string(dir.join(SEED_MARKER)).unwrap(),
+            fs::read_to_string(dir.join(crate::driver::marker::MARKER)).unwrap(),
             login().fingerprint()
         );
 
@@ -1366,7 +1344,7 @@ mod tests {
         // Once the caller HAS stored it, it says so, and the marker follows.
         commit_profile(&env, 8, &rotated).unwrap();
         assert_eq!(
-            fs::read_to_string(dir.join(SEED_MARKER)).unwrap(),
+            fs::read_to_string(dir.join(crate::driver::marker::MARKER)).unwrap(),
             rotated.fingerprint()
         );
         assert!(ignite(&driver, &env, 8, &rotated)
@@ -1416,7 +1394,10 @@ mod tests {
         // The marker stays on the generation the store holds until the caller
         // has stored this one; a retry before that reads the rotation back
         // rather than seeding the spent token over it.
-        let marker = env.home.join("profiles/claude/5").join(SEED_MARKER);
+        let marker = env
+            .home
+            .join("profiles/claude/5")
+            .join(crate::driver::marker::MARKER);
         assert_eq!(fs::read_to_string(&marker).unwrap(), login().fingerprint());
         commit_profile(&env, 5, &rotated).unwrap();
         assert_eq!(fs::read_to_string(&marker).unwrap(), rotated.fingerprint());

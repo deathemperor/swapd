@@ -3,7 +3,7 @@
 [![CI](https://github.com/deathemperor/swapd/actions/workflows/ci.yml/badge.svg)](https://github.com/deathemperor/swapd/actions/workflows/ci.yml)
 
 swapd is a multi-provider account switcher for AI coding CLIs (Claude Code
-today; Codex, Kiro, Gemini and Grok are planned). It tracks a fleet of
+and Gemini CLI today; Codex, Kiro and Grok are planned). It tracks a fleet of
 logins per provider, polls each one's usage, and switches the CLI's live
 login when a policy says to — by hand (`switch`, `rotate`) or unattended
 (`auto`). Every verb speaks `--json`, so swapd is as usable as a library

@@ -22,6 +22,8 @@ pub fn base_url_from(name: &str, get: impl Fn(&str) -> Option<String>) -> String
     match env_key.as_str() {
         "SWAPD_URL_ANTHROPIC_API" => "https://api.anthropic.com".to_string(),
         "SWAPD_URL_PLATFORM" => "https://platform.claude.com".to_string(),
+        "SWAPD_URL_GOOGLE_OAUTH" => "https://oauth2.googleapis.com".to_string(),
+        "SWAPD_URL_CLOUDCODE" => "https://cloudcode-pa.googleapis.com".to_string(),
         _ => name.to_string(),
     }
 }
@@ -44,6 +46,14 @@ mod tests {
         assert_eq!(
             base_url_from("platform", |_| None),
             "https://platform.claude.com"
+        );
+        assert_eq!(
+            base_url_from("google-oauth", |_| None),
+            "https://oauth2.googleapis.com"
+        );
+        assert_eq!(
+            base_url_from("cloudcode", |_| None),
+            "https://cloudcode-pa.googleapis.com"
         );
     }
 

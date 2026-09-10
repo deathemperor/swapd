@@ -13,6 +13,9 @@ use crate::driver::gemini::{identity, GeminiDriver};
 use crate::driver::{DriverError, Login, Usage};
 use crate::http;
 
+/// What swapd calls itself to Code Assist, and on the wire (`http::agent`).
+pub const USER_AGENT: &str = concat!("swapd/", env!("CARGO_PKG_VERSION"));
+
 pub fn load_url(ep: &GeminiEndpoints) -> String {
     format!(
         "{}/v1internal:loadCodeAssist",
@@ -91,7 +94,10 @@ pub fn fetch_quota(
     post(
         quota_url(ep),
         access_token,
-        &json!({"project": project, "userAgent": "swapd/0.1"}),
+        // Both this and the HTTP `User-Agent` (`http::agent`) carry the crate
+        // version: the release workflow bumps `Cargo.toml`, and a literal here
+        // would go stale at the first bump without anything noticing.
+        &json!({"project": project, "userAgent": USER_AGENT}),
         "retrieveUserQuota",
     )
 }
@@ -278,7 +284,11 @@ mod tests {
             when.method(POST)
                 .path("/v1internal:retrieveUserQuota")
                 .header("authorization", "Bearer at-1")
-                .json_body_partial(r#"{"project":"projects-123"}"#);
+                .header("user-agent", USER_AGENT)
+                .json_body_partial(
+                    serde_json::json!({"project": "projects-123", "userAgent": USER_AGENT})
+                        .to_string(),
+                );
             then.status(200).body(include_str!("fixtures/quota.json"));
         });
         let driver = driver(&server);

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub fn agent(timeout_s: u64) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
-        .user_agent("swapd/0.1")
+        .user_agent(concat!("swapd/", env!("CARGO_PKG_VERSION")))
         .timeout_global(Some(Duration::from_secs(timeout_s)))
         .build();
     ureq::Agent::new_with_config(config)

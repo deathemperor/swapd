@@ -151,12 +151,18 @@ fn doctor_lists_gemini_and_flags_encrypted_storage() {
 /// A machine whose Gemini CLI is on an API key has no login swapd manages —
 /// but `list` without `--provider` fans out over every driver, so anything
 /// harsher than `NoLogin` would take the Claude row down with it (B1).
+///
+/// The credential file is left in place on purpose: a user who signed in once
+/// and then switched to an API key is the realistic case, and it is the only
+/// one that reaches the auth-type check — a home with no `oauth_creds.json`
+/// at all is answered `NoLogin` before the read (S4).
 #[test]
 fn list_without_a_provider_survives_an_api_key_gemini() {
     let home = TempDir::new().unwrap();
     let gh = TempDir::new().unwrap();
     let dir = gh.path().join(".gemini");
     fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("oauth_creds.json"), CREDS_A).unwrap();
     fs::write(
         dir.join("settings.json"),
         r#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#,

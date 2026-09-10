@@ -51,6 +51,13 @@ Engines pane gains a row.
   `refresh_token, client_id, client_secret, grant_type=refresh_token`;
   the client id and the (deliberately public, installed-app) secret
   are constants in `packages/core/src/code_assist/oauth2.ts:76-85`.
+  swapd does NOT compile them in (a public repository must not carry
+  another product's OAuth client; GitHub push protection refuses it):
+  the driver reads the pair from the installed CLI's bundle — the one
+  `GOCSPX-` secret and the client id declared beside it — or from
+  `SWAPD_GEMINI_OAUTH_CLIENT_ID` / `SWAPD_GEMINI_OAUTH_CLIENT_SECRET`
+  (`SWAPD_GEMINI_BUNDLE_DIR` points tests at a synthetic bundle).
+  `doctor` notes an installed CLI whose bundle yields no client.
   A refresh response may **omit** `refresh_token` (PR #26924): the
   stored one is kept. Access tokens last ~1 h.
 - Igniter: `gemini -p "hi" --skip-trust` under `GEMINI_CLI_HOME`.

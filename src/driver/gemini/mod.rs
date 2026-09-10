@@ -25,6 +25,10 @@ use crate::driver::{
 
 pub struct GeminiDriver {
     pub endpoints: oauth::GeminiEndpoints,
+    /// Where the OAuth client comes from; resolved on first refresh and kept
+    /// for the driver's lifetime (`client_memo`).
+    pub client_source: oauth::ClientSource,
+    pub(crate) client_memo: Mutex<Option<oauth::OauthClient>>,
     /// `email -> cloudaicompanionProject`, learned from `loadCodeAssist` once
     /// per process (the daemon is long-lived; a status verb pays one extra
     /// request). Never persisted.
@@ -32,25 +36,45 @@ pub struct GeminiDriver {
 }
 
 impl GeminiDriver {
-    pub fn new(endpoints: oauth::GeminiEndpoints) -> Self {
+    pub fn new(endpoints: oauth::GeminiEndpoints, client_source: oauth::ClientSource) -> Self {
         Self {
             endpoints,
+            client_source,
+            client_memo: Mutex::new(None),
             project_memo: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn default_for_platform(env: &Env) -> Self {
-        Self::new(oauth::GeminiEndpoints::from_env(env))
+        Self::new(
+            oauth::GeminiEndpoints::from_env(env),
+            oauth::ClientSource::from_env(env),
+        )
+    }
+
+    /// The OAuth client a refresh sends, found once per driver.
+    pub fn oauth_client(&self) -> Result<oauth::OauthClient, DriverError> {
+        if let Some(client) = self.client_memo.lock().ok().and_then(|m| m.clone()) {
+            return Ok(client);
+        }
+        let client = self.client_source.resolve()?;
+        if let Ok(mut memo) = self.client_memo.lock() {
+            *memo = Some(client.clone());
+        }
+        Ok(client)
     }
 
     /// A driver whose endpoints are unreachable loopback addresses: for tests
     /// that only exercise `paths`/`live` and never make a request.
     #[cfg(test)]
     pub fn for_tests() -> Self {
-        Self::new(oauth::GeminiEndpoints {
-            oauth: "http://127.0.0.1:1".into(),
-            cloudcode: "http://127.0.0.1:1".into(),
-        })
+        Self::new(
+            oauth::GeminiEndpoints {
+                oauth: "http://127.0.0.1:1".into(),
+                cloudcode: "http://127.0.0.1:1".into(),
+            },
+            oauth::ClientSource::for_tests(),
+        )
     }
 }
 
@@ -81,7 +105,7 @@ impl Driver for GeminiDriver {
         identity::expires_at(login)
     }
     fn refresh(&self, login: &Login) -> Result<Login, DriverError> {
-        oauth::refresh(&self.endpoints, login)
+        oauth::refresh(&self.endpoints, &self.oauth_client()?, login)
     }
     fn usage(&self, login: &Login) -> Result<Usage, DriverError> {
         usage::usage(self, login)

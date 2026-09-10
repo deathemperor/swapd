@@ -1,19 +1,227 @@
 //! Google OAuth for the Gemini CLI's "oauth-personal" login: the token
-//! endpoint the CLI's `google-auth-library` client uses, with the CLI's own
-//! installed-app client (gemini-cli v0.46.0 `code_assist/oauth2.ts:76-92`).
-//! The client secret is public by Google's installed-app model; it is still
-//! never logged, printed or exported.
+//! endpoint the CLI's `google-auth-library` client uses, as the CLI's own
+//! installed-app OAuth client.
+//!
+//! The client id and secret are NOT compiled in. Google's installed-app model
+//! makes them public (they ship in every gemini-cli bundle), but a public
+//! repository must not carry another product's OAuth client, and GitHub's
+//! push protection refuses one. swapd reads them from the installed CLI's
+//! bundle instead — the bytes the CLI itself would send — or from
+//! `SWAPD_GEMINI_OAUTH_CLIENT_ID` / `SWAPD_GEMINI_OAUTH_CLIENT_SECRET`. They
+//! are never logged, printed or exported.
+
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::driver::gemini::live::Envelope;
+use crate::driver::gemini::run;
 use crate::driver::{DriverError, Env, Login};
 use crate::http;
 
-/// `OAUTH_CLIENT_ID` from oauth2.ts:76-77 at the pinned commit.
-const CLIENT_ID: &str = "REDACTED-CLIENT-ID.apps.googleusercontent.com";
-/// `OAUTH_CLIENT_SECRET` from oauth2.ts:85 at the pinned commit.
-const CLIENT_SECRET: &str = "GOCSPX-REDACTED";
+/// The CLI's OAuth client: what `client_id` / `client_secret` the token
+/// endpoint expects. No `Debug`: it holds the secret.
+#[derive(Clone)]
+pub struct OauthClient {
+    pub id: String,
+    pub secret: String,
+}
+
+/// Where a driver looks for its OAuth client, captured at construction
+/// (values, never a hidden environment read): an explicit pair from the
+/// environment wins; else the CLI's bundle directory, scanned on first use.
+#[derive(Clone, Default)]
+pub struct ClientSource {
+    pub explicit: Option<OauthClient>,
+    pub bundle_dir: Option<PathBuf>,
+}
+
+pub const CLIENT_ID_ENV: &str = "SWAPD_GEMINI_OAUTH_CLIENT_ID";
+pub const CLIENT_SECRET_ENV: &str = "SWAPD_GEMINI_OAUTH_CLIENT_SECRET";
+/// Points at a directory of `*.js` to scan instead of the installed CLI's.
+pub const BUNDLE_DIR_ENV: &str = "SWAPD_GEMINI_BUNDLE_DIR";
+
+impl ClientSource {
+    pub fn from_env(env: &Env) -> Self {
+        let explicit = match (env.vars.get(CLIENT_ID_ENV), env.vars.get(CLIENT_SECRET_ENV)) {
+            (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some(OauthClient {
+                id: id.clone(),
+                secret: secret.clone(),
+            }),
+            _ => None,
+        };
+        let bundle_dir = env
+            .vars
+            .get(BUNDLE_DIR_ENV)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| bundle_dir_of(&run::resolve_cli(env)?));
+        Self {
+            explicit,
+            bundle_dir,
+        }
+    }
+
+    /// A synthetic client for tests: no bundle is ever scanned.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self {
+            explicit: Some(OauthClient {
+                id: "id-1.apps.googleusercontent.com".to_string(),
+                secret: "GOCSPX-test".to_string(),
+            }),
+            bundle_dir: None,
+        }
+    }
+
+    /// The client this source yields, scanning the bundle when it has to.
+    pub fn resolve(&self) -> Result<OauthClient, DriverError> {
+        if let Some(client) = &self.explicit {
+            return Ok(client.clone());
+        }
+        match &self.bundle_dir {
+            Some(dir) => client_from_bundle(dir),
+            None => Err(DriverError::Unsupported(NOT_FOUND)),
+        }
+    }
+}
+
+/// What every "no client" path reports; `doctor` prints the same words.
+pub const NOT_FOUND: &str =
+    "gemini oauth client not found: install the Gemini CLI, or set SWAPD_GEMINI_OAUTH_CLIENT_ID and SWAPD_GEMINI_OAUTH_CLIENT_SECRET";
+
+/// The directory holding the CLI's JavaScript bundle, from the `gemini`
+/// executable: npm's `bin/gemini` is a symlink into
+/// `…/@google/gemini-cli/bundle/gemini.js`, so the resolved file's parent is
+/// the bundle. Windows' `gemini.cmd` shim is a file next to
+/// `node_modules/`, so that layout is tried second.
+pub fn bundle_dir_of(cli: &Path) -> Option<PathBuf> {
+    let resolved = fs::canonicalize(cli).ok()?;
+    if resolved.extension().is_some_and(|e| e == "js") {
+        return resolved.parent().map(Path::to_path_buf);
+    }
+    let dir = resolved.parent()?;
+    let candidates = [
+        dir.join("node_modules")
+            .join("@google")
+            .join("gemini-cli")
+            .join("bundle"),
+        dir.join("..")
+            .join("lib")
+            .join("node_modules")
+            .join("@google")
+            .join("gemini-cli")
+            .join("bundle"),
+    ];
+    candidates.into_iter().find(|c| c.is_dir())
+}
+
+/// A `doctor` note when the installed CLI's bundle yields no client.
+pub fn client_note(env: &Env) -> Option<String> {
+    let source = ClientSource::from_env(env);
+    match source.resolve() {
+        Ok(_) => None,
+        Err(_) if source.bundle_dir.is_some() => Some(
+            "no oauth client found in the Gemini CLI's bundle; refresh needs SWAPD_GEMINI_OAUTH_CLIENT_ID and SWAPD_GEMINI_OAUTH_CLIENT_SECRET"
+                .to_string(),
+        ),
+        Err(_) => None,
+    }
+}
+
+/// Scan the bundle's `*.js` files (largest first) for the CLI's OAuth client:
+/// the one `GOCSPX-…` installed-app secret, and the
+/// `….apps.googleusercontent.com` client id nearest to it in the same file
+/// (the source declares them together; a second id in the bundle belongs
+/// to another flow). Ambiguity — two distinct secrets — is an error, not a
+/// guess.
+pub fn client_from_bundle(dir: &Path) -> Result<OauthClient, DriverError> {
+    let mut files: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+        .map_err(|_| DriverError::Unsupported(NOT_FOUND))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "js"))
+        .filter_map(|p| Some((fs::metadata(&p).ok()?.len(), p)))
+        .collect();
+    files.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+    for (_, path) in files {
+        let Ok(bytes) = fs::read(&path) else { continue };
+        if let Some(client) = client_in(&bytes)? {
+            return Ok(client);
+        }
+    }
+    Err(DriverError::Unsupported(NOT_FOUND))
+}
+
+const SECRET_PREFIX: &[u8] = b"GOCSPX-";
+const ID_SUFFIX: &[u8] = b".apps.googleusercontent.com";
+
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while from + needle.len() <= hay.len() {
+        match hay[from..].windows(needle.len()).position(|w| w == needle) {
+            Some(i) => {
+                out.push(from + i);
+                from += i + 1;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// `Ok(None)` when the file carries no secret; `Err` when it carries two.
+fn client_in(bytes: &[u8]) -> Result<Option<OauthClient>, DriverError> {
+    let mut secrets: Vec<(usize, String)> = Vec::new();
+    for start in find_all(bytes, SECRET_PREFIX) {
+        let mut end = start + SECRET_PREFIX.len();
+        while end < bytes.len() && is_token_byte(bytes[end]) {
+            end += 1;
+        }
+        if end > start + SECRET_PREFIX.len() {
+            let value = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+            if !secrets.iter().any(|(_, s)| *s == value) {
+                secrets.push((start, value));
+            }
+        }
+    }
+    let (secret_at, secret) = match secrets.len() {
+        0 => return Ok(None),
+        1 => secrets.remove(0),
+        _ => {
+            return Err(DriverError::Invalid(
+                "gemini bundle carries more than one oauth client secret".to_string(),
+            ))
+        }
+    };
+    let mut nearest: Option<(usize, String)> = None;
+    for suffix_at in find_all(bytes, ID_SUFFIX) {
+        let mut start = suffix_at;
+        while start > 0 && is_token_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == suffix_at {
+            continue;
+        }
+        let id = String::from_utf8_lossy(&bytes[start..suffix_at + ID_SUFFIX.len()]).into_owned();
+        let distance = start.abs_diff(secret_at);
+        if nearest.as_ref().is_none_or(|(d, _)| distance < *d) {
+            nearest = Some((distance, id));
+        }
+    }
+    match nearest {
+        Some((_, id)) => Ok(Some(OauthClient { id, secret })),
+        None => Err(DriverError::Invalid(
+            "gemini bundle carries a secret but no client id".to_string(),
+        )),
+    }
+}
 
 pub const REFRESH_TIMEOUT_S: u64 = 20;
 pub const READ_TIMEOUT_S: u64 = 15;
@@ -98,7 +306,11 @@ fn form_encode(pairs: &[(&str, &str)]) -> String {
 /// A reply without `refresh_token` keeps the stored one (rotation is not
 /// guaranteed — gemini-cli PR #26924). Untouched members of `oauth_creds`
 /// survive; `google_account` is carried over.
-pub fn refresh(ep: &GeminiEndpoints, login: &Login) -> Result<Login, DriverError> {
+pub fn refresh(
+    ep: &GeminiEndpoints,
+    client: &OauthClient,
+    login: &Login,
+) -> Result<Login, DriverError> {
     let mut envelope = Envelope::parse(&login.bytes)
         .map_err(|_| DriverError::Http("refresh: malformed credential".to_string()))?;
     let refresh_token = envelope
@@ -110,8 +322,8 @@ pub fn refresh(ep: &GeminiEndpoints, login: &Login) -> Result<Login, DriverError
         .to_string();
     let body = form_encode(&[
         ("refresh_token", refresh_token.as_str()),
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+        ("client_id", client.id.as_str()),
+        ("client_secret", client.secret.as_str()),
         ("grant_type", "refresh_token"),
     ]);
     let response = http::agent(REFRESH_TIMEOUT_S)
@@ -179,6 +391,10 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
 
+    fn client() -> OauthClient {
+        ClientSource::for_tests().explicit.unwrap()
+    }
+
     fn endpoints(server: &MockServer) -> GeminiEndpoints {
         GeminiEndpoints {
             oauth: server.base_url(),
@@ -199,12 +415,13 @@ mod tests {
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body_contains("grant_type=refresh_token")
                 .body_contains("refresh_token=rt-1")
-                .body_contains("client_id=");
+                .body_contains("client_id=id-1.apps.googleusercontent.com")
+                .body_contains("client_secret=GOCSPX-test");
             then.status(200)
                 .body(include_str!("fixtures/token_refresh.json"));
         });
         let before = now_ms();
-        let rotated = refresh(&endpoints(&server), &login()).unwrap();
+        let rotated = refresh(&endpoints(&server), &client(), &login()).unwrap();
         mock.assert();
         let v: serde_json::Value = serde_json::from_str(&rotated.bytes).unwrap();
         assert_eq!(v["oauth_creds"]["access_token"], "at-2");
@@ -234,7 +451,7 @@ mod tests {
             then.status(200)
                 .body(r#"{"access_token":"at-2","expires_in":10,"refresh_token":"rt-2"}"#);
         });
-        let rotated = refresh(&endpoints(&server), &login()).unwrap();
+        let rotated = refresh(&endpoints(&server), &client(), &login()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rotated.bytes).unwrap();
         assert_eq!(v["oauth_creds"]["refresh_token"], "rt-2");
     }
@@ -248,7 +465,7 @@ mod tests {
                 .body(include_str!("fixtures/token_invalid_grant.json"));
         });
         assert!(matches!(
-            refresh(&endpoints(&server), &login()),
+            refresh(&endpoints(&server), &client(), &login()),
             Err(DriverError::TokenDead)
         ));
     }
@@ -260,7 +477,7 @@ mod tests {
             when.method(POST).path("/token");
             then.status(429).header("Retry-After", "7");
         });
-        match refresh(&endpoints(&server), &login()) {
+        match refresh(&endpoints(&server), &client(), &login()) {
             Err(DriverError::Throttled { retry_after }) => assert_eq!(retry_after, Some(7.0)),
             other => panic!("{:?}", other.err()),
         }
@@ -270,7 +487,7 @@ mod tests {
             then.status(500);
         });
         assert!(matches!(
-            refresh(&endpoints(&server), &login()),
+            refresh(&endpoints(&server), &client(), &login()),
             Err(DriverError::Http(_))
         ));
     }
@@ -286,7 +503,7 @@ mod tests {
             bytes: r#"{"oauth_creds":{"access_token":"a"},"google_account":null}"#.to_string(),
         };
         assert!(matches!(
-            refresh(&endpoints(&server), &login),
+            refresh(&endpoints(&server), &client(), &login),
             Err(DriverError::TokenDead)
         ));
         mock.assert_hits(0);
@@ -326,5 +543,105 @@ mod tests {
         let plain = GeminiEndpoints::from_env(&crate::driver::gemini::tests::env_with(&home, []));
         assert_eq!(plain.oauth, "https://oauth2.googleapis.com");
         assert_eq!(plain.cloudcode, "https://cloudcode-pa.googleapis.com");
+    }
+
+    #[test]
+    fn the_bundle_scan_pairs_the_secret_with_its_nearest_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("decoy.js"),
+            "x=\"1111-aaaa.apps.googleusercontent.com\";",
+        )
+        .unwrap();
+        let mut big = String::from("y=\"2222-bbbb.apps.googleusercontent.com\";");
+        big.push_str(&"/* filler */".repeat(2000));
+        big.push_str("z=\"3333-cccc.apps.googleusercontent.com\";s=\"GOCSPX-abc_DEF-123\";");
+        std::fs::write(dir.path().join("chunk.js"), big).unwrap();
+        let client = client_from_bundle(dir.path()).unwrap();
+        assert_eq!(client.id, "3333-cccc.apps.googleusercontent.com");
+        assert_eq!(client.secret, "GOCSPX-abc_DEF-123");
+    }
+
+    #[test]
+    fn a_bundle_without_a_secret_or_with_two_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("a.js"),
+            "x=\"1111-aaaa.apps.googleusercontent.com\";",
+        )
+        .unwrap();
+        assert!(matches!(
+            client_from_bundle(dir.path()),
+            Err(DriverError::Unsupported(_))
+        ));
+        std::fs::write(
+            dir.path().join("b.js"),
+            "s=\"GOCSPX-one\";t=\"GOCSPX-two\";i=\"1-a.apps.googleusercontent.com\";",
+        )
+        .unwrap();
+        assert!(matches!(
+            client_from_bundle(dir.path()),
+            Err(DriverError::Invalid(_))
+        ));
+        assert!(matches!(
+            client_from_bundle(&dir.path().join("missing")),
+            Err(DriverError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn the_explicit_pair_wins_and_an_empty_source_is_unsupported() {
+        let home = crate::driver::gemini::tests::temp_home();
+        let env = crate::driver::gemini::tests::env_with(
+            &home,
+            [
+                (CLIENT_ID_ENV, "id-9.apps.googleusercontent.com"),
+                (CLIENT_SECRET_ENV, "GOCSPX-nine"),
+            ],
+        );
+        let client = ClientSource::from_env(&env).resolve().unwrap();
+        assert_eq!(client.id, "id-9.apps.googleusercontent.com");
+        assert!(matches!(
+            ClientSource::default().resolve(),
+            Err(DriverError::Unsupported(_))
+        ));
+        // SWAPD_GEMINI_BUNDLE_DIR names the directory to scan.
+        let dir = home.path().join("bundle");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("c.js"),
+            "i=\"5-e.apps.googleusercontent.com\";s=\"GOCSPX-five\";",
+        )
+        .unwrap();
+        let env = crate::driver::gemini::tests::env_with(
+            &home,
+            [(BUNDLE_DIR_ENV, dir.to_str().unwrap())],
+        );
+        assert_eq!(
+            ClientSource::from_env(&env).resolve().unwrap().secret,
+            "GOCSPX-five"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bundle_dir_follows_the_cli_symlink_into_the_package() {
+        let home = crate::driver::gemini::tests::temp_home();
+        let bundle = home
+            .path()
+            .join("lib")
+            .join("node_modules")
+            .join("@google")
+            .join("gemini-cli")
+            .join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("gemini.js"), "").unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(bundle.join("gemini.js"), bin.join("gemini")).unwrap();
+        assert_eq!(
+            bundle_dir_of(&bin.join("gemini")).unwrap(),
+            std::fs::canonicalize(&bundle).unwrap()
+        );
     }
 }

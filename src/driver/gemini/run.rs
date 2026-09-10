@@ -246,7 +246,8 @@ pub fn ignite(
             rotated: None,
         }),
         Err(DriverError::NeedsRefresh) => {
-            let refreshed = match oauth::refresh(&driver.endpoints, login) {
+            let client = driver.oauth_client()?;
+            let refreshed = match oauth::refresh(&driver.endpoints, &client, login) {
                 Ok(refreshed) => refreshed,
                 Err(DriverError::TokenDead) => return dead(),
                 // A throttled or unreachable token endpoint is not an answer
@@ -442,10 +443,13 @@ mod tests {
             then.status(400)
                 .body(include_str!("fixtures/token_invalid_grant.json"));
         });
-        let driver = GeminiDriver::new(GeminiEndpoints {
-            oauth: server.base_url(),
-            cloudcode: server.base_url(),
-        });
+        let driver = GeminiDriver::new(
+            GeminiEndpoints {
+                oauth: server.base_url(),
+                cloudcode: server.base_url(),
+            },
+            crate::driver::gemini::oauth::ClientSource::for_tests(),
+        );
         let home = temp_home();
         let env = env_with(&home, []);
         let outcome = ignite(&driver, &env, 1, &login(4_102_444_800_000)).unwrap();
@@ -476,10 +480,13 @@ mod tests {
             when.method(POST).path("/v1internal:retrieveUserQuota");
             then.status(200).body(include_str!("fixtures/quota.json"));
         });
-        let driver = GeminiDriver::new(GeminiEndpoints {
-            oauth: server.base_url(),
-            cloudcode: server.base_url(),
-        });
+        let driver = GeminiDriver::new(
+            GeminiEndpoints {
+                oauth: server.base_url(),
+                cloudcode: server.base_url(),
+            },
+            crate::driver::gemini::oauth::ClientSource::for_tests(),
+        );
         let home = temp_home();
         let env = env_with(&home, []);
         let outcome = ignite(&driver, &env, 1, &login(1_000)).unwrap();

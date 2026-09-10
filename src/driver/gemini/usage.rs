@@ -207,10 +207,13 @@ mod tests {
     use httpmock::prelude::*;
 
     fn driver(server: &MockServer) -> GeminiDriver {
-        GeminiDriver::new(GeminiEndpoints {
-            oauth: server.base_url(),
-            cloudcode: server.base_url(),
-        })
+        GeminiDriver::new(
+            GeminiEndpoints {
+                oauth: server.base_url(),
+                cloudcode: server.base_url(),
+            },
+            crate::driver::gemini::oauth::ClientSource::for_tests(),
+        )
     }
 
     fn login(expiry_ms: i64) -> Login {

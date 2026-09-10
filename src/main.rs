@@ -559,7 +559,8 @@ fn doctor(json: bool) -> Result<()> {
                     .filter(|kind| kind != driver::gemini::live::OAUTH_PERSONAL)
                     .map(|kind| {
                         format!("gemini is configured for {kind} auth; only oauth-personal is managed")
-                    }),
+                    })
+                    .or_else(|| path.as_ref().and_then(|_| driver::gemini::oauth::client_note(&env))),
                 _ => None,
             };
             ProviderStatus {

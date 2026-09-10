@@ -2111,7 +2111,7 @@ git commit -m "gemini: the driver joins the registry; doctor reports every provi
 
 ### Task 8: Infinitus shows the Gemini fleet (separate repo, separate PR)
 
-**Files (in `~/death/limitless`, worktree `~/death/limitless-gemini`, branch `swapd-gemini-fleet` off `origin/main`):**
+**Files (in `~/death/limitless`, worktree `~/death/limitless-gemini`, branch `swapd-gemini-fleet` off `origin/native` — the native app ships from `native` since 2026-09-10; `main` is the T3 Code fork):**
 - Modify: `Sources/InfinitusCore/Engines/Swapd/SwapdEngine.swift` — `addCurrent()` / `addToken` currently hard-code `provider: .claude`; `addCurrent` gains no new API (the app's add flow is Claude-only today) — nothing to change unless the engine protocol already carries a provider.
 - Test: `Tests/InfinitusCoreTests/SwapdEngineTests.swift`
 

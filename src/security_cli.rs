@@ -380,7 +380,10 @@ mod tests {
         // The fourth value is a ~20 KB login-shaped blob (newline + non-ASCII byte,
         // so it reads back through the `0x<hex>` branch): its `-i` line would be
         // ~40 KB, ten times the buffer, so it travels on argv.
-        let large = format!("{{\"mcpOAuth\": \"{}\",\n\"e\": \"🩸\"}}", "x".repeat(20_000));
+        let large = format!(
+            "{{\"mcpOAuth\": \"{}\",\n\"e\": \"🩸\"}}",
+            "x".repeat(20_000)
+        );
         for value in [
             "{\"a\": \"b c\",\n\"e\": \"🩸\"}",
             "deadbeef",
@@ -412,8 +415,14 @@ mod tests {
 
     #[test]
     fn add_transport_switches_to_argv_above_the_line_limit() {
-        assert_eq!(add_transport(SECURITY_STDIN_LINE_LIMIT), AddTransport::Stdin);
-        assert_eq!(add_transport(SECURITY_STDIN_LINE_LIMIT + 1), AddTransport::Argv);
+        assert_eq!(
+            add_transport(SECURITY_STDIN_LINE_LIMIT),
+            AddTransport::Stdin
+        );
+        assert_eq!(
+            add_transport(SECURITY_STDIN_LINE_LIMIT + 1),
+            AddTransport::Argv
+        );
     }
 
     #[test]

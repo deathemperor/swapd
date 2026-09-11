@@ -570,6 +570,7 @@ fn execute_inner(
         installed: provider.installed(&ctx.env).is_some(),
         active_slot: states.iter().find(|st| st.active).map(|st| st.slot),
         active_unreadable: prepared.active_unreadable.clone(),
+        last_known_active_slot: prepared.unreadable_active,
         next_candidate: next_candidate(ctx, &states, &prepared.entries),
         next_recovery: next_recovery(ctx, &states, &prepared.entries),
         accounts,

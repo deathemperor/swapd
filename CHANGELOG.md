@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-09-11
 
+- list --json carries `lastKnownActiveSlot` beside `activeUnreadable` so a reader keeps the active slot through a switch (#28)
 - Windows: a lock taken over as stale is no longer removed when its previous holder exits (#15).
 - auto: one tick reads the live login and each slot's secret once, not once per pass (#1)
 - add --slot n moves an account that already has a slot instead of duplicating it (#3)

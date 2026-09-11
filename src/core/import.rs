@@ -39,11 +39,28 @@ pub struct ImportResult {
     /// (`driver::live_is_older`) or missing altogether. The row is rewritten
     /// from the file too, as `--force` would.
     pub refreshed: Vec<u32>,
+    /// Slots that already held the account, kept their stored credential (the
+    /// file's copy was not provably newer), and took the file's row metadata —
+    /// alias, icon, held, preferred — because it differed. The exporter is
+    /// where the user labels accounts in phase 1, and a label it changed after
+    /// the first import otherwise never reached swapd.
+    pub updated: Vec<u32>,
     pub skipped: Vec<Skipped>,
     /// The slot the envelope called active. Recorded for the caller, never
     /// activated: an import is not a switch, and the machine's live login is
     /// whatever it already was.
     pub active_slot: Option<u32>,
+}
+
+/// What pass 3 does with one entry.
+enum Fate {
+    /// A free slot: credential and row from the file.
+    New,
+    /// The slot's account, with a newer credential in the file: both rewritten.
+    Refresh,
+    /// The slot's account, credential kept: the occupant's row with the file's
+    /// metadata.
+    Update(Slot),
 }
 
 pub struct Skipped {
@@ -68,6 +85,14 @@ struct Entry {
 }
 
 impl Entry {
+    /// Whether the file's labels and choices differ from the row's.
+    fn metadata_differs(&self, slot: &Slot) -> bool {
+        self.alias != slot.alias
+            || self.icon != slot.icon
+            || self.disabled != slot.disabled
+            || self.preferred != slot.preferred
+    }
+
     /// The account this row names, so the occupied-slot check asks the same
     /// question every other identity match in swapd asks.
     fn identity(&self) -> Identity {
@@ -117,15 +142,14 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
     // Pass 3: write, in the same lock cycle. All the rows go in one
     // `slots::update`, so an import lands as a table rather than as N separate
     // ones.
-    let (imported, refreshed, skipped, failure) = slots::update(&ctx.home.slots_file(), |file| {
+    let slots_file = ctx.home.slots_file();
+    let (imported, refreshed, updated, skipped, failure) = slots::update(&slots_file, |file| {
         let existing = file.providers.entry(id.to_string()).or_default();
         let mut skipped: Vec<Skipped> = Vec::new();
-        // The entry, and whether it replaces a credential the slot already
-        // holds for the same account.
-        let mut writing: Vec<(Entry, bool)> = Vec::new();
+        let mut writing: Vec<(Entry, Fate)> = Vec::new();
 
         for entry in entries {
-            let mut refresh = false;
+            let mut fate = Fate::New;
             if let Some(occupant) = existing.slots.get(&entry.slot) {
                 let same = slots::same_account(&entry.identity(), occupant);
                 if same {
@@ -151,7 +175,11 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                                 crate::driver::live_is_older(provider, stored, &entry.login)
                             }
                         };
-                        if !newer {
+                        if newer {
+                            fate = Fate::Refresh;
+                        } else if entry.metadata_differs(occupant) {
+                            fate = Fate::Update(occupant.clone());
+                        } else {
                             skipped.push(Skipped {
                                 slot: entry.slot,
                                 email: entry.email,
@@ -159,7 +187,6 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                             });
                             continue;
                         }
-                        refresh = true;
                     }
                 } else if !force {
                     // Refused rather than reported: silently skipping would
@@ -178,14 +205,29 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                     )));
                 }
             }
-            writing.push((entry, refresh));
+            writing.push((entry, fate));
         }
 
         let mut imported: Vec<u32> = Vec::new();
         let mut refreshed: Vec<u32> = Vec::new();
+        let mut updated: Vec<u32> = Vec::new();
         let mut rows: Vec<(u32, Slot)> = Vec::new();
         let mut failure = None;
-        for (entry, refresh) in writing {
+        for (entry, fate) in writing {
+            if let Fate::Update(occupant) = fate {
+                // The credential stays, so the row keeps the occupant's
+                // fingerprint and `added`: a fingerprint taken from the file's
+                // bytes would read as "credentials replaced" on the next
+                // collector pass for a login that never changed.
+                let mut row = occupant;
+                row.alias = entry.alias;
+                row.icon = entry.icon;
+                row.disabled = entry.disabled;
+                row.preferred = entry.preferred;
+                rows.push((entry.slot, row));
+                updated.push(entry.slot);
+                continue;
+            }
             // Secrets first, rows after: bytes without a row are unreferenced,
             // a row without bytes is a slot that cannot authenticate. A keychain
             // that fails part way therefore stops the import here and reports
@@ -229,7 +271,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 fingerprint: Some(entry.login.fingerprint()),
             };
             rows.push((entry.slot, meta));
-            if refresh {
+            if matches!(fate, Fate::Refresh) {
                 refreshed.push(entry.slot);
             } else {
                 imported.push(entry.slot);
@@ -240,7 +282,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
         for (slot, meta) in rows {
             existing.insert(slot, meta);
         }
-        Ok((dirty, (imported, refreshed, skipped, failure)))
+        Ok((dirty, (imported, refreshed, updated, skipped, failure)))
     })?;
 
     // Outside the lock, so the usage store's is never nested inside it: a slot
@@ -264,6 +306,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
     Ok(ImportResult {
         imported,
         refreshed,
+        updated,
         skipped,
         active_slot,
     })
@@ -640,6 +683,60 @@ mod tests {
         let restored = run(&ctx, &driver, &export_with(dir.path(), 1_000), false).unwrap();
         assert_eq!(restored.refreshed, vec![1]);
         assert_eq!(stored_expiry(&ctx), Some(1_000));
+    }
+
+    #[test]
+    fn an_already_present_account_takes_the_files_labels_and_keeps_its_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(dir.path());
+        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform(&test_env());
+        let export = |alias: &str, preferred: bool| {
+            let path = dir.path().join(format!("export-{alias}-{preferred}.json"));
+            let envelope = json!({
+                "version": 1,
+                "accounts": [{
+                    "number": 1,
+                    "email": "one@example.com",
+                    "alias": alias,
+                    "preferred": preferred,
+                    "credentials": {"claudeAiOauth": {
+                        "accessToken": "at-2000",
+                        "refreshToken": "rt-1",
+                        "expiresAt": 2_000,
+                    }},
+                }],
+            });
+            std::fs::write(&path, envelope.to_string()).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let row = |ctx: &Ctx| slots::load(&ctx.home, "claude").unwrap().slots[&1].clone();
+
+        run(&ctx, &driver, &export("", false), false).unwrap();
+        let before = row(&ctx);
+        assert_eq!(before.alias, None);
+
+        // The exporter renamed and pinned the account since: same generation,
+        // so the credential stays, but the row follows the file.
+        let out = run(&ctx, &driver, &export("hiep", true), false).unwrap();
+        assert_eq!(
+            (out.imported, out.refreshed, out.updated),
+            (vec![], vec![], vec![1])
+        );
+        assert!(out.skipped.is_empty());
+        let after = row(&ctx);
+        assert_eq!(after.alias.as_deref(), Some("hiep"));
+        assert!(after.preferred);
+        assert_eq!(
+            after.fingerprint, before.fingerprint,
+            "the credential never changed"
+        );
+        assert_eq!(after.added, before.added);
+        assert_eq!(stored_expiry(&ctx), Some(2_000));
+
+        // The same file again is a no-op.
+        let again = run(&ctx, &driver, &export("hiep", true), false).unwrap();
+        assert!(again.updated.is_empty());
+        assert_eq!(again.skipped[0].reason, "already-present");
     }
 
     #[test]

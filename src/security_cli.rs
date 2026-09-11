@@ -138,6 +138,34 @@ fn parse_password_line(stderr: &str) -> Result<String> {
     Err(keychain_unavailable())
 }
 
+/// `security -i` reads each command into a 4096-byte line buffer. A longer line is
+/// split: the first 4096 bytes run as an `add-generic-password` with truncated hex
+/// (measured on Darwin 25.6: a 2100-byte value stores 4047 bytes, exit 1), the rest
+/// runs as `unknown command`. A Claude login carrying the CLI's `mcpOAuth` blobs is
+/// ~18 KB, so it can never travel on that line. Above the limit the hex goes on argv
+/// instead — the deliberate exception to "secrets over stdin, never argv", ported
+/// from cswap's `macos_keychain.py` (`SECURITY_STDIN_LINE_LIMIT`): hex on argv is
+/// recoverable by an observer of `ps` for the call's few ms, silent corruption of
+/// the stored (or the CLI's live) login is strictly worse.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SECURITY_STDIN_LINE_LIMIT: usize = 4096 - 64;
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum AddTransport {
+    Stdin,
+    Argv,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn add_transport(line_len: usize) -> AddTransport {
+    if line_len <= SECURITY_STDIN_LINE_LIMIT {
+        AddTransport::Stdin
+    } else {
+        AddTransport::Argv
+    }
+}
+
 /// Maps a `security find-generic-password -g` exit code + captured stderr to a result:
 /// 44 (not found) -> `Ok(None)`; 0 -> the parsed `password:` line; anything else ->
 /// `KeychainUnavailable`. Pure and platform-independent so it's unit-testable without
@@ -208,15 +236,31 @@ impl SecurityCli for RealSecurity {
     fn add(&self, service: &str, account: &str, value: &str) -> Result<()> {
         validate_component(service)?;
         validate_component(account)?;
-        let mut cmd = Command::new("/usr/bin/security");
-        cmd.arg("-i");
+        let hex_value = hex::encode(value.as_bytes());
         let line = format!(
             "add-generic-password -U -s {} -a {} -X {}\n",
             quote(service),
             quote(account),
-            hex::encode(value.as_bytes())
+            hex_value
         );
-        let (code, _, _) = Self::run(&mut cmd, Some(&line))?;
+        let mut cmd = Command::new("/usr/bin/security");
+        let (code, _, _) = match add_transport(line.len()) {
+            AddTransport::Stdin => {
+                cmd.arg("-i");
+                Self::run(&mut cmd, Some(&line))?
+            }
+            AddTransport::Argv => {
+                cmd.arg("add-generic-password")
+                    .arg("-U")
+                    .arg("-s")
+                    .arg(service)
+                    .arg("-a")
+                    .arg(account)
+                    .arg("-X")
+                    .arg(&hex_value);
+                Self::run(&mut cmd, None)?
+            }
+        };
         if code != 0 {
             return Err(keychain_unavailable());
         }
@@ -333,16 +377,22 @@ mod tests {
         let service = "swapd test";
         let account = "swapd-test-account";
 
+        // The fourth value is a ~20 KB login-shaped blob (newline + non-ASCII byte,
+        // so it reads back through the `0x<hex>` branch): its `-i` line would be
+        // ~40 KB, ten times the buffer, so it travels on argv.
+        let large = format!("{{\"mcpOAuth\": \"{}\",\n\"e\": \"🩸\"}}", "x".repeat(20_000));
         for value in [
             "{\"a\": \"b c\",\n\"e\": \"🩸\"}",
             "deadbeef",
             "back\\slash \"quote\"",
+            large.as_str(),
         ] {
             cli.add(service, account, value).unwrap();
             assert_eq!(
                 cli.find(service, Some(account)).unwrap(),
                 Some(value.to_string()),
-                "roundtrip failed for {value:?}"
+                "roundtrip failed for a {}-byte value",
+                value.len()
             );
         }
         cli.delete(service, account).unwrap();
@@ -358,6 +408,12 @@ mod tests {
             .add("swapd\"evil", "account", "value")
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn add_transport_switches_to_argv_above_the_line_limit() {
+        assert_eq!(add_transport(SECURITY_STDIN_LINE_LIMIT), AddTransport::Stdin);
+        assert_eq!(add_transport(SECURITY_STDIN_LINE_LIMIT + 1), AddTransport::Argv);
     }
 
     #[test]

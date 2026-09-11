@@ -104,6 +104,48 @@ impl FileLock {
         })
     }
 
+    /// Acquire a SHARED lock on `<path>.lock`, waiting up to `timeout`: any
+    /// number of holders at once, none while an `acquire` holds the exclusive
+    /// side. Returns `ErrorCode::Locked` if the timeout elapses first.
+    pub fn acquire_shared(path: &Path, timeout: Duration) -> Result<Self> {
+        let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
+        lock_name.push(".lock");
+        let lock_path: PathBuf = path.with_file_name(lock_name);
+
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(false).write(true).read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path)?;
+        let rw = fd_lock::RwLock::new(file);
+
+        let start = Instant::now();
+        loop {
+            match rw.try_read() {
+                Ok(guard) => {
+                    std::mem::forget(guard);
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if start.elapsed() >= timeout {
+                        return Err(SwapdError::new(
+                            ErrorCode::Locked,
+                            format!("timed out waiting for lock on {}", path.display()),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(FileLock {
+            _file: rw.into_inner(),
+        })
+    }
+
     /// Leave a breadcrumb in the lock file itself (the auto daemon writes its
     /// pid there, cswap `autoswitch.py:2874`).
     ///

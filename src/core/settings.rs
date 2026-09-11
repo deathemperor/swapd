@@ -452,6 +452,59 @@ pub fn set(home: &Home, provider: &str, key: &str, value: Value) -> Result<()> {
     })
 }
 
+/// Rewrite the slot numbers in `autoswitch.preferred` after a renumber
+/// (`core::compact`): `map` answers each number's new one, or `None` to drop
+/// the pin (the number named an account that is gone). Emails and aliases
+/// pass through untouched; a missing file or key is nothing to rewrite.
+pub fn renumber_preferred(
+    home: &Home,
+    provider: &str,
+    map: impl Fn(u32) -> Option<u32>,
+) -> Result<()> {
+    if !home.settings_file().exists() {
+        return Ok(());
+    }
+    edit(home, |raw| {
+        let Some(preferred) = raw
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut(provider))
+            .and_then(Value::as_object_mut)
+            .and_then(|section| section.get_mut("preferred"))
+        else {
+            return Ok((false, ()));
+        };
+        let renumber = |token: &str| -> Option<String> {
+            match token.trim().parse::<u32>() {
+                Ok(n) => map(n).map(|n| n.to_string()),
+                Err(_) => Some(token.to_string()),
+            }
+        };
+        let rewritten = match &*preferred {
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .filter_map(|item| match item.as_str() {
+                        Some(s) => renumber(s).map(Value::from),
+                        None => Some(item.clone()),
+                    })
+                    .collect(),
+            ),
+            Value::String(s) => Value::from(
+                s.split(',')
+                    .filter(|t| !t.trim().is_empty())
+                    .filter_map(renumber)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            other => other.clone(),
+        };
+        let dirty = rewritten != *preferred;
+        *preferred = rewritten;
+        Ok((dirty, ()))
+    })
+}
+
 /// Drop one key, so the default applies again. Answers whether it was there.
 pub fn unset(home: &Home, provider: &str, key: &str) -> Result<bool> {
     edit(home, |raw| {

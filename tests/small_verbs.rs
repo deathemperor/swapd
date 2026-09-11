@@ -488,18 +488,182 @@ fn remove_deletes_the_login_and_refuses_the_live_one() {
     assert_eq!(err["error"]["code"], "invalid-input");
     assert!(fx.credential(2).exists());
 
+    // Slot 3's profile, with the marker its next run reads.
+    let profile3 = fx.home.path().join("profiles/claude/3");
+    write(&profile3.join(".swapd-seeded"), "fp-3");
+
     let out = fx.run(&["remove", "two@example.com", "--yes", "--json"]);
     assert_eq!(out["ok"], true);
     assert_eq!(out["slot"], 2);
-    assert!(!fx.credential(2).exists(), "the stored login is gone");
-    assert!(!profile.exists(), "so is the run profile");
+    // Slot 2's own run profile is gone: what sits at that path now is slot
+    // 3's, renamed (checked below by its marker).
+    assert!(
+        !profile.join(".credentials.json").exists(),
+        "the run profile is gone"
+    );
+    // The slot above moved down to close the gap (#22), carrying everything
+    // keyed by its number.
+    assert_eq!(out["moves"], json!([{"from": 3, "to": 2}]));
+    assert!(out["stoppedAt"].is_null());
     let slots = fx.slots();
-    assert!(slot_of(&slots, 2).is_null());
+    assert_eq!(slot_of(&slots, 2)["email"], "three@example.com");
+    assert_eq!(slot_of(&slots, 2)["alias"], "a3");
+    assert!(slot_of(&slots, 3).is_null());
     assert_eq!(
         slots["providers"]["claude"]["order"],
-        json!([1, 3]),
-        "and the rotation order forgets it"
+        json!([1, 2]),
+        "and the rotation order follows"
     );
+    assert!(
+        fx.stored(2).contains("rt-3"),
+        "the credential moved with the row"
+    );
+    assert!(!fx.credential(3).exists(), "and its old key is gone");
+    assert_eq!(
+        std::fs::read_to_string(fx.home.path().join("profiles/claude/2/.swapd-seeded")).unwrap(),
+        "fp-3",
+        "the run profile was renamed, marker included"
+    );
+    assert!(!profile3.exists());
+    let usage = read_json(&fx.home.path().join("usage.json"));
+    assert_eq!(usage["rows"]["claude:2"]["email"], "three@example.com");
+    assert!(usage["rows"]["claude:3"].is_null());
+    // The freed number is the one the next account takes.
+    let out = fx
+        .cmd()
+        .args(["add-token", "-", "--json"])
+        .write_stdin("sk-ant-api03-fourth\n")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(fx.stored(3), "sk-ant-api03-fourth");
+    assert_eq!(fx.slots()["providers"]["claude"]["order"], json!([1, 2, 3]));
+}
+
+#[test]
+fn remove_renumbers_a_chain_and_carries_the_pins_and_the_quarantine() {
+    let fx = Fixture::new();
+    let accounts = [
+        (1u32, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+        (3, "three@example.com", "org-3"),
+        (4, "four@example.com", "org-4"),
+    ];
+    fx.write_slots(&accounts, Some(3));
+    for (slot, email, org) in accounts {
+        fx.write_stored(slot, &fx.login(email, org, &format!("rt-{slot}")));
+    }
+    fx.write_live("three@example.com", "org-3", "rt-3");
+    fx.write_usage(&accounts);
+    fx.run(&["hold", "4", "--json"]);
+    fx.run(&["reorder", "4", "3", "1", "2", "--json"]);
+    fx.run(&[
+        "config",
+        "set",
+        "claude.preferred",
+        "1,4,two@example.com",
+        "--json",
+    ]);
+    write(
+        &fx.home.path().join("auto-state.json"),
+        &json!({"schemaVersion": 1, "quarantine": {
+            "4": {"reason": "dead-token", "since": "2026-09-11T00:00:00Z", "fingerprint": "fp-4"},
+            "2": {"reason": "dead-token", "since": "2026-09-11T00:00:00Z", "fingerprint": "fp-2"},
+        }})
+        .to_string(),
+    );
+
+    let out = fx.run(&["remove", "1", "--yes", "--json"]);
+    assert_eq!(
+        out["moves"],
+        json!([{"from": 2, "to": 1}, {"from": 3, "to": 2}, {"from": 4, "to": 3}])
+    );
+    let slots = fx.slots();
+    let provider = &slots["providers"]["claude"];
+    assert_eq!(slot_of(&slots, 1)["email"], "two@example.com");
+    assert_eq!(slot_of(&slots, 2)["email"], "three@example.com");
+    assert_eq!(slot_of(&slots, 3)["email"], "four@example.com");
+    assert_eq!(
+        slot_of(&slots, 3)["disabled"],
+        true,
+        "the hold moved with the row"
+    );
+    assert!(slot_of(&slots, 4).is_null());
+    assert_eq!(
+        provider["activeSlot"], 2,
+        "the live login's number followed it"
+    );
+    assert_eq!(
+        provider["order"],
+        json!([3, 2, 1]),
+        "the rotation order is the same accounts"
+    );
+    for (slot, refresh) in [(1, "rt-2"), (2, "rt-3"), (3, "rt-4")] {
+        assert!(fx.stored(slot).contains(refresh), "slot {slot}");
+    }
+    assert!(!fx.credential(4).exists());
+    // A pin by number follows its account; the removed account's pin is gone.
+    let out = fx.run(&["config", "get", "claude.preferred", "--json"]);
+    assert_eq!(
+        setting(&out, "claude.preferred")["value"],
+        json!(["3", "two@example.com"])
+    );
+    // So does a quarantine entry, under the new number, with no strike lost.
+    let state = read_json(&fx.home.path().join("auto-state.json"));
+    assert_eq!(state["quarantine"]["3"]["fingerprint"], "fp-4");
+    assert_eq!(state["quarantine"]["1"]["fingerprint"], "fp-2");
+    assert!(state["quarantine"]["4"].is_null());
+    assert!(state["quarantine"]["2"].is_null());
+}
+
+#[test]
+fn compact_closes_every_gap_and_is_idempotent() {
+    let fx = Fixture::new();
+    let accounts = [
+        (1u32, "one@example.com", "org-1"),
+        (2, "two@example.com", "org-2"),
+        (5, "five@example.com", "org-5"),
+        (7, "seven@example.com", "org-7"),
+    ];
+    fx.write_slots(&accounts, Some(1));
+    for (slot, email, org) in accounts {
+        fx.write_stored(slot, &fx.login(email, org, &format!("rt-{slot}")));
+    }
+    fx.write_live("one@example.com", "org-1", "rt-1");
+    fx.write_usage(&accounts);
+
+    let out = fx.run(&["compact", "--json"]);
+    assert_eq!(out["ok"], true);
+    assert_eq!(
+        out["moves"],
+        json!([{"from": 5, "to": 3}, {"from": 7, "to": 4}])
+    );
+    let slots = fx.slots();
+    assert_eq!(slot_of(&slots, 3)["email"], "five@example.com");
+    assert_eq!(slot_of(&slots, 4)["email"], "seven@example.com");
+    assert_eq!(slots["providers"]["claude"]["order"], json!([1, 2, 3, 4]));
+    assert!(fx.stored(3).contains("rt-5"));
+    assert!(fx.stored(4).contains("rt-7"));
+    assert!(!fx.credential(5).exists());
+    assert!(!fx.credential(7).exists());
+
+    // Dense already: nothing moves, nothing is rewritten.
+    let before = std::fs::metadata(fx.home.path().join("slots.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let out = fx.run(&["compact", "--json"]);
+    assert_eq!(out["moves"], json!([]));
+    assert!(out["stoppedAt"].is_null());
+    let after = std::fs::metadata(fx.home.path().join("slots.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(before, after);
 }
 
 #[test]

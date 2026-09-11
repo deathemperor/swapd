@@ -15,7 +15,7 @@
 use std::io::IsTerminal;
 use std::process::{Command, ExitStatus};
 
-use crate::core::slots::{self, ProviderSlots};
+use crate::core::slots::{self, ProviderSlots, LOCK_TIMEOUT};
 use crate::core::store::FileLock;
 use crate::core::switch::{match_slot, resolve};
 use crate::ctx::Ctx;
@@ -100,6 +100,11 @@ pub fn run(
         return Ok(exit_code(&status));
     }
 
+    // Marks the slot as in use from before its login is refreshed until the
+    // child's rotation is read back: a renumber (`core::compact`) leaves a
+    // slot whose lock is held where it is, so neither the refresh's persist
+    // nor the read-back lands under a number that no longer names the account.
+    let _session = FileLock::acquire_shared(&ctx.home.run_lock_base(id, slot), LOCK_TIMEOUT)?;
     let login = super::login_to_run(ctx, driver, slot)?;
     let profile = driver.run_profile(&ctx.env, slot, &login)?;
 

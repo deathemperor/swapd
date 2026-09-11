@@ -81,6 +81,15 @@ impl Home {
         self.root.join(format!("refresh-{provider}-{slot}"))
     }
 
+    /// The base path whose `.lock` sibling — `run-<provider>-<slot>.lock` —
+    /// marks ONE slot's profile as in use: `run` and `ignite` hold its shared
+    /// side for the CLI's lifetime (several sessions on one account are
+    /// fine), and a renumber (`core::compact`) takes the exclusive side, or
+    /// leaves the slot where it is.
+    pub fn run_lock_base(&self, provider: &str, slot: u32) -> PathBuf {
+        self.root.join(format!("run-{provider}-{slot}"))
+    }
+
     pub fn auto_state_file(&self) -> PathBuf {
         self.root.join("auto-state.json")
     }

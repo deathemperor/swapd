@@ -119,6 +119,34 @@ pub struct AutoState {
     pub left_at_limit: Option<Departure>,
 }
 
+/// Re-key the quarantine entries of slots a renumber moved (`core::compact`),
+/// so a strike earned under the old number is not forgotten — nor released
+/// as "account removed" and re-earned — on the next tick. Under the state's
+/// own lock; a missing or corrupt file holds nothing to move.
+pub fn renumber_quarantine(home: &crate::paths::Home, moves: &[(u32, u32)]) -> Result<()> {
+    let path = home.auto_state_file();
+    if moves.is_empty() || !path.exists() {
+        return Ok(());
+    }
+    let _lock = FileLock::acquire(&path, LOCK_TIMEOUT)?;
+    let Ok(mut state) = read_json::<AutoState>(&path) else {
+        return Ok(());
+    };
+    let mut moved = BTreeMap::new();
+    for (from, to) in moves {
+        if let Some(entry) = state.quarantine.remove(&from.to_string()) {
+            moved.insert(to.to_string(), entry);
+        }
+    }
+    if moved.is_empty() {
+        return Ok(());
+    }
+    state.quarantine.extend(moved);
+    state.schema_version = STATE_SCHEMA_VERSION;
+    write_json_atomic(&path, &state)?;
+    Ok(())
+}
+
 /// One quarantined slot. The fingerprint is the point: strikes condemn the
 /// credential GENERATION that failed, so a re-login that replaces it releases
 /// the quarantine on its own.

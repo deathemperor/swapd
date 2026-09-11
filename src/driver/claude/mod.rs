@@ -131,6 +131,10 @@ impl Driver for ClaudeDriver {
         run::forget_profile(self, env, slot)
     }
 
+    fn relocate_profile(&self, env: &Env, from: u32, to: u32) -> Result<(), DriverError> {
+        run::relocate_profile(self, env, from, to)
+    }
+
     /// `~/.claude.json` (or the legacy `<config dir>/.config.json`), through
     /// the same resolver every other read uses — so `$CLAUDE_CONFIG_DIR` is
     /// honoured here exactly as Claude Code honours it.

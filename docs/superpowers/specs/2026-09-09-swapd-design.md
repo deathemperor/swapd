@@ -156,7 +156,8 @@ Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
 | `prefer <slot> on\|off` | write | the auto loop lands on preferred slots first |
 | `add [--slot n]` | write | captures the CLI's current live login into a slot |
 | `add-token -` | write | raw token / API key from stdin |
-| `remove <slot> --yes` | write | |
+| `remove <slot> --yes` | write | the slots above it move down: numbers stay 1…n (`core::compact`); a live `run`/`ignite` session stops the renumber at its slot |
+| `compact` | write | renumber 1…n; idempotent; the finish-later step after a stopped `remove` |
 | `export <path\|->` [--slot n] [--full] | read | swapd envelope (section 9) |
 | `import <path> [--force]` | write | swapd envelope, or cswap's `export` envelope |
 | `ignite <slot>` | human | the driver's cheapest request under that slot's login, then `refresh --slot`; returns `list` |
@@ -373,6 +374,6 @@ TUI, directory mappings, session resume, cmux, Slack/Telegram sending
 - Settings defaults are cswap's `AutoSwitchSettings` (threshold 90.0, interval 60, cooldown 300, hysteresis 10, strategy best, unhealthyTicks 3, model/preferred empty); a plain `rotate` uses `settings.strategy`.
 - The auto tick nominates fetches like cswap `_collect_scheduled_usage` (active if due + one due candidate + escalation band) via `CollectOpts.only`; consume-first re-measures `{current, target}` before committing.
 - `collect` = `prepare` (lock, live, secrets, adopt/heal) + `execute` (fetch set); the auto tick prepares once and re-prepares after a switch; a second `execute` re-reads only the slots it claimed so a rotated token is never re-spent.
-- `ignite`/`run`: refresh-if-expired first; `rotated` persisted before a non-zero exit is reported; `run` on the active slot execs directly (same-account fast path); the profile seed marker advances only after the rotation is persisted (`commit_profile`); `remove` calls `forget_profile`.
+- `ignite`/`run`: refresh-if-expired first; `rotated` persisted before a non-zero exit is reported; `run` on the active slot execs directly (same-account fast path); the profile seed marker advances only after the rotation is persisted (`commit_profile`); `remove` calls `forget_profile`, then `core::compact` renumbers the slots above it (row, credential, usage row, profile dir + keychain item via `relocate_profile`, quarantine entry, `preferred` pins); `run`/`ignite` hold a shared `run-<provider>-<slot>.lock` for the child's lifetime and a slot whose lock is held stops the renumber.
 - Tests never touch the real keychain, `~/.claude*`, `~/.swapd`, the real `claude` or the network: `SWAPD_SECRETS=file|memory`, `SWAPD_LIVE_STORE=file|keychain`, `SWAPD_HOME`, `SWAPD_URL_*`, `SWAPD_CLAUDE_CLI`, all via `Command::env`.
 

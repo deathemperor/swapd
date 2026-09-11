@@ -122,6 +122,9 @@ enum Command {
     Unhold { ident: String },
     /// Set the rotation order: every slot, exactly once.
     Reorder { idents: Vec<String> },
+    /// Renumber the slots 1…n, closing any gap (a `remove` stopped by a live
+    /// session, an import of a sparse roster).
+    Compact,
     /// Forget an account: its stored login, its run profile and its slot.
     Remove {
         ident: String,
@@ -415,6 +418,12 @@ fn run(cli: &Cli) -> Result<()> {
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
             emit_list(&cmd::reorder::run(&ctx, driver.as_ref(), idents)?, cli.json)
+        }
+        Command::Compact => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let out = cmd::compact::run(&ctx, driver.as_ref())?;
+            emit(&out, cli.json, || cmd::compact::print_human(&out))
         }
         Command::Remove { ident, yes } => {
             let driver = single_driver(cli)?;

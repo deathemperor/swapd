@@ -171,6 +171,14 @@ impl Driver for FakeDriver {
     ) -> std::result::Result<(), DriverError> {
         Ok(())
     }
+    fn relocate_profile(
+        &self,
+        _env: &crate::driver::Env,
+        _from: u32,
+        _to: u32,
+    ) -> std::result::Result<(), DriverError> {
+        Ok(())
+    }
     fn live_config_text(
         &self,
         _env: &crate::driver::Env,

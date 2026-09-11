@@ -42,7 +42,8 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | `prefer <ident> on\|off` | pin or unpin an account the rotation lands on first |
 | `hold <ident>` / `unhold <ident>` | take an account out of / back into the rotation |
 | `reorder <idents>…` | set the rotation order: every slot, exactly once |
-| `remove <ident> --yes` | forget an account: its login, run profile and slot |
+| `remove <ident> --yes` | forget an account: its login, run profile and slot; the slots above it move down so the numbers stay 1…n |
+| `compact` | renumber the slots 1…n (after a `remove` a live session stopped, or a sparse import) |
 | `config list\|get\|set\|unset` | read or change the `settings.json` knobs |
 | `history [--limit n]` | the switch log, newest last |
 | `unclaimed [--purge id]` | list, or drop, logins a switch stashed because they matched no slot |

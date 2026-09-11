@@ -122,6 +122,10 @@ impl Driver for GeminiDriver {
     fn forget_profile(&self, env: &Env, slot: u32) -> Result<(), DriverError> {
         run::forget_profile(env, slot)
     }
+    /// Nothing lives outside the directory, and `compact` renames that.
+    fn relocate_profile(&self, _env: &Env, _from: u32, _to: u32) -> Result<(), DriverError> {
+        Ok(())
+    }
     fn live_config_text(&self, env: &Env) -> Result<Option<String>, DriverError> {
         GeminiDriver::live_config_text(self, env)
     }

@@ -5,8 +5,10 @@ expression: "account(&payload, 1)"
 {
   "active": false,
   "alias": "one",
+  "backoffUntil": "[backoff-until]",
   "disabled": false,
   "email": "one@example.com",
+  "lastError": "http-500",
   "lastGood": {
     "ageSeconds": "[age]",
     "fetchedAt": "[fetched-at]",

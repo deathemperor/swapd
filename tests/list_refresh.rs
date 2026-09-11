@@ -416,6 +416,7 @@ fn the_stale_shape_matches_the_snapshot() {
     insta::assert_json_snapshot!("stale_account", account(&payload, 1), {
         ".**.fetchedAt" => "[fetched-at]",
         ".**.ageSeconds" => "[age]",
+        ".**.backoffUntil" => "[backoff-until]",
     });
 }
 

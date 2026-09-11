@@ -148,6 +148,30 @@ class DiffAccountTest(unittest.TestCase):
         row = next(r for r in rows if r[0] == "alias")
         self.assertEqual(row[3], "MISMATCH")
 
+    def test_a_mismatch_carries_swapd_fetch_note(self):
+        swapd = swapd_account(alias="different", usageStatus="stale", lastError="http-429",
+                              backoffUntil="2026-09-09T06:00:00+00:00")
+        rows = parity.diff_account(parity.map_cswap_account(cswap_account()), parity.map_swapd_account(swapd))
+        note = rows[-1]
+        self.assertEqual(note[0], "swapd.fetch")
+        self.assertEqual(note[3], "NOTE")
+        self.assertIn("stale", note[2])
+        self.assertIn("lastError http-429", note[2])
+        self.assertIn("backoff until 2026-09-09T06:00:00Z", note[2])
+
+    def test_a_clean_account_carries_no_note(self):
+        rows = parity.diff_account(parity.map_cswap_account(cswap_account()), parity.map_swapd_account(swapd_account()))
+        self.assertFalse(any(r[3] == "NOTE" for r in rows))
+
+    def test_note_rows_do_not_count_as_fields(self):
+        import contextlib, io
+        diff = {"you@example.com": [("alias", "a", "b", "MISMATCH"), ("swapd.fetch", "", "stale", "NOTE")]}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mismatches = parity._print_table(diff)
+        self.assertEqual(mismatches, 1)
+        self.assertIn("0/1 fields match", out.getvalue())
+
 
 class BuildDiffTest(unittest.TestCase):
     def _payloads(self, cswap_accounts, swapd_accounts):

@@ -64,6 +64,14 @@ pub struct AccountView {
     pub windows: Vec<Window>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_good: Option<LastGood>,
+    /// The store's classified kind of the most recent failed fetch
+    /// (`http-429`, `timeout`, `locked`, …); absent once a fetch succeeds.
+    /// Why a `stale` row is stale, without opening the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// When the failure backoff lifts, RFC 3339; absent when none is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_until: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -202,6 +210,8 @@ mod tests {
                         age_seconds: 0.0,
                         windows: vec![],
                     }),
+                    last_error: None,
+                    backoff_until: None,
                 }],
             }],
         };

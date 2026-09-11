@@ -1124,6 +1124,11 @@ fn account_view(st: &SlotState, entry: &Entry, now: f64) -> AccountView {
             Vec::new()
         },
         last_good,
+        last_error: entry.last_error.clone(),
+        backoff_until: entry
+            .backoff_until
+            .filter(|until| now < *until)
+            .and_then(format_ts),
     }
 }
 

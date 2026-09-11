@@ -134,6 +134,11 @@ Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
   to look in two places for the same number.
 - `lastGood` therefore appears on every non-`ok` status that has ever been
   measured, and never on `ok`.
+- `lastError` (the store's classified kind of the most recent failed fetch:
+  `http-429`, `http-500`, `timeout`, `locked`, …) and `backoffUntil` (RFC 3339,
+  while a failure backoff is running) say WHY a row is not `ok`, without
+  opening the store; both are omitted once a fetch succeeds. `tools/parity.py`
+  prints them as a `NOTE` row under any account with a mismatch.
 - Countdown/clock strings are NOT in the contract (the app formats).
 
 ### Verbs

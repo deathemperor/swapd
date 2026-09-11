@@ -96,6 +96,13 @@ def map_swapd_account(account: dict) -> dict:
         "active": bool(account.get("active")),
         "usageStatus": USAGE_STATUS_MAP.get(status, status),
         "usage": usage,
+        # Why swapd's side reads the way it does; shown only beside a mismatch.
+        "fetch": {
+            "status": status,
+            "ageSeconds": (account.get("lastGood") or {}).get("ageSeconds", account.get("ageSeconds")),
+            "lastError": account.get("lastError"),
+            "backoffUntil": normalize_ts(account.get("backoffUntil")),
+        },
     }
 
 
@@ -174,7 +181,24 @@ def diff_account(cswap_row: dict, swapd_row: dict) -> list[tuple[str, object, ob
     swapd_scoped = {w.get("name"): w for w in swapd_row["usage"]["scoped"]}
     for name in sorted(set(cswap_scoped) | set(swapd_scoped), key=lambda n: (n is None, n)):
         _diff_window(f"scoped[{name}]", cswap_scoped.get(name), swapd_scoped.get(name), rows)
+    if any(row[3] == "MISMATCH" for row in rows):
+        rows.append(("swapd.fetch", "", _fetch_note(swapd_row.get("fetch") or {}), "NOTE"))
     return rows
+
+
+def _fetch_note(fetch: dict) -> str:
+    """One line saying why swapd's side reads as it does: the raw status, the
+    age of the reading shown, and the store's last failure and backoff. A
+    `NOTE` row is not a field and never counts against the match total."""
+    age = fetch.get("ageSeconds")
+    parts = [str(fetch.get("status"))]
+    if age is not None:
+        parts.append(f"age {int(age)}s")
+    if fetch.get("lastError"):
+        parts.append(f"lastError {fetch['lastError']}")
+    if fetch.get("backoffUntil"):
+        parts.append(f"backoff until {fetch['backoffUntil']}")
+    return ", ".join(parts)
 
 
 def build_diff(cswap_payload: dict, swapd_payload: dict) -> dict[str, list[tuple[str, object, object, str]]]:
@@ -248,8 +272,9 @@ def _print_table(diff: dict[str, list[tuple[str, object, object, str]]]) -> int:
     mismatches = 0
     for email, rows in diff.items():
         for field, cswap_val, swapd_val, verdict in rows:
-            total += 1
-            if verdict != "OK":
+            if verdict != "NOTE":
+                total += 1
+            if verdict == "MISMATCH":
                 mismatches += 1
             print(f"{email:<32} {field:<18} {str(cswap_val):<24} {str(swapd_val):<24} {verdict}")
     print(f"\n{total - mismatches}/{total} fields match across {len(diff)} account(s)")
@@ -282,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             for email, rows in diff.items()
         }
         print(json.dumps(payload, indent=2))
-        mismatches = sum(1 for rows in diff.values() for row in rows if row[3] != "OK")
+        mismatches = sum(1 for rows in diff.values() for row in rows if row[3] == "MISMATCH")
     else:
         mismatches = _print_table(diff)
 

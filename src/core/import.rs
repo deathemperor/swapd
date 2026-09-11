@@ -80,17 +80,50 @@ struct Entry {
     plan: Option<String>,
     disabled: bool,
     preferred: bool,
+    /// Which of the four the file spelled out. A key the exporter does not
+    /// write (cswap's envelope has no icon, disabled or preferred) says
+    /// nothing about the row, so a re-import leaves that value alone rather
+    /// than resetting a hold or a pin made on this side.
+    carries: Carried,
     added: Option<String>,
     login: Login,
 }
 
+#[derive(Clone, Copy)]
+struct Carried {
+    alias: bool,
+    icon: bool,
+    disabled: bool,
+    preferred: bool,
+}
+
 impl Entry {
-    /// Whether the file's labels and choices differ from the row's.
+    /// Whether a label or choice the file carries differs from the row's.
     fn metadata_differs(&self, slot: &Slot) -> bool {
-        self.alias != slot.alias
-            || self.icon != slot.icon
-            || self.disabled != slot.disabled
-            || self.preferred != slot.preferred
+        let c = self.carries;
+        (c.alias && self.alias != slot.alias)
+            || (c.icon && self.icon != slot.icon)
+            || (c.disabled && self.disabled != slot.disabled)
+            || (c.preferred && self.preferred != slot.preferred)
+    }
+
+    /// The row with every label or choice the file carries taken from the
+    /// file; the rest, and everything else in the row, as it was.
+    fn apply_metadata(&self, mut row: Slot) -> Slot {
+        let c = self.carries;
+        if c.alias {
+            row.alias = self.alias.clone();
+        }
+        if c.icon {
+            row.icon = self.icon.clone();
+        }
+        if c.disabled {
+            row.disabled = self.disabled;
+        }
+        if c.preferred {
+            row.preferred = self.preferred;
+        }
+        row
     }
 
     /// The account this row names, so the occupied-slot check asks the same
@@ -219,12 +252,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 // fingerprint and `added`: a fingerprint taken from the file's
                 // bytes would read as "credentials replaced" on the next
                 // collector pass for a login that never changed.
-                let mut row = occupant;
-                row.alias = entry.alias;
-                row.icon = entry.icon;
-                row.disabled = entry.disabled;
-                row.preferred = entry.preferred;
-                rows.push((entry.slot, row));
+                rows.push((entry.slot, entry.apply_metadata(occupant)));
                 updated.push(entry.slot);
                 continue;
             }
@@ -431,7 +459,8 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
     // The user's own labels and choices, carried whole: an export that
     // remembers a pinned, held or renamed account and an import that quietly
     // dropped it would leave the two machines describing different rotations.
-    // Absent (cswap's envelope has none of these) is the row's default.
+    // Absent (cswap's envelope has none of these) is the row's default on a
+    // new slot; on one already held it leaves the row's value (`carries`).
     let icon = Some(text("icon")?)
         .map(|i| i.trim().to_string())
         .filter(|i| !i.is_empty());
@@ -445,6 +474,12 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
     };
     let disabled = flag("disabled")?;
     let preferred = flag("preferred")?;
+    let carries = Carried {
+        alias: account.contains_key("alias"),
+        icon: account.contains_key("icon"),
+        disabled: account.contains_key("disabled"),
+        preferred: account.contains_key("preferred"),
+    };
 
     let login = login_of(provider, account, &email)?;
     Ok(Entry {
@@ -457,6 +492,7 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
         plan,
         disabled,
         preferred,
+        carries,
         added,
         login,
     })
@@ -737,6 +773,27 @@ mod tests {
         let again = run(&ctx, &driver, &export("hiep", true), false).unwrap();
         assert!(again.updated.is_empty());
         assert_eq!(again.skipped[0].reason, "already-present");
+
+        // A file that never mentions `preferred` (cswap's envelope) says
+        // nothing about it: the pin made here survives the re-import.
+        let path = dir.path().join("export-no-flags.json");
+        let envelope = json!({
+            "version": 1,
+            "accounts": [{
+                "number": 1,
+                "email": "one@example.com",
+                "alias": "hiep",
+                "credentials": {"claudeAiOauth": {
+                    "accessToken": "at-2000",
+                    "refreshToken": "rt-1",
+                    "expiresAt": 2_000,
+                }},
+            }],
+        });
+        std::fs::write(&path, envelope.to_string()).unwrap();
+        let silent = run(&ctx, &driver, &path.to_string_lossy(), false).unwrap();
+        assert!(silent.updated.is_empty());
+        assert!(row(&ctx).preferred, "an absent key leaves the row alone");
     }
 
     #[test]

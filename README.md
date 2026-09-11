@@ -126,9 +126,10 @@ the provider's own login files (Claude Code's `.credentials.json`,
    side until the next export carries cswap's rotation, so re-export
    before every parity run: `import` takes the file's copy of an account
    it already holds whenever that copy is a newer generation (reported
-   as `refreshed`), leaves an older one alone, and takes the file's
-   alias, icon, held and preferred state either way (reported as
-   `updated` when they changed).
+   as `refreshed`), leaves an older one alone, and either way takes the
+   alias, icon, held and preferred state the file spells out (reported
+   as `updated` when they changed; a key the file omits leaves the row
+   as it was).
 5. Point Infinitus at the swapd engine, in its Engines pane. Once cswap is
    off, run one last `cswap export - | swapd import -` (cswap's final
    rotations), then unset `SWAPD_SHADOW`.

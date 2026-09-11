@@ -261,7 +261,7 @@ fn import_skips_an_account_the_slot_already_holds() {
     // takes the file's labels, and the run is reported as `updated`.
     let mut renamed = account(1, "one@example.com", "org-1");
     renamed["alias"] = json!("renamed");
-    let out = fx.import(&cswap_envelope(vec![renamed]), &[]);
+    let out = fx.import(&cswap_envelope(vec![renamed.clone()]), &[]);
     assert_eq!(out["refreshed"], json!([]));
     assert_eq!(out["updated"], json!([1]));
     assert_eq!(out["skipped"], json!([]));
@@ -269,6 +269,17 @@ fn import_skips_an_account_the_slot_already_holds() {
     assert_eq!(
         fx.slots()["providers"]["claude"]["slots"]["1"]["alias"],
         "renamed"
+    );
+
+    // cswap's envelope carries no `disabled`: a hold made here survives the
+    // next re-import of the same file.
+    fx.cmd().args(["hold", "1", "--json"]).output().unwrap();
+    let out = fx.import(&cswap_envelope(vec![renamed]), &[]);
+    assert_eq!(out["updated"], json!([]));
+    assert_eq!(out["skipped"][0]["reason"], "already-present");
+    assert_eq!(
+        fx.slots()["providers"]["claude"]["slots"]["1"]["disabled"],
+        true
     );
 
     // A row that lost its credential takes the file's copy, whatever its age.

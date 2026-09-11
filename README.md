@@ -123,7 +123,9 @@ the provider's own login files (Claude Code's `.credentials.json`,
    `switch`, `auto`, `ignite`, `run` and `rotate` are refused. An account
    whose access token has expired reads `token-expired` on the swapd
    side until the next export carries cswap's rotation, so re-export
-   before every parity run.
+   before every parity run: `import` takes the file's copy of an account
+   it already holds whenever that copy is a newer generation (reported
+   as `refreshed`), and leaves an older one alone.
 5. Point Infinitus at the swapd engine, in its Engines pane. Once cswap is
    off, run one last `cswap export - | swapd import -` (cswap's final
    rotations), then unset `SWAPD_SHADOW`.

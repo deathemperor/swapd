@@ -244,22 +244,43 @@ fn import_refuses_occupied_slot_without_force() {
 #[test]
 fn import_skips_an_account_the_slot_already_holds() {
     let fx = Fixture::new();
-    fx.write_slots(&[(1, "one@example.com", "org-1")]);
-
     let envelope = cswap_envelope(vec![account(1, "one@example.com", "org-1")]);
+    assert_eq!(fx.import(&envelope, &[])["imported"], json!([1]));
+    let stored = fx.stored(1);
+
+    // The same generation again: nothing newer, so nothing written.
     let out = fx.import(&envelope, &[]);
     assert_eq!(out["imported"], json!([]));
+    assert_eq!(out["refreshed"], json!([]));
     assert_eq!(out["skipped"][0]["slot"], 1);
     assert_eq!(out["skipped"][0]["reason"], "already-present");
-    assert!(
-        !fx.home.path().join("credentials/claude_1").exists(),
-        "a skipped account writes nothing"
-    );
+    assert_eq!(fx.stored(1), stored, "a skipped account writes nothing");
 
-    // `--force` is how a fresher credential for an account you already have
-    // gets in.
+    // A row that lost its credential takes the file's copy, whatever its age.
+    std::fs::remove_file(fx.home.path().join("credentials/claude_1")).unwrap();
+    let out = fx.import(&envelope, &[]);
+    assert_eq!(out["refreshed"], json!([1]));
+    assert_eq!(fx.stored(1), stored);
+
+    // The exporter's rotation — a provably newer generation of the same
+    // lineage — replaces the stored copy without `--force`.
+    let mut rotated = account(1, "one@example.com", "org-1");
+    rotated["credentials"]["claudeAiOauth"]["accessToken"] = json!("tok-1-rotated");
+    rotated["credentials"]["claudeAiOauth"]["expiresAt"] = json!(4_102_444_900_000i64);
+    let out = fx.import(&cswap_envelope(vec![rotated]), &[]);
+    assert_eq!(out["imported"], json!([]));
+    assert_eq!(out["refreshed"], json!([1]));
+    assert!(fx.stored(1).contains("tok-1-rotated"));
+
+    // An older generation is never written over its successor…
+    let out = fx.import(&envelope, &[]);
+    assert_eq!(out["skipped"][0]["reason"], "already-present");
+    assert!(fx.stored(1).contains("tok-1-rotated"));
+
+    // …except by `--force`, which rewrites regardless.
     let out = fx.import(&envelope, &["--force"]);
     assert_eq!(out["imported"], json!([1]));
+    assert!(fx.stored(1).contains("\"tok-1\""));
 }
 
 #[test]

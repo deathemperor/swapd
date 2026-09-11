@@ -13,6 +13,9 @@ use crate::output;
 pub struct ImportOutput {
     pub schema_version: u32,
     pub imported: Vec<u32>,
+    /// Slots already holding the account whose credential the file replaced
+    /// (a newer generation, or the stored one was missing).
+    pub refreshed: Vec<u32>,
     pub skipped: Vec<SkippedView>,
     /// The slot the file called active. Reported, never activated.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +38,7 @@ fn view(result: ImportResult) -> ImportOutput {
     ImportOutput {
         schema_version: output::SCHEMA_VERSION,
         imported: result.imported,
+        refreshed: result.refreshed,
         skipped: result
             .skipped
             .into_iter()
@@ -52,6 +56,9 @@ pub fn print_human(out: &ImportOutput) {
     println!("imported {} account(s)", out.imported.len());
     for slot in &out.imported {
         println!("  + slot {slot}");
+    }
+    for slot in &out.refreshed {
+        println!("  ~ slot {slot} (credential refreshed from the file)");
     }
     for skipped in &out.skipped {
         println!(

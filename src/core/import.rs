@@ -34,6 +34,11 @@ use crate::errors::{ErrorCode, Result, SwapdError};
 /// What an import did.
 pub struct ImportResult {
     pub imported: Vec<u32>,
+    /// Slots that already held the account and whose credential the file
+    /// replaced: the stored copy was provably an older generation
+    /// (`driver::live_is_older`) or missing altogether. The row is rewritten
+    /// from the file too, as `--force` would.
+    pub refreshed: Vec<u32>,
     pub skipped: Vec<Skipped>,
     /// The slot the envelope called active. Recorded for the caller, never
     /// activated: an import is not a switch, and the machine's live login is
@@ -112,25 +117,49 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
     // Pass 3: write, in the same lock cycle. All the rows go in one
     // `slots::update`, so an import lands as a table rather than as N separate
     // ones.
-    let (imported, skipped, failure) = slots::update(&ctx.home.slots_file(), |file| {
+    let (imported, refreshed, skipped, failure) = slots::update(&ctx.home.slots_file(), |file| {
         let existing = file.providers.entry(id.to_string()).or_default();
         let mut skipped: Vec<Skipped> = Vec::new();
-        let mut writing: Vec<Entry> = Vec::new();
+        // The entry, and whether it replaces a credential the slot already
+        // holds for the same account.
+        let mut writing: Vec<(Entry, bool)> = Vec::new();
 
         for entry in entries {
+            let mut refresh = false;
             if let Some(occupant) = existing.slots.get(&entry.slot) {
                 let same = slots::same_account(&entry.identity(), occupant);
                 if same {
-                    // Nothing to decide: the slot already holds this account.
-                    // `--force` still rewrites it, which is how a fresher
-                    // credential for an account you already have gets in.
+                    // The slot already holds this account. Its credential is
+                    // taken from the file when the stored copy is provably an
+                    // older generation of the lineage, or is missing: the
+                    // exporter (cswap, in phase 1) refreshes logins swapd
+                    // never sees otherwise, and an expired stored copy would
+                    // read `token-expired` until it did. A copy the file cannot
+                    // prove older is left alone, so an import never writes a
+                    // spent generation over its successor. `--force` rewrites
+                    // regardless, as before.
                     if !force {
-                        skipped.push(Skipped {
-                            slot: entry.slot,
-                            email: entry.email,
-                            reason: "already-present".to_string(),
-                        });
-                        continue;
+                        let key = crate::secrets::slot_key(id, entry.slot);
+                        let stored = ctx
+                            .secrets
+                            .get(&key)?
+                            .filter(|bytes| !bytes.trim().is_empty())
+                            .map(|bytes| Login { bytes });
+                        let newer = match &stored {
+                            None => true,
+                            Some(stored) => {
+                                crate::driver::live_is_older(provider, stored, &entry.login)
+                            }
+                        };
+                        if !newer {
+                            skipped.push(Skipped {
+                                slot: entry.slot,
+                                email: entry.email,
+                                reason: "already-present".to_string(),
+                            });
+                            continue;
+                        }
+                        refresh = true;
                     }
                 } else if !force {
                     // Refused rather than reported: silently skipping would
@@ -149,13 +178,14 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                     )));
                 }
             }
-            writing.push(entry);
+            writing.push((entry, refresh));
         }
 
         let mut imported: Vec<u32> = Vec::new();
+        let mut refreshed: Vec<u32> = Vec::new();
         let mut rows: Vec<(u32, Slot)> = Vec::new();
         let mut failure = None;
-        for entry in writing {
+        for (entry, refresh) in writing {
             // Secrets first, rows after: bytes without a row are unreferenced,
             // a row without bytes is a slot that cannot authenticate. A keychain
             // that fails part way therefore stops the import here and reports
@@ -199,14 +229,18 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 fingerprint: Some(entry.login.fingerprint()),
             };
             rows.push((entry.slot, meta));
-            imported.push(entry.slot);
+            if refresh {
+                refreshed.push(entry.slot);
+            } else {
+                imported.push(entry.slot);
+            }
         }
 
         let dirty = !rows.is_empty();
         for (slot, meta) in rows {
             existing.insert(slot, meta);
         }
-        Ok((dirty, (imported, skipped, failure)))
+        Ok((dirty, (imported, refreshed, skipped, failure)))
     })?;
 
     // Outside the lock, so the usage store's is never nested inside it: a slot
@@ -218,7 +252,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
     // fine. Every slot is still attempted — one quarantine that cannot be
     // lifted must not skip the rest.
     let mut quarantine = None;
-    for slot in &imported {
+    for slot in imported.iter().chain(&refreshed) {
         if let Err(e) = ctx.store.clear_dead(&crate::secrets::slot_key(id, *slot)) {
             quarantine.get_or_insert(e);
         }
@@ -229,6 +263,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
 
     Ok(ImportResult {
         imported,
+        refreshed,
         skipped,
         active_slot,
     })
@@ -518,6 +553,93 @@ mod tests {
         let value: Value = serde_json::from_str(&entry.login.bytes).unwrap();
         assert_eq!(value["oauthAccount"]["emailAddress"], "one@example.com");
         assert_eq!(value["claudeAiOauth"]["refreshToken"], "rt-1");
+    }
+
+    /// A `Ctx` over a temp home, an in-memory secret store and a fixed clock.
+    fn ctx_for(dir: &std::path::Path) -> Ctx {
+        let home = crate::paths::Home {
+            root: dir.to_path_buf(),
+        };
+        home.ensure().unwrap();
+        let store = crate::core::usage_store::UsageStore::new(&home.usage_file());
+        Ctx {
+            env: test_env(),
+            home,
+            secrets: Box::new(crate::secrets::MemorySecrets::new()),
+            clock: Box::new(|| 1_757_000_000.0),
+            settings: Default::default(),
+            store,
+        }
+    }
+
+    /// A cswap export naming one account in slot 1, whose access token
+    /// expires at `expires_at` (ms); the refresh token — the lineage — is the
+    /// same across generations, as a Claude refresh keeps it.
+    fn export_with(dir: &std::path::Path, expires_at: i64) -> String {
+        let path = dir.join(format!("export-{expires_at}.json"));
+        let envelope = json!({
+            "version": 1,
+            "accounts": [{
+                "number": 1,
+                "email": "one@example.com",
+                "credentials": {"claudeAiOauth": {
+                    "accessToken": format!("at-{expires_at}"),
+                    "refreshToken": "rt-1",
+                    "expiresAt": expires_at,
+                }},
+            }],
+        });
+        std::fs::write(&path, envelope.to_string()).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn stored_expiry(ctx: &Ctx) -> Option<i64> {
+        let bytes = ctx
+            .secrets
+            .get(&crate::secrets::slot_key("claude", 1))
+            .unwrap()?;
+        let value: Value = serde_json::from_str(&bytes).unwrap();
+        value["claudeAiOauth"]["expiresAt"].as_i64()
+    }
+
+    #[test]
+    fn an_already_present_account_takes_the_files_newer_generation_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(dir.path());
+        let driver = crate::driver::claude::live::ClaudeDriver::default_for_platform(&test_env());
+
+        // First import: the slot is new.
+        let first = run(&ctx, &driver, &export_with(dir.path(), 2_000), false).unwrap();
+        assert_eq!((first.imported, first.refreshed), (vec![1], vec![]));
+        assert_eq!(stored_expiry(&ctx), Some(2_000));
+
+        // The same file again: nothing newer, so nothing written.
+        let again = run(&ctx, &driver, &export_with(dir.path(), 2_000), false).unwrap();
+        assert!(again.imported.is_empty() && again.refreshed.is_empty());
+        assert_eq!(again.skipped.len(), 1);
+        assert_eq!(again.skipped[0].reason, "already-present");
+
+        // An older generation is never written over the stored one.
+        let older = run(&ctx, &driver, &export_with(dir.path(), 1_000), false).unwrap();
+        assert!(
+            older.refreshed.is_empty(),
+            "a spent generation must not replace its successor"
+        );
+        assert_eq!(stored_expiry(&ctx), Some(2_000));
+
+        // The exporter's rotation: a provably newer copy replaces the stored one.
+        let newer = run(&ctx, &driver, &export_with(dir.path(), 3_000), false).unwrap();
+        assert_eq!((newer.imported, newer.refreshed), (vec![], vec![1]));
+        assert!(newer.skipped.is_empty());
+        assert_eq!(stored_expiry(&ctx), Some(3_000));
+
+        // A row whose credential is gone takes the file's copy whatever its age.
+        ctx.secrets
+            .set(&crate::secrets::slot_key("claude", 1), "")
+            .unwrap();
+        let restored = run(&ctx, &driver, &export_with(dir.path(), 1_000), false).unwrap();
+        assert_eq!(restored.refreshed, vec![1]);
+        assert_eq!(stored_expiry(&ctx), Some(1_000));
     }
 
     #[test]

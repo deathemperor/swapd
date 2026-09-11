@@ -274,13 +274,27 @@ fn import_skips_an_account_the_slot_already_holds() {
     // cswap's envelope carries no `disabled`: a hold made here survives the
     // next re-import of the same file.
     fx.cmd().args(["hold", "1", "--json"]).output().unwrap();
-    let out = fx.import(&cswap_envelope(vec![renamed]), &[]);
+    let out = fx.import(&cswap_envelope(vec![renamed.clone()]), &[]);
     assert_eq!(out["updated"], json!([]));
     assert_eq!(out["skipped"][0]["reason"], "already-present");
     assert_eq!(
         fx.slots()["providers"]["claude"]["slots"]["1"]["disabled"],
         true
     );
+
+    // …and a rotation of the same account (a newer generation): the credential
+    // is replaced, the hold stays.
+    let mut rotated_held = renamed.clone();
+    rotated_held["credentials"]["claudeAiOauth"]["accessToken"] = json!("tok-1-rotated-2");
+    rotated_held["credentials"]["claudeAiOauth"]["expiresAt"] = json!(4_102_444_850_000i64);
+    let out = fx.import(&cswap_envelope(vec![rotated_held]), &[]);
+    assert_eq!(out["refreshed"], json!([1]));
+    assert!(fx.stored(1).contains("tok-1-rotated-2"));
+    assert_eq!(
+        fx.slots()["providers"]["claude"]["slots"]["1"]["disabled"],
+        true
+    );
+    fx.cmd().args(["unhold", "1", "--json"]).output().unwrap();
 
     // A row that lost its credential takes the file's copy, whatever its age.
     std::fs::remove_file(fx.home.path().join("credentials/claude_1")).unwrap();

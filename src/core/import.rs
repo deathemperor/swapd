@@ -36,8 +36,8 @@ pub struct ImportResult {
     pub imported: Vec<u32>,
     /// Slots that already held the account and whose credential the file
     /// replaced: the stored copy was provably an older generation
-    /// (`driver::live_is_older`) or missing altogether. The row is rewritten
-    /// from the file too, as `--force` would.
+    /// (`driver::live_is_older`) or missing altogether. The row keeps what
+    /// the file does not spell out, like an `updated` one.
     pub refreshed: Vec<u32>,
     /// Slots that already held the account, kept their stored credential (the
     /// file's copy was not provably newer), and took the file's row metadata —
@@ -56,10 +56,11 @@ pub struct ImportResult {
 enum Fate {
     /// A free slot: credential and row from the file.
     New,
-    /// The slot's account, with a newer credential in the file: both rewritten.
-    Refresh,
-    /// The slot's account, credential kept: the occupant's row with the file's
-    /// metadata.
+    /// The slot's account, with a newer credential in the file: the credential
+    /// and fingerprint from the file, the row otherwise as `Update`.
+    Refresh(Slot),
+    /// The slot's account, credential kept: the occupant's row with the labels
+    /// and choices the file carries.
     Update(Slot),
 }
 
@@ -209,7 +210,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                             }
                         };
                         if newer {
-                            fate = Fate::Refresh;
+                            fate = Fate::Refresh(occupant.clone());
                         } else if entry.metadata_differs(occupant) {
                             fate = Fate::Update(occupant.clone());
                         } else {
@@ -286,23 +287,35 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                 ));
                 break;
             }
-            let meta = Slot {
-                email: entry.email.clone(),
-                organization_uuid: entry.organization_uuid.clone(),
-                organization_name: entry.organization_name.clone(),
-                plan: entry.plan.clone(),
-                alias: entry.alias.clone(),
-                icon: entry.icon.clone(),
-                disabled: entry.disabled,
-                preferred: entry.preferred,
-                added: entry.added.clone(),
-                fingerprint: Some(entry.login.fingerprint()),
-            };
-            rows.push((entry.slot, meta));
-            if matches!(fate, Fate::Refresh) {
-                refreshed.push(entry.slot);
-            } else {
-                imported.push(entry.slot);
+            let fingerprint = Some(entry.login.fingerprint());
+            match fate {
+                Fate::Refresh(occupant) => {
+                    // A rotation of an account already held: the row is that
+                    // account's, so a hold or pin made here outlives it the
+                    // same way it outlives a re-import that changes nothing.
+                    let mut row = entry.apply_metadata(occupant);
+                    row.fingerprint = fingerprint;
+                    rows.push((entry.slot, row));
+                    refreshed.push(entry.slot);
+                }
+                _ => {
+                    rows.push((
+                        entry.slot,
+                        Slot {
+                            email: entry.email.clone(),
+                            organization_uuid: entry.organization_uuid.clone(),
+                            organization_name: entry.organization_name.clone(),
+                            plan: entry.plan.clone(),
+                            alias: entry.alias.clone(),
+                            icon: entry.icon.clone(),
+                            disabled: entry.disabled,
+                            preferred: entry.preferred,
+                            added: entry.added.clone(),
+                            fingerprint,
+                        },
+                    ));
+                    imported.push(entry.slot);
+                }
             }
         }
 

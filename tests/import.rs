@@ -296,6 +296,17 @@ fn import_skips_an_account_the_slot_already_holds() {
     );
     fx.cmd().args(["unhold", "1", "--json"]).output().unwrap();
 
+    // The organisation's display name is the file's whenever it is written
+    // (cswap always writes it); the uuid is identity and never moves.
+    let mut renamed_org = renamed.clone();
+    renamed_org["organizationName"] = json!("Org, renamed");
+    let out = fx.import(&cswap_envelope(vec![renamed_org]), &[]);
+    assert_eq!(out["updated"], json!([1]));
+    assert_eq!(
+        fx.slots()["providers"]["claude"]["slots"]["1"]["organizationName"],
+        "Org, renamed"
+    );
+
     // A row that lost its credential takes the file's copy, whatever its age.
     std::fs::remove_file(fx.home.path().join("credentials/claude_1")).unwrap();
     let out = fx.import(&envelope, &[]);

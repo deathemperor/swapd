@@ -17,7 +17,8 @@ pub struct ImportOutput {
     /// (a newer generation, or the stored one was missing).
     pub refreshed: Vec<u32>,
     /// Slots already holding the account that kept their credential and took
-    /// the file's alias, icon, held and preferred state.
+    /// the labels and flags the file spells out (organisation name, plan, alias,
+    /// icon, held, preferred).
     pub updated: Vec<u32>,
     pub skipped: Vec<SkippedView>,
     /// The slot the file called active. Reported, never activated.
@@ -65,7 +66,7 @@ pub fn print_human(out: &ImportOutput) {
         println!("  ~ slot {slot} (credential refreshed from the file)");
     }
     for slot in &out.updated {
-        println!("  ~ slot {slot} (alias, icon, held or preferred taken from the file)");
+        println!("  ~ slot {slot} (labels or flags taken from the file)");
     }
     for skipped in &out.skipped {
         println!(

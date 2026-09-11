@@ -41,9 +41,10 @@ pub struct ImportResult {
     pub refreshed: Vec<u32>,
     /// Slots that already held the account, kept their stored credential (the
     /// file's copy was not provably newer), and took the file's row metadata —
-    /// alias, icon, held, preferred — because it differed. The exporter is
-    /// where the user labels accounts in phase 1, and a label it changed after
-    /// the first import otherwise never reached swapd.
+    /// organisation name, plan, alias, icon, held, preferred — because it
+    /// differed. The exporter is where the user labels accounts in phase 1,
+    /// and a label it changed after the first import otherwise never reached
+    /// swapd.
     pub updated: Vec<u32>,
     pub skipped: Vec<Skipped>,
     /// The slot the envelope called active. Recorded for the caller, never
@@ -92,6 +93,8 @@ struct Entry {
 
 #[derive(Clone, Copy)]
 struct Carried {
+    organization_name: bool,
+    plan: bool,
     alias: bool,
     icon: bool,
     disabled: bool,
@@ -99,10 +102,13 @@ struct Carried {
 }
 
 impl Entry {
-    /// Whether a label or choice the file carries differs from the row's.
+    /// Whether a label, choice or organisation name the file carries differs
+    /// from the row's.
     fn metadata_differs(&self, slot: &Slot) -> bool {
         let c = self.carries;
-        (c.alias && self.alias != slot.alias)
+        (c.organization_name && self.organization_name != slot.organization_name)
+            || (c.plan && self.plan != slot.plan)
+            || (c.alias && self.alias != slot.alias)
             || (c.icon && self.icon != slot.icon)
             || (c.disabled && self.disabled != slot.disabled)
             || (c.preferred && self.preferred != slot.preferred)
@@ -112,6 +118,12 @@ impl Entry {
     /// file; the rest, and everything else in the row, as it was.
     fn apply_metadata(&self, mut row: Slot) -> Slot {
         let c = self.carries;
+        if c.organization_name {
+            row.organization_name = self.organization_name.clone();
+        }
+        if c.plan {
+            row.plan = self.plan.clone();
+        }
         if c.alias {
             row.alias = self.alias.clone();
         }
@@ -488,6 +500,8 @@ fn validate(provider: &dyn Driver, raw: &Value) -> Result<Entry> {
     let disabled = flag("disabled")?;
     let preferred = flag("preferred")?;
     let carries = Carried {
+        organization_name: account.contains_key("organizationName"),
+        plan: account.contains_key("plan"),
         alias: account.contains_key("alias"),
         icon: account.contains_key("icon"),
         disabled: account.contains_key("disabled"),

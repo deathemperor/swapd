@@ -455,13 +455,20 @@ fn active_unreadable_reports_switch_in_progress_and_is_absent_on_a_normal_pass()
         view.active_unreadable,
         Some("switch-in-progress".to_string())
     );
+    assert_eq!(
+        view.last_known_active_slot,
+        Some(1),
+        "the store's active slot rides beside the reason so a reader can carry it"
+    );
+    assert_eq!(view.active_slot, None);
     drop(held);
 
     let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
     assert_eq!(view.active_unreadable, None);
+    assert_eq!(view.last_known_active_slot, None);
     let json = serde_json::to_string(&view).unwrap();
     assert!(
-        !json.contains("activeUnreadable"),
+        !json.contains("activeUnreadable") && !json.contains("lastKnownActiveSlot"),
         "an absent reason must not be serialised: {json}"
     );
 }

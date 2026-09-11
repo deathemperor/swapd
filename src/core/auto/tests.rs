@@ -956,7 +956,10 @@ fn an_entry_without_a_fingerprint_is_released_not_moved() {
 
     let released = board.last("account-unquarantined").unwrap();
     assert_eq!(released["number"], 2);
-    assert_eq!(released["reason"], "account-removed", "no row: the account is gone (#16)");
+    assert_eq!(
+        released["reason"], "account-removed",
+        "no row: the account is gone (#16)"
+    );
     assert!(
         board.state().quarantine.is_empty(),
         "released, not re-keyed onto slot 3"

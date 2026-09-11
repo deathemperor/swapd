@@ -128,6 +128,8 @@ def map_cswap_account(account: dict) -> dict:
         "alias": account.get("alias") or "",
         "active": bool(account.get("active")),
         "usageStatus": account.get("usageStatus"),
+        # cswap's side of the same note: how old the reading it serves is.
+        "fetch": {"status": account.get("usageStatus"), "ageSeconds": account.get("usageAgeSeconds")},
         "usage": usage,
     }
 
@@ -187,14 +189,22 @@ def diff_account(cswap_row: dict, swapd_row: dict) -> list[tuple[str, object, ob
     for name in sorted(set(cswap_scoped) | set(swapd_scoped), key=lambda n: (n is None, n)):
         _diff_window(f"scoped[{name}]", cswap_scoped.get(name), swapd_scoped.get(name), rows)
     if any(row[3] == "MISMATCH" for row in rows):
-        rows.append(("swapd.fetch", "", _fetch_note(swapd_row.get("fetch") or {}), "NOTE"))
+        rows.append(
+            (
+                "fetch",
+                _fetch_note(cswap_row.get("fetch") or {}),
+                _fetch_note(swapd_row.get("fetch") or {}),
+                "NOTE",
+            )
+        )
     return rows
 
 
 def _fetch_note(fetch: dict) -> str:
-    """One line saying why swapd's side reads as it does: the raw status, the
-    age of the reading shown, and the store's last failure and backoff. A
-    `NOTE` row is not a field and never counts against the match total."""
+    """One line saying why a side reads as it does: the raw status, the age of
+    the reading shown and, for swapd, the store's last failure and backoff. A
+    `NOTE` row is not a field and never counts against the match total; two
+    fresh readings taken minutes apart differ because usage moved between them."""
     age = fetch.get("ageSeconds")
     parts = [str(fetch.get("status"))]
     if age is not None:

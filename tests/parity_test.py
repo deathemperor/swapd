@@ -153,8 +153,9 @@ class DiffAccountTest(unittest.TestCase):
                               backoffUntil="2026-09-09T06:00:00+00:00")
         rows = parity.diff_account(parity.map_cswap_account(cswap_account()), parity.map_swapd_account(swapd))
         note = rows[-1]
-        self.assertEqual(note[0], "swapd.fetch")
+        self.assertEqual(note[0], "fetch")
         self.assertEqual(note[3], "NOTE")
+        self.assertTrue(note[1].startswith("ok"), note[1])
         self.assertIn("stale", note[2])
         self.assertIn("lastError http-429", note[2])
         self.assertIn("backoff until 2026-09-09T06:00:00Z", note[2])
@@ -172,7 +173,7 @@ class DiffAccountTest(unittest.TestCase):
 
     def test_note_rows_do_not_count_as_fields(self):
         import contextlib, io
-        diff = {"you@example.com": [("alias", "a", "b", "MISMATCH"), ("swapd.fetch", "", "stale", "NOTE")]}
+        diff = {"you@example.com": [("alias", "a", "b", "MISMATCH"), ("fetch", "ok, age 3s", "stale", "NOTE")]}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             mismatches = parity._print_table(diff)

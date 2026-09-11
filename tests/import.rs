@@ -254,7 +254,22 @@ fn import_skips_an_account_the_slot_already_holds() {
     assert_eq!(out["refreshed"], json!([]));
     assert_eq!(out["skipped"][0]["slot"], 1);
     assert_eq!(out["skipped"][0]["reason"], "already-present");
+    assert_eq!(out["updated"], json!([]));
     assert_eq!(fx.stored(1), stored, "a skipped account writes nothing");
+
+    // The same generation with a new alias: the credential stays, the row
+    // takes the file's labels, and the run is reported as `updated`.
+    let mut renamed = account(1, "one@example.com", "org-1");
+    renamed["alias"] = json!("renamed");
+    let out = fx.import(&cswap_envelope(vec![renamed]), &[]);
+    assert_eq!(out["refreshed"], json!([]));
+    assert_eq!(out["updated"], json!([1]));
+    assert_eq!(out["skipped"], json!([]));
+    assert_eq!(fx.stored(1), stored);
+    assert_eq!(
+        fx.slots()["providers"]["claude"]["slots"]["1"]["alias"],
+        "renamed"
+    );
 
     // A row that lost its credential takes the file's copy, whatever its age.
     std::fs::remove_file(fx.home.path().join("credentials/claude_1")).unwrap();

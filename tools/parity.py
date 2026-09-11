@@ -67,7 +67,12 @@ def map_swapd_account(account: dict) -> dict:
     cswap's `account_row` shape (json_output.py:213), the subset this script
     compares."""
     usage: dict = {"fiveHour": None, "sevenDay": None, "spend": None, "scoped": []}
-    for window in account.get("windows") or []:
+    # A `stale` row (a reading past STALE_OK_S that the poll plan has not
+    # re-fetched yet — candidates poll every 600 s) carries its measurement
+    # under `lastGood`; cswap serves the same reading as current, and so does
+    # the app's mapping (`stale` → ok with lastGoodUsage). Compare those.
+    windows = account.get("windows") or (account.get("lastGood") or {}).get("windows") or []
+    for window in windows:
         kind = window.get("kind")
         mapped = _normalize_window_resets_at(window)
         if kind == "5h":

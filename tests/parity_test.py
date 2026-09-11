@@ -159,6 +159,13 @@ class DiffAccountTest(unittest.TestCase):
         self.assertIn("lastError http-429", note[2])
         self.assertIn("backoff until 2026-09-09T06:00:00Z", note[2])
 
+    def test_a_stale_row_compares_its_last_good_windows(self):
+        swapd = swapd_account(usageStatus="stale")
+        swapd["lastGood"] = {"fetchedAt": "2026-09-09T01:00:00Z", "ageSeconds": 480.0, "windows": swapd.pop("windows")}
+        swapd["windows"] = []
+        rows = parity.diff_account(parity.map_cswap_account(cswap_account()), parity.map_swapd_account(swapd))
+        self.assertTrue(all(r[3] == "OK" for r in rows), rows)
+
     def test_a_clean_account_carries_no_note(self):
         rows = parity.diff_account(parity.map_cswap_account(cswap_account()), parity.map_swapd_account(swapd_account()))
         self.assertFalse(any(r[3] == "NOTE" for r in rows))

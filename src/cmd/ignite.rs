@@ -9,7 +9,8 @@ use serde::Serialize;
 
 use crate::contract::ListPayload;
 use crate::core::collect::{collect, CollectOpts};
-use crate::core::slots;
+use crate::core::slots::{self, LOCK_TIMEOUT};
+use crate::core::store::FileLock;
 use crate::core::switch::resolve;
 use crate::ctx::Ctx;
 use crate::driver::claude::usage::format_ts;
@@ -60,6 +61,10 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<IgniteOutput> 
         ));
     }
 
+    // The slot is in use from before its login is refreshed until the
+    // rotation is persisted and committed (see `cmd::run`); a renumber skips
+    // a slot whose lock is held.
+    let session = FileLock::acquire_shared(&ctx.home.run_lock_base(id, slot), LOCK_TIMEOUT)?;
     let login = super::login_to_run(ctx, driver, slot)?;
     let outcome = driver.ignite(&ctx.env, slot, &login)?;
 
@@ -77,6 +82,7 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<IgniteOutput> 
         // account and seed the older generation over the rotation.
         driver.commit_profile(&ctx.env, slot, login)?;
     }
+    drop(session);
     if outcome.exit_code != 0 {
         return Err(SwapdError::new(
             ErrorCode::Http,

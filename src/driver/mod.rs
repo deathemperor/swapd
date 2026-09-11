@@ -327,6 +327,15 @@ pub trait Driver: Send + Sync {
     /// inherited "nothing to do" would leave a live credential behind for an
     /// account swapd has forgotten.
     fn forget_profile(&self, env: &Env, slot: u32) -> Result<(), DriverError>;
+    /// Re-key whatever slot `from`'s run profile keeps *outside* its directory
+    /// to slot `to`, before `compact` renames the directory itself.
+    ///
+    /// The Claude driver's keychain item is named after the config dir's
+    /// exact path, so a renamed directory would otherwise start a fresh
+    /// profile with no credential — and leave the old item behind under a
+    /// name nothing derives any more. No default, for `forget_profile`'s
+    /// reason.
+    fn relocate_profile(&self, env: &Env, from: u32, to: u32) -> Result<(), DriverError>;
     /// The CLI's own config file for the live login, as text — `None` when the
     /// CLI keeps no such file or it is not there.
     ///

@@ -540,6 +540,90 @@ fn run_passes_argv_through_the_profile_and_propagates_the_exit_code() {
         .exists());
 }
 
+/// A slot whose CLI is running cannot be renumbered: `remove` stops at it and
+/// `compact` finishes once the session ends (#22).
+#[cfg(unix)]
+#[test]
+fn a_live_session_stops_the_renumber_until_compact() {
+    let fx = Fixture::new();
+    fx.write_second_slot();
+    // A stub that reports in, then waits to be released.
+    let release = fx.bin.path().join("release");
+    let script = format!(
+        "#!/bin/sh\nprintf 'config:%s\\n' \"$CLAUDE_CONFIG_DIR\" > '{}'\n\
+         while [ ! -e '{}' ]; do sleep 0.05; done\n",
+        fx.witness_path().display(),
+        release.display()
+    );
+    let path = fx.bin.path().join("claude");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `assert_cmd` only runs to completion; the session has to stay open
+    // while `remove` runs, so it is a plain `std` child with the same setup.
+    let configured = fx.cmd();
+    let mut command = std::process::Command::new(configured.get_program());
+    command.env_clear();
+    for (key, value) in configured.get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    let child = command.args(["run", "two", "--"]).spawn().unwrap();
+    // A failed assertion must not leave the session running: the stub would
+    // spin forever and the child holds the test's stdout open, so the whole
+    // run would wait on it. Releasing the stub ends both.
+    struct Session(std::process::Child, PathBuf);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.1, "");
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Session(child, release.clone());
+    let started = std::time::Instant::now();
+    while !fx.witness_path().exists() {
+        assert!(started.elapsed().as_secs() < 20, "the stub never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Slot 2 would move to 1, but its profile is in use.
+    let out = fx.run(&["remove", "one", "--yes", "--json"]);
+    assert_eq!(out["moves"], json!([]));
+    assert_eq!(out["stoppedAt"]["slot"], 2);
+    assert_eq!(
+        out["stoppedAt"]["reason"],
+        "a live session is using its profile"
+    );
+    let slots = fx.slots();
+    assert!(slots["providers"]["claude"]["slots"]["1"].is_null());
+    assert_eq!(
+        slots["providers"]["claude"]["slots"]["2"]["email"],
+        "two@example.com"
+    );
+    assert!(fx.home.path().join("profiles/claude/2").is_dir());
+
+    std::fs::write(&release, "").unwrap();
+    assert!(child.0.wait().unwrap().success());
+
+    let out = fx.run(&["compact", "--json"]);
+    assert_eq!(out["moves"], json!([{"from": 2, "to": 1}]));
+    assert!(out["stoppedAt"].is_null());
+    let slots = fx.slots();
+    assert_eq!(
+        slots["providers"]["claude"]["slots"]["1"]["email"],
+        "two@example.com"
+    );
+    assert!(fx.home.path().join("profiles/claude/1").is_dir());
+    assert!(!fx.home.path().join("profiles/claude/2").exists());
+    assert!(
+        fx.stored_login().contains("rt-2"),
+        "the credential followed the row to slot 1"
+    );
+}
+
 #[test]
 fn run_refreshes_an_expired_login_before_it_starts_the_cli() {
     let fx = Fixture::new();

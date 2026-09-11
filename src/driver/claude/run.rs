@@ -494,6 +494,40 @@ pub fn forget_profile(driver: &ClaudeDriver, env: &Env, slot: u32) -> Result<(),
     .map_err(live::map_security_error)
 }
 
+/// Move the keychain item Claude Code named after slot `from`'s config dir to
+/// the name slot `to`'s dir hashes to (see `forget_profile` for why the item
+/// exists and how it is named). Copy first, delete second: a failure between
+/// the two leaves the credential under both names, never under neither. No
+/// item, or no keychain, is nothing to move.
+pub fn relocate_profile(
+    driver: &ClaudeDriver,
+    env: &Env,
+    from: u32,
+    to: u32,
+) -> Result<(), DriverError> {
+    let LiveStore::Keychain(cli) = &driver.store else {
+        return Ok(());
+    };
+    let (Some(from_dir), Some(to_dir)) = (
+        profile_dir(env, from).to_str().map(str::to_string),
+        profile_dir(env, to).to_str().map(str::to_string),
+    ) else {
+        return Ok(());
+    };
+    let account = live::keychain_account(env);
+    let from_service = paths::keychain_service_name(&from_dir);
+    let Some(value) = cli
+        .find(&from_service, Some(&account))
+        .map_err(live::map_security_error)?
+    else {
+        return Ok(());
+    };
+    cli.add(&paths::keychain_service_name(&to_dir), &account, &value)
+        .map_err(live::map_security_error)?;
+    cli.delete(&from_service, &account)
+        .map_err(live::map_security_error)
+}
+
 /// The environment that selects slot `slot`'s profile, without creating or
 /// seeding anything.
 fn profile_env(env: &Env, slot: u32) -> Result<Env, DriverError> {
@@ -861,6 +895,37 @@ mod tests {
         // keychain at all — Linux, Windows — has nothing to delete.
         forget_profile(&driver, &env, 3).unwrap();
         forget_profile(&ClaudeDriver::new(LiveStore::File, endpoints()), &env, 3).unwrap();
+    }
+
+    #[test]
+    fn relocate_profile_moves_the_item_to_the_new_dirs_name() {
+        let home = temp_home();
+        let env = env_with(&home, [("USER", "tester")]);
+        let fake = std::sync::Arc::new(crate::security_cli::FakeSecurity::default());
+        let driver = ClaudeDriver::new(LiveStore::Keychain(fake.clone()), endpoints());
+        let service_of =
+            |slot: u32| paths::keychain_service_name(profile_dir(&env, slot).to_str().unwrap());
+        fake.add(&service_of(3), "tester", "rt-three").unwrap();
+        fake.add(paths::DEFAULT_SERVICE, "tester", "live").unwrap();
+
+        relocate_profile(&driver, &env, 3, 2).unwrap();
+        assert_eq!(
+            fake.find(&service_of(2), None).unwrap().as_deref(),
+            Some("rt-three")
+        );
+        assert_eq!(fake.find(&service_of(3), None).unwrap(), None);
+        assert_eq!(
+            fake.find(paths::DEFAULT_SERVICE, None).unwrap().as_deref(),
+            Some("live")
+        );
+
+        // No item under the old name is nothing to move, and so is no keychain.
+        relocate_profile(&driver, &env, 3, 2).unwrap();
+        assert_eq!(
+            fake.find(&service_of(2), None).unwrap().as_deref(),
+            Some("rt-three")
+        );
+        relocate_profile(&ClaudeDriver::new(LiveStore::File, endpoints()), &env, 2, 1).unwrap();
     }
 
     #[test]

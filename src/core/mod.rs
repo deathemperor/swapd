@@ -1,5 +1,6 @@
 pub mod auto;
 pub mod collect;
+pub mod compact;
 pub mod events;
 pub mod history;
 pub mod import;

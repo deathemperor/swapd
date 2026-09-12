@@ -321,7 +321,10 @@ fn write(path: &Path, contents: &str) {
 
 fn usage_body(five_hour: f64, seven_day: f64) -> Value {
     json!({
-        "five_hour": { "utilization": five_hour, "resets_at": "2026-09-09T05:59:59Z" },
+        // An open window: a reset ahead of the real clock, the shape a fetch
+        // after a run reports. A reset in the past would read as cold and
+        // make `ignite` wait for the endpoint to catch up.
+        "five_hour": { "utilization": five_hour, "resets_at": "2099-01-01T05:59:59Z" },
         "seven_day": { "utilization": seven_day },
     })
 }
@@ -413,6 +416,7 @@ fn ignite_runs_igniter_then_forces_refresh() {
     other.assert_hits(1);
     assert_eq!(out["ignited"]["slot"], 1);
     assert_eq!(out["ignited"]["rotated"], true);
+    assert_eq!(out["ignited"]["windowSeen"], true);
     assert!(out["ignited"]["at"].as_str().unwrap().ends_with('Z'));
     // The payload is `list`'s, so one call both ignites and reports the board.
     assert_eq!(out["schemaVersion"], 1);

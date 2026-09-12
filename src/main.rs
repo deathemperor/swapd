@@ -339,7 +339,7 @@ fn run(cli: &Cli) -> Result<()> {
             refuse_in_shadow("ignite")?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
-            let out = cmd::ignite::run(&ctx, driver.as_ref(), ident)?;
+            let out = cmd::ignite::run(&ctx, driver.as_ref(), ident, &std::thread::sleep)?;
             emit(&out, cli.json, || cmd::ignite::print_human(&out))
         }
         Command::Run { ident, args } => {

@@ -4,7 +4,7 @@
 //! is a `Mutex<String>`, a temp swapd home, an in-memory secret store. No
 //! network, no keychain, no `~/.claude*`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +29,15 @@ pub struct FakeDriver {
     pub switch_during_refresh: Mutex<Option<String>>,
     /// How long the token endpoint takes, so two refreshers really overlap.
     pub refresh_delay: Duration,
+    /// Whether `installed` names a binary — what `ignite` checks first.
+    installed: bool,
+    /// Whether `ignite` runs (exit 0, no rotation) instead of being unsupported.
+    ignitable: bool,
+    /// What successive `usage` calls answer, the last answer repeating; empty
+    /// windows once (or while) there is none.
+    usage_answers: Mutex<VecDeque<Vec<Window>>>,
+    /// How many times `usage` was called.
+    pub usages: Mutex<u32>,
 }
 
 impl FakeDriver {
@@ -40,7 +49,26 @@ impl FakeDriver {
             usable: Mutex::new(BTreeSet::new()),
             switch_during_refresh: Mutex::new(None),
             refresh_delay: Duration::ZERO,
+            installed: false,
+            ignitable: false,
+            usage_answers: Mutex::new(VecDeque::new()),
+            usages: Mutex::new(0),
         }
+    }
+
+    pub fn installed(mut self) -> Self {
+        self.installed = true;
+        self
+    }
+
+    pub fn ignitable(mut self) -> Self {
+        self.ignitable = true;
+        self
+    }
+
+    pub fn usage_answers(self, answers: Vec<Vec<Window>>) -> Self {
+        *self.usage_answers.lock().unwrap() = answers.into();
+        self
     }
 
     /// Mark this refresh token's access token as good, so `usage()` answers.
@@ -82,7 +110,8 @@ impl Driver for FakeDriver {
         "claude"
     }
     fn installed(&self, _env: &crate::driver::Env) -> Option<std::path::PathBuf> {
-        None
+        self.installed
+            .then(|| std::path::PathBuf::from("/fake/claude"))
     }
     fn read_live(&self, _env: &crate::driver::Env) -> std::result::Result<Login, DriverError> {
         match self.live.lock().unwrap().clone() {
@@ -135,8 +164,15 @@ impl Driver for FakeDriver {
         if !self.usable.lock().unwrap().contains(&Self::token_of(login)) {
             return Err(DriverError::NeedsRefresh);
         }
+        *self.usages.lock().unwrap() += 1;
+        let mut answers = self.usage_answers.lock().unwrap();
+        let windows = if answers.len() > 1 {
+            answers.pop_front().unwrap()
+        } else {
+            answers.front().cloned().unwrap_or_default()
+        };
         Ok(Usage {
-            windows: Vec::new(),
+            windows,
             fetched_at: 1_757_000_000.0,
         })
     }
@@ -146,7 +182,13 @@ impl Driver for FakeDriver {
         _slot: u32,
         _login: &Login,
     ) -> std::result::Result<IgniteOutcome, DriverError> {
-        Err(DriverError::Unsupported("ignite"))
+        if !self.ignitable {
+            return Err(DriverError::Unsupported("ignite"));
+        }
+        Ok(IgniteOutcome {
+            exit_code: 0,
+            rotated: None,
+        })
     }
     fn run_profile(
         &self,

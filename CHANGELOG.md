@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- ignite: the forced re-fetch after the run is repeated on a short backoff (3, 7, 15, 30 s) while the usage endpoint still reads the account as cold, and the reply's `ignited.windowSeen` says whether the 5h window ever showed a reset ahead; the human line adds "window not visible yet" when it did not.
+
 ## 0.1.0 — 2026-09-11
 
 - list --json carries `lastKnownActiveSlot` beside `activeUnreadable` so a reader keeps the active slot through a switch (#28)

@@ -18,27 +18,49 @@ pub struct Login {
     pub bytes: String,
 }
 
+/// Keys naming the refresh token in the envelopes swapd itself writes (the
+/// Claude envelope is Claude Code's blob plus `oauthAccount`; the Gemini
+/// envelope is `{oauth_creds, google_account}`), so reading them is core
+/// reading its own format, not a provider's token.
+const REFRESH_TOKEN_POINTERS: [&str; 2] =
+    ["/claudeAiOauth/refreshToken", "/oauth_creds/refresh_token"];
+
 impl Login {
+    /// The envelope's non-empty refresh token, when it carries one.
+    ///
+    /// A refresh token is the one member that survives an access-token
+    /// refresh, which is what makes it the identity of a stored login across
+    /// generations — and what makes its ABSENCE terminal: without it there is
+    /// nothing to spend on a renewal, so no pass can ever make the login work
+    /// again.
+    fn refresh_token(&self) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(&self.bytes).ok()?;
+        REFRESH_TOKEN_POINTERS
+            .iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(|v| v.as_str()))
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether this login can ever be renewed: it carries a refresh token.
+    ///
+    /// `false` is terminal, not transient. A live store blanked to
+    /// `{"accessToken":"","refreshToken":"","expiresAt":0}` (observed
+    /// 2026-09-13, Claude Code logged out under swapd) is expired on every
+    /// pass and refreshable on none, so reporting it as merely "expired" asks
+    /// the user to wait for a retry that can never succeed.
+    ///
+    /// API-key logins carry no refresh token either and are not broken by it;
+    /// callers ask `is_api_key` first (`credential_sentinel` does).
+    pub fn is_renewable(&self) -> bool {
+        self.refresh_token().is_some()
+    }
+
     /// The refresh token's sha256 when the envelope carries one, else the
     /// sha256 of the raw bytes; empty bytes fingerprint to "".
-    ///
-    /// Both pointers name keys of envelopes swapd itself writes (the Claude
-    /// envelope is Claude Code's blob plus `oauthAccount`; the Gemini envelope
-    /// is `{oauth_creds, google_account}`), so this is core reading its own
-    /// format, not a provider's token. A refresh token is the one member that
-    /// survives an access-token refresh, which is what makes it the identity
-    /// of a stored login across generations.
     pub fn fingerprint(&self) -> String {
-        const REFRESH_TOKEN_POINTERS: [&str; 2] =
-            ["/claudeAiOauth/refreshToken", "/oauth_creds/refresh_token"];
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.bytes) {
-            for pointer in REFRESH_TOKEN_POINTERS {
-                if let Some(token) = value.pointer(pointer).and_then(|v| v.as_str()) {
-                    if !token.is_empty() {
-                        return format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
-                    }
-                }
-            }
+        if let Some(token) = self.refresh_token() {
+            return format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
         }
         if self.bytes.trim().is_empty() {
             return String::new();
@@ -458,6 +480,36 @@ mod tests {
             bytes: String::new(),
         };
         assert_eq!(login.fingerprint(), "");
+    }
+
+    #[test]
+    fn is_renewable_follows_the_refresh_token() {
+        let claude = Login {
+            bytes: r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":0}}"#
+                .to_string(),
+        };
+        assert!(claude.is_renewable());
+        let gemini = Login {
+            bytes: r#"{"oauth_creds":{"access_token":"a1","refresh_token":"r-gem"}}"#.to_string(),
+        };
+        assert!(gemini.is_renewable());
+
+        // The shape the blanked keychain item had: the envelope is there, the
+        // token that would renew it is not. Nothing later can fix this.
+        let blanked = Login {
+            bytes: r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#
+                .to_string(),
+        };
+        assert!(!blanked.is_renewable());
+        // An API key and a torn envelope carry none either.
+        assert!(!Login {
+            bytes: "sk-ant-api03-fake-key".to_string()
+        }
+        .is_renewable());
+        assert!(!Login {
+            bytes: String::new()
+        }
+        .is_renewable());
     }
 
     #[test]

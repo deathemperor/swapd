@@ -47,8 +47,8 @@ const MAX_FETCH_THREADS: usize = 4;
 /// `FetchOpts` and leaves the preamble alone.
 #[derive(Default)]
 pub struct FetchOpts {
-    /// Slots to fetch regardless of freshness or plan (`refresh --slot n`).
-    /// Backoff, claims and the dead-token quarantine still apply.
+    /// Slots to fetch regardless of freshness, plan or failure backoff
+    /// (`refresh --slot n`). Claims and the dead-token quarantine still apply.
     pub force_slots: Vec<u32>,
     /// Fetch every account whose plan is due *or* whose data is stale
     /// (`refresh`), rather than the on-demand "stale and due" rule.
@@ -65,8 +65,8 @@ pub struct FetchOpts {
 /// half's, kept as one shape because every verb but the auto engine wants both
 /// at once (`collect`).
 pub struct CollectOpts {
-    /// Slots to fetch regardless of freshness or plan (`refresh --slot n`).
-    /// Backoff, claims and the dead-token quarantine still apply.
+    /// Slots to fetch regardless of freshness, plan or failure backoff
+    /// (`refresh --slot n`). Claims and the dead-token quarantine still apply.
     pub force_slots: Vec<u32>,
     /// Fetch every account whose plan is due *or* whose data is stale
     /// (`refresh`), rather than the on-demand "stale and due" rule.
@@ -508,7 +508,14 @@ fn execute_inner(
             .and_then(|login| provider.expires_at(login))
             .is_some_and(|expires_at| expires_at < now);
         if expired || st.heal_live {
-            st.sentinel = Some(UsageStatus::TokenExpired);
+            // Expired with nothing to renew it is terminal: say so, rather
+            // than name a retry that can never land.
+            let renewable = st.login.as_ref().is_some_and(Login::is_renewable);
+            st.sentinel = Some(if renewable {
+                UsageStatus::TokenExpired
+            } else {
+                UsageStatus::ReloginRequired
+            });
         }
     }
 
@@ -626,6 +633,12 @@ fn adopt_successor(
 
 /// The sentinel a slot carries before the usage table has been consulted:
 /// everything the credential alone (or the absence of one) decides.
+///
+/// A login carrying no refresh token answers `ReloginRequired`, not
+/// `TokenExpired`: with nothing to spend on a renewal it is expired on every
+/// pass and refreshable on none, and only a re-login can fix it. The two are
+/// told apart HERE rather than at the expiry check because the distinction is
+/// a property of the credential, which is what this function reads.
 fn credential_sentinel(
     provider: &dyn Driver,
     slot: u32,
@@ -636,6 +649,7 @@ fn credential_sentinel(
         _ if unreadable_active == Some(slot) => Some(UsageStatus::Stale),
         None => Some(UsageStatus::NoCredentials),
         Some(login) if provider.is_api_key(login) => Some(UsageStatus::ApiKey),
+        Some(login) if !login.is_renewable() => Some(UsageStatus::ReloginRequired),
         Some(_) => None,
     }
 }
@@ -981,9 +995,16 @@ fn refresh_then_usage(
                 .record_failure(&st.key, claim, "refresh", None, None)?;
             // An expired ACTIVE credential nothing could refresh this pass is
             // the state the auto engine must idle-hold on, not a failed fetch
-            // (`switcher.py:4810-4830`).
+            // (`switcher.py:4810-4830`). A credential with no refresh token to
+            // spend is not that state: no later pass can renew it, so it is
+            // reported as terminal rather than as a retry in progress.
+            let terminal = !login.is_renewable();
             return Ok(Fetched {
-                sentinel: st.active.then_some(UsageStatus::TokenExpired),
+                sentinel: if terminal {
+                    Some(UsageStatus::ReloginRequired)
+                } else {
+                    st.active.then_some(UsageStatus::TokenExpired)
+                },
                 live_synced: healed,
             });
         }

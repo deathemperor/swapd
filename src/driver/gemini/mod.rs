@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::driver::{
-    Caps, Driver, DriverError, Env, Identity, IgniteOutcome, Login, RunProfile, Usage,
+    Caps, Driver, DriverError, Env, Identity, IgniteFailure, IgniteOutcome, Login, RunProfile,
+    Usage,
 };
 
 pub struct GeminiDriver {
@@ -110,7 +111,7 @@ impl Driver for GeminiDriver {
     fn usage(&self, login: &Login) -> Result<Usage, DriverError> {
         usage::usage(self, login)
     }
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError> {
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, IgniteFailure> {
         run::ignite(self, env, slot, login)
     }
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError> {

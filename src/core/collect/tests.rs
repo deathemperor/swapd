@@ -33,6 +33,9 @@ pub struct FakeDriver {
     installed: bool,
     /// Whether `ignite` runs (exit 0, no rotation) instead of being unsupported.
     ignitable: bool,
+    /// Makes `ignite` answer this error, carrying a rotation made before it —
+    /// a driver that refreshed and then failed the request it refreshed for.
+    ignite_fails_after_rotating: Option<String>,
     /// What successive `usage` calls answer, the last answer repeating; empty
     /// windows once (or while) there is none.
     usage_answers: Mutex<VecDeque<Vec<Window>>>,
@@ -51,6 +54,7 @@ impl FakeDriver {
             refresh_delay: Duration::ZERO,
             installed: false,
             ignitable: false,
+            ignite_fails_after_rotating: None,
             usage_answers: Mutex::new(VecDeque::new()),
             usages: Mutex::new(0),
         }
@@ -63,6 +67,12 @@ impl FakeDriver {
 
     pub fn ignitable(mut self) -> Self {
         self.ignitable = true;
+        self
+    }
+
+    /// `ignite` answers `Http(message)` with the rotation it had already made.
+    pub fn ignite_fails_after_rotating(mut self, message: &str) -> Self {
+        self.ignite_fails_after_rotating = Some(message.to_string());
         self
     }
 
@@ -180,10 +190,18 @@ impl Driver for FakeDriver {
         &self,
         _env: &crate::driver::Env,
         _slot: u32,
-        _login: &Login,
-    ) -> std::result::Result<IgniteOutcome, DriverError> {
+        login: &Login,
+    ) -> std::result::Result<IgniteOutcome, crate::driver::IgniteFailure> {
         if !self.ignitable {
-            return Err(DriverError::Unsupported("ignite"));
+            return Err(DriverError::Unsupported("ignite").into());
+        }
+        if let Some(message) = &self.ignite_fails_after_rotating {
+            return Err(crate::driver::IgniteFailure {
+                error: DriverError::Http(message.clone()),
+                rotated: Some(Login {
+                    bytes: login.bytes.replace("rt-", "rt-next-"),
+                }),
+            });
         }
         Ok(IgniteOutcome {
             exit_code: 0,

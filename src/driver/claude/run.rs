@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 use crate::driver::claude::live::{self, ClaudeDriver, LiveStore};
 use crate::driver::claude::paths;
 use crate::driver::fsutil::{create_private_dir_all, is_executable};
-use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
+use crate::driver::{DriverError, Env, IgniteFailure, IgniteOutcome, Login, RunProfile};
 
 /// The user customizations that follow an account into its profile
 /// (`session.py:76-83`, cswap's default share set). Files and directories
@@ -620,7 +620,7 @@ pub fn ignite(
     env: &Env,
     slot: u32,
     login: &Login,
-) -> Result<IgniteOutcome, DriverError> {
+) -> Result<IgniteOutcome, IgniteFailure> {
     let profile = run_profile(driver, env, slot, login)?;
     let path_var = env.vars.get("PATH").map(String::as_str);
     let home = paths::home(env)?;
@@ -663,7 +663,7 @@ pub fn ignite(
                 if start.elapsed() >= IGNITE_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(DriverError::Http("igniter timed out".to_string()));
+                    return Err(DriverError::Http("igniter timed out".to_string()).into());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -679,7 +679,7 @@ pub fn ignite(
         // Killed by a signal: no exit status at all, so nothing to report a code
         // for. The rotation (if any) is still in the profile, and the next run
         // reads it back.
-        return Err(DriverError::Http("igniter killed by a signal".to_string()));
+        return Err(DriverError::Http("igniter killed by a signal".to_string()).into());
     };
     let rotated = match &profile.read_back {
         Some(read_back) => read_back()?,
@@ -704,7 +704,7 @@ mod tests {
 
     /// `Result::unwrap_err` needs `T: Debug`, which neither `Login` (it holds
     /// the credential) nor `RunProfile` (it holds a closure) has.
-    fn expect_err<T>(result: Result<T, DriverError>) -> DriverError {
+    fn expect_err<T, E>(result: Result<T, E>) -> E {
         match result {
             Err(e) => e,
             Ok(_) => panic!("expected an error"),
@@ -1432,7 +1432,8 @@ mod tests {
         let home = temp_home();
         let env = env_with(&home, [("USER", "tester"), ("PATH", "")]);
         let driver = ClaudeDriver::new(LiveStore::File, endpoints());
-        let err = expect_err(ignite(&driver, &env, 1, &login()));
-        assert!(matches!(err, DriverError::NotInstalled));
+        let failure = expect_err(ignite(&driver, &env, 1, &login()));
+        assert!(matches!(failure.error, DriverError::NotInstalled));
+        assert!(failure.rotated.is_none(), "nothing ran, so nothing rotated");
     }
 }

@@ -939,8 +939,9 @@ mod tests {
             _env: &crate::driver::Env,
             _slot: u32,
             _login: &Login,
-        ) -> std::result::Result<crate::driver::IgniteOutcome, DriverError> {
-            Err(DriverError::Unsupported("ignite"))
+        ) -> std::result::Result<crate::driver::IgniteOutcome, crate::driver::IgniteFailure>
+        {
+            Err(DriverError::Unsupported("ignite").into())
         }
         fn run_profile(
             &self,

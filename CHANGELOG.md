@@ -5,6 +5,8 @@
 - A credential carrying no refresh token reports `relogin-required` instead of `token-expired`: nothing can renew it, so naming a retry that can never land left the status stuck on "retrying" forever (#30).
 - `refresh --slot n` now fetches through the failure backoff, which was a cadence rule for automatic passes and silently dropped an explicit ask; the reply's `skipped` names the two gates a force still does not override (a live claim, a dead-token quarantine) rather than returning the unchanged list as if the fetch had happened (#31).
 - ignite: the forced re-fetch after the run is repeated on a short backoff (3, 7, 15, 30 s) while the usage endpoint still reads the account as cold, and the reply's `ignited.windowSeen` says whether the 5h window ever showed a reset ahead; the human line adds "window not visible yet" when it did not.
+- `list` (text): an account with no 5h/7d window — the Gemini shape, one scoped bucket per model — names its binding bucket (`gemini-2.5-pro 75%`) where the two columns go, instead of reading `- / -` about an account swapd had just measured (#18).
+- ignite: a rotation the run made survives a failure that produced no exit status. The Gemini igniter refreshes and retries the quota call, and a retry that failed for its own reasons (a 500, a timeout) used to drop the refreshed credential — losing the new refresh token when the reply carried one (#18).
 
 ## 0.1.0 — 2026-09-11
 

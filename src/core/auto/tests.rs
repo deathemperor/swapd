@@ -179,8 +179,8 @@ impl Driver for FakeDriver {
         _env: &Env,
         _slot: u32,
         _login: &Login,
-    ) -> std::result::Result<IgniteOutcome, DriverError> {
-        Err(DriverError::Unsupported("ignite"))
+    ) -> std::result::Result<IgniteOutcome, crate::driver::IgniteFailure> {
+        Err(DriverError::Unsupported("ignite").into())
     }
     fn run_profile(
         &self,

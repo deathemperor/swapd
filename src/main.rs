@@ -279,7 +279,8 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Refresh { slot } => {
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
-            emit_list(&cmd::refresh::run(&ctx, driver.as_ref(), *slot)?, cli.json)
+            let out = cmd::refresh::run(&ctx, driver.as_ref(), *slot)?;
+            emit(&out, cli.json, || cmd::refresh::print_human(&out))
         }
         Command::Add { slot, alias, force } => {
             let driver = single_driver(cli)?;

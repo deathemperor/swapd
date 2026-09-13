@@ -445,19 +445,28 @@ fn failure_backoff_s(
 /// Fetch eligibility of a stored row, evaluated under the write lock
 /// (`usage_store.py:1215-1246`).
 ///
-/// Always: not quarantined (dead token), not in failure backoff, not claimed
-/// within `CLAIM_TTL_S`. Then by caller mode —
-/// - `force` (an explicit `refresh --slot`): nothing else blocks.
+/// Always, whatever the caller wants: not quarantined (a dead token cannot be
+/// revived by asking again) and not claimed within `CLAIM_TTL_S` (another
+/// collector is spending this slot's single-use token right now — stomping it
+/// is how both passes lose). Then by caller mode —
+/// - `force` (an explicit `refresh --slot`): nothing else blocks, the failure
+///   backoff included.
 /// - `respect_plans` (on-demand callers: list/status/switch): the row must be
 ///   stale *and* poll-due (or have no plan yet).
 /// - otherwise (the scheduler's deliberate cadence): poll-due *or* stale — a
 ///   due row may be re-fetched inside the serve TTL, which is how the bounded
 ///   urgent cadence beats the TTL.
+///
+/// The failure backoff sits BELOW `force` on purpose. It is a cadence rule for
+/// automatic callers, not a safety interlock: it exists so the scheduler stops
+/// hammering an endpoint that is failing. A human typing `refresh --slot n` has
+/// already decided to spend one request on one account, and until 2026-09-13
+/// that request was silently dropped — a slot in an hour-long 429 backoff
+/// served hour-old data with no way to ask again and nothing on screen saying
+/// why (#31). The two absolute gates above still hold, so a forced fetch can
+/// still cost at most one request per invocation.
 fn row_eligible(row: &Row, now: f64, respect_plans: bool, force: bool) -> bool {
     if row.auth_dead_strikes >= AUTH_DEAD_STRIKES {
-        return false;
-    }
-    if row.backoff_until.is_some_and(|b| now < b) {
         return false;
     }
     if live_claim(row.claim_until, now) {
@@ -465,6 +474,9 @@ fn row_eligible(row: &Row, now: f64, respect_plans: bool, force: bool) -> bool {
     }
     if force {
         return true;
+    }
+    if row.backoff_until.is_some_and(|b| now < b) {
+        return false;
     }
     let stale = row.fetched_at.is_none_or(|f| (now - f) > SERVE_TTL_S);
     let poll_due = row.next_poll_at.is_some_and(|next| now >= next);
@@ -613,7 +625,7 @@ impl UsageStore {
     /// Deciding eligibility on a lock-free `entries()` read and then claiming
     /// separately lets two collectors both pass the check and both fetch; the
     /// re-check under the lock closes that window. `force` is `refresh --slot`:
-    /// it ignores freshness and the plan, but still honors the failure backoff,
+    /// it ignores freshness, the plan and the failure backoff, but still honors
     /// a live claim and the dead-token quarantine.
     pub fn reserve(
         &self,
@@ -1053,7 +1065,13 @@ mod tests {
         assert_eq!(e.backoff_until, Some(T0 + EDGE_BACKOFF_S));
         assert_eq!(e.last_429_at, Some(T0));
         assert!(e.in_backoff(T0 + 1.0));
-        // Backoff blocks reserve, force included.
+        // The backoff blocks an automatic pass...
+        assert!(store.reserve(&ident(), false, false).unwrap().is_empty());
+        // ...but not an explicit `refresh --slot`, which is a person asking for
+        // this one account now and spends exactly one request (#31).
+        let forced = store.reserve(&ident(), false, true).unwrap();
+        assert_eq!(forced.len(), 1);
+        // The claim it won is real, so a second forced pass still waits on it.
         assert!(store.reserve(&ident(), false, true).unwrap().is_empty());
 
         // A short positive ask is honored as measured — accurate, no margin.

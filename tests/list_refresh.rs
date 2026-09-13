@@ -337,6 +337,80 @@ fn refresh_slot_bypasses_serve_ttl() {
     two.assert_hits(1);
 }
 
+/// The failure backoff is a cadence rule for automatic passes, not a safety
+/// interlock: a person typing `refresh --slot n` has decided to spend one
+/// request on one account, and a silently dropped force reads exactly like a
+/// refresh that succeeded and found the same numbers (#31).
+#[test]
+fn refresh_slot_bypasses_the_failure_backoff() {
+    let fx = Fixture::new();
+    // Slot 2 is an hour into a 429 backoff with an hour-old measurement.
+    let mut row = UsageRow::new(2, "two@example.com", "org-2", 3600.0, 42.0);
+    row.backoff_ahead_s = Some(3600.0);
+    fx.write_usage_row(row);
+    let one = fx.usage_mock(1, 200, usage_body(12.0, 34.0));
+    let two = fx.usage_mock(2, 200, usage_body(56.0, 7.0));
+
+    // An ordinary pass respects the backoff and serves the hour-old row.
+    let listed = fx.list();
+    assert_eq!(account(&listed, 2)["lastGood"]["windows"][0]["pct"], 42.0);
+    two.assert_hits(0);
+
+    // The force asks anyway, and the answer is the fresh one.
+    let refreshed = fx.run(&["refresh", "--slot", "2", "--json"]);
+    assert_eq!(account(&refreshed, 2)["usageStatus"], "ok");
+    assert_eq!(account(&refreshed, 2)["windows"][0]["pct"], 56.0);
+    assert!(refreshed["skipped"].is_null(), "{refreshed}");
+    two.assert_hits(1);
+    // Still one slot at a time: the force names slot 2 and nothing else.
+    one.assert_hits(1);
+}
+
+/// The two gates a force deliberately does not override say so, rather than
+/// returning the unchanged list as if the fetch had happened.
+#[test]
+fn a_forced_refresh_the_quarantine_blocks_reports_itself_as_skipped() {
+    let fx = Fixture::new();
+    let mut row = UsageRow::new(2, "two@example.com", "org-2", 3600.0, 42.0);
+    row.strikes = 1;
+    row.dead_fp = Some(fingerprint_of("rt-2"));
+    fx.write_usage_row(row);
+    let two = fx.usage_mock(2, 200, usage_body(56.0, 7.0));
+
+    let out = fx.run(&["refresh", "--slot", "2", "--json"]);
+    assert_eq!(account(&out, 2)["usageStatus"], "relogin-required");
+    assert_eq!(out["skipped"]["slot"], 2);
+    assert_eq!(out["skipped"]["reason"], "token-dead");
+    two.assert_hits(0);
+}
+
+/// A credential with no refresh token is expired on every pass and refreshable
+/// on none: naming a retry that can never land is what left the menu bar
+/// saying "token expired — retrying" for hours (#30).
+#[test]
+fn a_credential_with_no_refresh_token_is_relogin_required_not_token_expired() {
+    let fx = Fixture::new();
+    // The shape a blanked keychain item has: the envelope survives, the tokens
+    // in it do not.
+    fx.write_slot_login(2, "", "", 0);
+    fx.write_live_login("two@example.com", "org-2", "", "", 0);
+    fx.set_active_slot(2);
+    let one = fx.usage_mock(1, 200, usage_body(12.0, 34.0));
+    let two = fx.usage_mock(2, 200, usage_body(56.0, 7.0));
+    let token = fx.server.mock(|when, then| {
+        when.method(POST).path("/v1/oauth/token");
+        then.status(200).json_body(json!({}));
+    });
+
+    let payload = fx.list();
+    assert_eq!(account(&payload, 2)["usageStatus"], "relogin-required");
+    // Terminal means terminal: nothing is spent asking.
+    two.assert_hits(0);
+    token.assert_hits(0);
+    assert_eq!(account(&payload, 1)["usageStatus"], "ok");
+    one.assert_hits(1);
+}
+
 #[test]
 fn dead_token_is_relogin_required_and_not_fetched() {
     let fx = Fixture::new();

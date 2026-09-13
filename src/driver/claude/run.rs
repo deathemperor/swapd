@@ -31,6 +31,7 @@ use serde_json::{Map, Value};
 
 use crate::driver::claude::live::{self, ClaudeDriver, LiveStore};
 use crate::driver::claude::paths;
+use crate::driver::fsutil::{create_private_dir_all, is_executable};
 use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
 
 /// The user customizations that follow an account into its profile
@@ -131,28 +132,6 @@ pub fn resolve_cli(env: &Env) -> Option<PathBuf> {
         env.vars.get("PATH").map(String::as_str),
         &home,
     )
-}
-
-/// An existing file we could actually exec. A non-executable `claude` on `PATH`
-/// (a stray text file, a half-finished install, a `claude` *directory*) must not
-/// shadow a real one further along it — reporting "installed" for something that
-/// cannot run turns every later failure into a mystery.
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 #[cfg(windows)]
@@ -543,27 +522,6 @@ fn profile_env(env: &Env, slot: u32) -> Result<Env, DriverError> {
         home: env.home.clone(),
         vars,
     })
-}
-
-/// `mkdir -p` with 0700 on every component swapd creates.
-fn create_private_dir_all(dir: &Path) -> Result<(), DriverError> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = dir.parent() {
-        create_private_dir_all(parent)?;
-    }
-    match fs::create_dir(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(e) => return Err(e.into()),
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 /// Mirror the share set from the user's real config home into the profile

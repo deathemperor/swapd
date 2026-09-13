@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use crate::contract::{Window, WindowKind};
 use crate::driver::gemini::oauth::{self, GeminiEndpoints};
 use crate::driver::gemini::{identity, GeminiDriver};
+use crate::driver::http_auth;
 use crate::driver::{DriverError, Login, Usage};
-use crate::http;
 
 /// What swapd calls itself to Code Assist, and on the wire (`http::agent`).
 pub const USER_AGENT: &str = concat!("swapd/", env!("CARGO_PKG_VERSION"));
@@ -34,31 +34,22 @@ pub fn quota_url(ep: &GeminiEndpoints) -> String {
 /// (the caller refreshes and retries), 429 → `Throttled` with the
 /// `RetryInfo.retryDelay` seconds when the body carries one.
 fn post(url: String, access_token: &str, body: &Value, what: &str) -> Result<Value, DriverError> {
-    let response = http::agent(oauth::READ_TIMEOUT_S)
-        .post(url)
-        .config()
-        .http_status_as_error(false)
-        .build()
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("Content-Type", "application/json")
-        .send_json(body)
-        .map_err(|e| match e {
-            ureq::Error::Timeout(_) => DriverError::Http(format!("{what}: timeout")),
-            _ => DriverError::Http(format!("{what}: network")),
-        })?;
-    let status = response.status().as_u16();
-    let text = response
-        .into_body()
-        .read_to_string()
-        .map_err(|_| DriverError::Http(format!("{what}: network")))?;
-    match status {
-        200..=299 => serde_json::from_str::<Value>(&text)
+    let reply = http_auth::post_json(
+        url,
+        oauth::READ_TIMEOUT_S,
+        access_token,
+        what,
+        &[("Content-Type", "application/json")],
+        body,
+    )?;
+    match reply.status {
+        200..=299 => serde_json::from_str::<Value>(&reply.body)
             .map_err(|_| DriverError::Http(format!("{what}: malformed response"))),
         401 | 403 => Err(DriverError::NeedsRefresh),
         429 => Err(DriverError::Throttled {
-            retry_after: retry_delay_seconds(&text),
+            retry_after: retry_delay_seconds(&reply.body),
         }),
-        _ => Err(DriverError::Http(format!("{what}: http {status}"))),
+        status => Err(DriverError::Http(format!("{what}: http {status}"))),
     }
 }
 

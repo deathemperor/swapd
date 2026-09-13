@@ -2,7 +2,10 @@
 //! verbs resolve a provider through.
 
 pub mod claude;
+pub mod fsutil;
 pub mod gemini;
+pub mod http_auth;
+pub mod lockdir;
 pub mod marker;
 
 use std::collections::HashMap;

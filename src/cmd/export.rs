@@ -188,7 +188,7 @@ pub fn run(
 
     let envelope = json!({
         "format": "swapd/1",
-        "exportedAt": crate::driver::claude::usage::format_ts(ctx.now()),
+        "exportedAt": crate::timefmt::format_ts(ctx.now()),
         "providers": [{
             "provider": id,
             "activeSlot": active_slot,

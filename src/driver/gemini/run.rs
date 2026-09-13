@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::driver::claude::live::write_private_file;
+use crate::driver::fsutil::{create_private_dir_all, is_executable, write_private_file};
 use crate::driver::gemini::live::{Envelope, OAUTH_PERSONAL};
 use crate::driver::gemini::{identity, oauth, usage, GeminiDriver};
 use crate::driver::marker;
@@ -37,24 +37,6 @@ fn binary_names() -> &'static [&'static str] {
         &["gemini.cmd", "gemini.exe", "gemini"]
     } else {
         &["gemini"]
-    }
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
     }
 }
 
@@ -83,16 +65,6 @@ pub fn profile_dir(env: &Env, slot: u32) -> PathBuf {
         .join("profiles")
         .join("gemini")
         .join(slot.to_string())
-}
-
-fn create_private_dir_all(dir: &Path) -> Result<(), DriverError> {
-    fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 fn seed(dir: &Path, envelope: &Envelope) -> Result<(), DriverError> {
@@ -281,6 +253,28 @@ mod tests {
             bytes: format!(
                 r#"{{"oauth_creds":{{"access_token":"at-1","refresh_token":"rt-1","expiry_date":{expiry_ms}}},"google_account":"you@example.com"}}"#
             ),
+        }
+    }
+
+    /// Every directory on the way to a profile is swapd's own and holds a
+    /// credential at the end of it, so each component gets 0700 — including
+    /// `profiles/` and `profiles/gemini/`, which took the umask default until
+    /// both drivers shared one `create_private_dir_all` (#17).
+    #[cfg(unix)]
+    #[test]
+    fn every_component_of_a_profile_path_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let env = env_with(&home, []);
+        run_profile(&env, 3, &login(1_000)).unwrap();
+        for path in [
+            env.home.join("profiles"),
+            env.home.join("profiles").join("gemini"),
+            profile_dir(&env, 3),
+            profile_dir(&env, 3).join(".gemini"),
+        ] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", path.display());
         }
     }
 

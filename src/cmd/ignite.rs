@@ -21,10 +21,10 @@ use crate::core::slots::{self, LOCK_TIMEOUT};
 use crate::core::store::FileLock;
 use crate::core::switch::resolve;
 use crate::ctx::Ctx;
-use crate::driver::claude::usage::format_ts;
 use crate::driver::Driver;
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
+use crate::timefmt::format_ts;
 
 /// `list`'s payload plus what this run did, so one call both ignites the
 /// account and hands back the board it changed.

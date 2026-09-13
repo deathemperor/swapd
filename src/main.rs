@@ -9,6 +9,7 @@ mod output;
 mod paths;
 mod secrets;
 mod security_cli;
+mod timefmt;
 
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};

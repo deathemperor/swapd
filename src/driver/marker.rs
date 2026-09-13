@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::driver::claude::live::write_private_file;
+use crate::driver::fsutil::write_private_file;
 use crate::driver::DriverError;
 
 pub const MARKER: &str = ".swapd-seeded";

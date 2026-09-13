@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::contract::{AccountView, ProviderView, UsageStatus, Window};
 use crate::core::collect::{self, collect, CollectOpts, FetchOpts, Prepared};
 use crate::core::events::{pct_label, window_label, Emit, Event};
+use crate::core::gating::relevant;
 use crate::core::history::SlotRef;
 use crate::core::poll_policy::{
     self, binding_pct, limiting_reset_ts, parse_reset_ts, ESCALATION_MARGIN_PCT, RESET_SLACK_S,
@@ -47,7 +48,7 @@ use crate::core::store::{read_json, write_json_atomic, FileLock};
 use crate::core::switch;
 use crate::core::usage_store::{due_candidate, plan_oversleeps_interval, Entry};
 use crate::ctx::Ctx;
-use crate::driver::claude::usage::{format_ts, relevant};
+use crate::driver::claude::usage::format_ts;
 use crate::driver::{Driver, Login};
 use crate::errors::{ErrorCode, Result};
 use crate::secrets::slot_key;

@@ -2,6 +2,7 @@ pub mod auto;
 pub mod collect;
 pub mod compact;
 pub mod events;
+pub mod gating;
 pub mod history;
 pub mod import;
 pub mod poll_policy;

@@ -21,7 +21,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::contract::Window;
-use crate::driver::claude::usage::{headroom, relevant};
+use crate::core::gating::{headroom, relevant};
 
 /// Freshness floor shared by every collector: an entry younger than this is
 /// served from the store without any fetch, so the maximum sustained rate on

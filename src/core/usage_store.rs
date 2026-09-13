@@ -27,12 +27,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{Window, WindowKind};
+use crate::core::gating::relevant;
 use crate::core::poll_policy::{
     self, parse_reset_ts, plan_after_fetch, PlanInput, EDGE_BACKOFF_S, RECENT_429_WINDOW_S,
     SERVE_TTL_S,
 };
 use crate::core::store::{read_json, write_json_atomic, FileLock};
-use crate::driver::claude::usage::{format_ts, relevant};
+use crate::driver::claude::usage::format_ts;
 use crate::errors::Result;
 
 /// `usage.json`'s schema. A file at any other version (including a version-less

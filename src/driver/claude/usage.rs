@@ -23,6 +23,7 @@ use crate::contract::{Pace, Window, WindowKind};
 use crate::driver::claude::oauth::{self, Endpoints};
 use crate::driver::http_auth;
 use crate::driver::DriverError;
+use crate::timefmt::format_ts;
 
 /// Weekly windows reset on a fixed 7-day cadence (`pace.py:26`).
 const WEEKLY_PERIOD_S: f64 = 7.0 * 86400.0;
@@ -284,17 +285,6 @@ fn pace_fields(pct: f64, resets_at: Option<&str>, fetched_at: f64) -> Option<Pac
 /// not a case that occurs.)
 fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
-}
-
-/// A POSIX timestamp as `2026-09-15T10:59:59Z` — cswap's
-/// `isoformat(timespec="seconds").replace("+00:00", "Z")`.
-pub fn format_ts(ts: f64) -> Option<String> {
-    let seconds = if ts.is_finite() { ts.floor() as i64 } else { 0 };
-    OffsetDateTime::from_unix_timestamp(seconds)
-        .ok()?
-        .format(&Rfc3339)
-        .ok()
-        .map(|s| s.replace("+00:00", "Z"))
 }
 
 #[cfg(test)]

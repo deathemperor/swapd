@@ -20,9 +20,9 @@ use crate::core::auto::AutoEngine;
 use crate::core::events::{Emit, Event};
 use crate::core::store::FileLock;
 use crate::ctx::Ctx;
-use crate::driver::claude::usage::format_ts;
 use crate::driver::Driver;
 use crate::errors::{ErrorCode, Result};
+use crate::timefmt::format_ts;
 
 /// How long to wait for the engine mutex. Nonzero because a supervisor can
 /// restart its daemon without waiting for the old process to exit, so the lock

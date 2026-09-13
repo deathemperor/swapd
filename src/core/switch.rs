@@ -26,10 +26,10 @@ use crate::core::slots::{self, ProviderSlots};
 use crate::core::store::FileLock;
 use crate::core::unclaimed;
 use crate::ctx::Ctx;
-use crate::driver::claude::usage::format_ts;
 use crate::driver::{Driver, DriverError, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::secrets::slot_key;
+use crate::timefmt::format_ts;
 
 /// What a switch did, or why it did nothing.
 pub struct SwitchResult {

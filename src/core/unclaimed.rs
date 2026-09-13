@@ -87,7 +87,7 @@ pub fn purge(ctx: &Ctx, id: &str) -> Result<Entry> {
 }
 
 /// `stashed_at` as RFC 3339 UTC with a `Z` offset rather than `+00:00` — the
-/// same shape `driver::claude::usage::format_ts` writes. Shared rather than
+/// same shape `timefmt::format_ts` writes. Shared rather than
 /// duplicated: `swapd unclaimed` and `export` both render this field, and
 /// both must render it identically.
 pub fn format_stashed_at(seconds: u64) -> String {

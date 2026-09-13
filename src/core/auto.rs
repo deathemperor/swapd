@@ -48,10 +48,10 @@ use crate::core::store::{read_json, write_json_atomic, FileLock};
 use crate::core::switch;
 use crate::core::usage_store::{due_candidate, plan_oversleeps_interval, Entry};
 use crate::ctx::Ctx;
-use crate::driver::claude::usage::format_ts;
 use crate::driver::{Driver, Login};
 use crate::errors::{ErrorCode, Result};
 use crate::secrets::slot_key;
+use crate::timefmt::format_ts;
 
 /// `auto-state.json`'s layout.
 pub const STATE_SCHEMA_VERSION: u32 = 1;

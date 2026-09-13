@@ -29,10 +29,10 @@ use crate::core::slots::{self, ProviderSlots, Slot, SlotsFile};
 use crate::core::store::{read_json, FileLock};
 use crate::core::usage_store::{Entry, STALE_OK_S};
 use crate::ctx::Ctx;
-use crate::driver::claude::usage::format_ts;
 use crate::driver::{Driver, DriverError, Login};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::secrets::slot_key;
+use crate::timefmt::format_ts;
 
 /// Most usage fetches in flight at once. Each is one short HTTPS round trip and
 /// the accounts are independent, so the cap is about being a good citizen of

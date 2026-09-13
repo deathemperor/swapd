@@ -218,7 +218,7 @@ pub fn compose(identity: &Identity, prior: Option<&Slot>, alias: Option<&str>, n
         preferred: prior.is_some_and(|p| p.preferred),
         added: prior
             .and_then(|p| p.added.clone())
-            .or_else(|| crate::driver::claude::usage::format_ts(now)),
+            .or_else(|| crate::timefmt::format_ts(now)),
         fingerprint: None,
     }
 }

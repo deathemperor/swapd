@@ -33,8 +33,8 @@ use crate::core::poll_policy::{
     SERVE_TTL_S,
 };
 use crate::core::store::{read_json, write_json_atomic, FileLock};
-use crate::driver::claude::usage::format_ts;
 use crate::errors::Result;
+use crate::timefmt::format_ts;
 
 /// `usage.json`'s schema. A file at any other version (including a version-less
 /// legacy one) is read as empty: its data had a serve-TTL shelf life anyway.

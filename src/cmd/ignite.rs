@@ -77,6 +77,23 @@ fn window_seen(view: &ProviderView, slot: u32, now: f64) -> Option<bool> {
     Some(parse_reset_ts(window.resets_at.as_deref()).is_some_and(|reset| reset > now))
 }
 
+/// Store a rotation the run made, then mark the profile as holding it.
+///
+/// The commit is second on purpose. The profile's seed marker records what the
+/// STORE holds, so moving it before the persist would put it ahead of the
+/// store, and the next launch would read the profile as a slot re-pointed at
+/// another account and seed the older generation over the rotation.
+fn persist_rotation(
+    ctx: &Ctx,
+    driver: &dyn Driver,
+    slot: u32,
+    login: &crate::driver::Login,
+) -> Result<()> {
+    super::persist_login(ctx, driver.id(), slot, login)?;
+    driver.commit_profile(&ctx.env, slot, login)?;
+    Ok(())
+}
+
 /// `wait` is how the verb sleeps between re-fetches: the real clock from
 /// `main`, a recorder in tests.
 pub fn run(
@@ -111,21 +128,36 @@ pub fn run(
     // a slot whose lock is held.
     let session = FileLock::acquire_shared(&ctx.home.run_lock_base(id, slot), LOCK_TIMEOUT)?;
     let login = super::login_to_run(ctx, driver, slot)?;
-    let outcome = driver.ignite(&ctx.env, slot, &login)?;
+    // Persisted FIRST, whatever the exit code — and whether or not there is
+    // one. The CLI refreshes its token early in a run and can still fail
+    // afterwards, so a failed run routinely carries a rotation, and the token
+    // it replaced is already spent: dropping it would leave the slot holding a
+    // credential whose next refresh answers `invalid_grant` and reads as a dead
+    // account. A run that produced no exit status at all is no different, so
+    // its rotation is stored before the error goes back up.
+    let outcome = match driver.ignite(&ctx.env, slot, &login) {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            // The persist's own failure does not replace the run's: the run is
+            // why this call failed, and a store error reported in its place
+            // would send the reader looking in the wrong direction. It is
+            // carried as a warning on the error instead.
+            let mut err: SwapdError = failure.error.into();
+            if let Some(login) = &failure.rotated {
+                if let Err(store) = persist_rotation(ctx, driver, slot, login) {
+                    err.message = format!(
+                        "{}; the run's rotation was not stored: {}",
+                        err.message, store.message
+                    );
+                }
+            }
+            return Err(err);
+        }
+    };
 
-    // Persisted FIRST, whatever the exit code. The CLI refreshes its token
-    // early in a run and can still fail afterwards, so a failed run routinely
-    // carries a rotation — and the token it replaced is already spent, so
-    // dropping it would leave the slot holding a credential whose next refresh
-    // answers `invalid_grant` and reads as a dead account.
     let rotated = outcome.rotated.is_some();
     if let Some(login) = &outcome.rotated {
-        super::persist_login(ctx, id, slot, login)?;
-        // Only now. The profile's seed marker records what the STORE holds, so
-        // moving it before the persist would put it ahead of the store, and the
-        // next launch would read the profile as a slot re-pointed at another
-        // account and seed the older generation over the rotation.
-        driver.commit_profile(&ctx.env, slot, login)?;
+        persist_rotation(ctx, driver, slot, login)?;
     }
     drop(session);
     if outcome.exit_code != 0 {
@@ -287,5 +319,31 @@ mod tests {
         let (out, _, _) = ignite_with(vec![scoped()]);
         let json = serde_json::to_value(&out).unwrap();
         assert!(json["ignited"].get("windowSeen").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_rotation_carried_by_a_failed_run_is_persisted_before_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1"))
+            .usable("rt-1")
+            .installed()
+            .ignitable()
+            .ignite_fails_after_rotating("usage: http-500");
+        let err = match run(&ctx, &driver, "1", &|_| ()) {
+            Err(err) => err,
+            Ok(_) => panic!("expected the failed run to propagate"),
+        };
+        assert_eq!(err.message, "usage: http-500");
+
+        // The run produced no exit status, but it had already spent the slot's
+        // refresh token: the successor is what the store holds.
+        assert_eq!(
+            ctx.secrets
+                .get(&crate::secrets::slot_key("claude", 1))
+                .unwrap()
+                .unwrap(),
+            login_for("one@example.com", "rt-next-1")
+        );
     }
 }

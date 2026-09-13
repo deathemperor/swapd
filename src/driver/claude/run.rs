@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 use crate::driver::claude::live::{self, ClaudeDriver, LiveStore};
 use crate::driver::claude::paths;
 use crate::driver::fsutil::{create_private_dir_all, is_executable};
-use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
+use crate::driver::{DriverError, Env, IgniteFailure, IgniteOutcome, Login, RunProfile};
 
 /// The user customizations that follow an account into its profile
 /// (`session.py:76-83`, cswap's default share set). Files and directories
@@ -620,7 +620,7 @@ pub fn ignite(
     env: &Env,
     slot: u32,
     login: &Login,
-) -> Result<IgniteOutcome, DriverError> {
+) -> Result<IgniteOutcome, IgniteFailure> {
     let profile = run_profile(driver, env, slot, login)?;
     let path_var = env.vars.get("PATH").map(String::as_str);
     let home = paths::home(env)?;
@@ -654,6 +654,21 @@ pub fn ignite(
         command.env_remove(key);
     }
 
+    // Read back on ANY exit, not just a clean one, and not just one that
+    // produced a code at all. `claude` refreshes its token before it does the
+    // work that may fail, so a failed — or hung, or signalled — run routinely
+    // leaves a rotation behind, and reporting only the failure would strand
+    // swapd on the spent refresh token, whose next use answers `invalid_grant`
+    // and reads as a dead account.
+    //
+    // On the two failure paths a read-back that itself fails answers "no
+    // rotation": there is already an error to report, and replacing "igniter
+    // timed out" with whatever the profile read hit would lose the reason.
+    let read_back = || match &profile.read_back {
+        Some(read_back) => read_back().unwrap_or(None),
+        None => None,
+    };
+
     let mut child = command.spawn()?;
     let start = Instant::now();
     let status = loop {
@@ -663,23 +678,24 @@ pub fn ignite(
                 if start.elapsed() >= IGNITE_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(DriverError::Http("igniter timed out".to_string()));
+                    return Err(IgniteFailure {
+                        error: DriverError::Http("igniter timed out".to_string()),
+                        rotated: read_back(),
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
     };
-    // Read back on ANY normal exit, not just a clean one. `claude` refreshes its
-    // token before it does the work that may fail, so a failed run routinely
-    // leaves a rotation behind — and reporting only the failure would strand
-    // swapd on the spent refresh token, whose next use answers `invalid_grant`
-    // and reads as a dead account. The exit code goes back with it; what a
-    // non-zero one means is the verb's call, after it has persisted the login.
+    // The exit code goes back with the rotation; what a non-zero one means is
+    // the verb's call, after it has persisted the login.
     let Some(exit_code) = status.code() else {
-        // Killed by a signal: no exit status at all, so nothing to report a code
-        // for. The rotation (if any) is still in the profile, and the next run
-        // reads it back.
-        return Err(DriverError::Http("igniter killed by a signal".to_string()));
+        // Killed by a signal: no exit status at all, so nothing to report a
+        // code for — but the run may still have rotated before it died.
+        return Err(IgniteFailure {
+            error: DriverError::Http("igniter killed by a signal".to_string()),
+            rotated: read_back(),
+        });
     };
     let rotated = match &profile.read_back {
         Some(read_back) => read_back()?,
@@ -704,7 +720,7 @@ mod tests {
 
     /// `Result::unwrap_err` needs `T: Debug`, which neither `Login` (it holds
     /// the credential) nor `RunProfile` (it holds a closure) has.
-    fn expect_err<T>(result: Result<T, DriverError>) -> DriverError {
+    fn expect_err<T, E>(result: Result<T, E>) -> E {
         match result {
             Err(e) => e,
             Ok(_) => panic!("expected an error"),
@@ -1428,11 +1444,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ignite_reports_a_rotation_from_a_run_that_produced_no_exit_status() {
+        let home = temp_home();
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        // Rotates, then dies on a signal: no exit code to report, but the
+        // refresh token in the store is already spent. The timeout path a few
+        // lines above reads the profile back the same way.
+        write_script(
+            &bin.join("claude"),
+            "#!/bin/sh\nprintf '%s' \
+             '{\"claudeAiOauth\":{\"refreshToken\":\"rt-rotated\"}}' \
+             > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\nkill -9 $$\n",
+        );
+
+        let env = env_with(&home, [("USER", "tester"), ("PATH", bin.to_str().unwrap())]);
+        let driver = ClaudeDriver::new(LiveStore::File, endpoints());
+
+        let failure = expect_err(ignite(&driver, &env, 6, &login()));
+        assert!(matches!(failure.error, DriverError::Http(_)));
+        let rotated = failure.rotated.expect("rotated before the signal");
+        assert!(rotated.bytes.contains("rt-rotated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ignite_without_a_claude_binary_is_not_installed() {
         let home = temp_home();
         let env = env_with(&home, [("USER", "tester"), ("PATH", "")]);
         let driver = ClaudeDriver::new(LiveStore::File, endpoints());
-        let err = expect_err(ignite(&driver, &env, 1, &login()));
-        assert!(matches!(err, DriverError::NotInstalled));
+        let failure = expect_err(ignite(&driver, &env, 1, &login()));
+        assert!(matches!(failure.error, DriverError::NotInstalled));
+        assert!(failure.rotated.is_none(), "nothing ran, so nothing rotated");
     }
 }

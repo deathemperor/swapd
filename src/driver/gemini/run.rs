@@ -18,7 +18,7 @@ use crate::driver::fsutil::{create_private_dir_all, is_executable, write_private
 use crate::driver::gemini::live::{Envelope, OAUTH_PERSONAL};
 use crate::driver::gemini::{identity, oauth, usage, GeminiDriver};
 use crate::driver::marker;
-use crate::driver::{DriverError, Env, IgniteOutcome, Login, RunProfile};
+use crate::driver::{DriverError, Env, IgniteFailure, IgniteOutcome, Login, RunProfile};
 
 pub const CLI_OVERRIDE_ENV: &str = "SWAPD_GEMINI_CLI";
 
@@ -198,14 +198,14 @@ const EXIT_AUTH_FAILED: i32 = 41;
 /// here as `NeedsRefresh`. Answering 41 there would call a live account
 /// auth-dead (spec §7: 41 is `TokenDead`, or `NeedsRefresh` *after* a
 /// refresh). The rotation is reported whenever the refresh itself succeeded,
-/// including alongside a 41 — the token it replaced is already spent, and the
-/// caller persists `rotated` before it judges the exit code.
+/// including alongside a 41 and alongside an `Err` — the token it replaced is
+/// already spent, and the caller persists `rotated` before it judges either.
 pub fn ignite(
     driver: &GeminiDriver,
     _env: &Env,
     _slot: u32,
     login: &Login,
-) -> Result<IgniteOutcome, DriverError> {
+) -> Result<IgniteOutcome, IgniteFailure> {
     let dead = || {
         Ok(IgniteOutcome {
             exit_code: EXIT_AUTH_FAILED,
@@ -224,12 +224,21 @@ pub fn ignite(
                 Err(DriverError::TokenDead) => return dead(),
                 // A throttled or unreachable token endpoint is not an answer
                 // about the credential; it propagates as the error it is.
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             let exit_code = match usage::usage(driver, &refreshed) {
                 Ok(_) => 0,
                 Err(DriverError::TokenDead | DriverError::NeedsRefresh) => EXIT_AUTH_FAILED,
-                Err(e) => return Err(e),
+                // The retry failed for its own reasons, but the refresh above
+                // already happened: Google's reply may have rotated the refresh
+                // token, and that generation exists nowhere else. It rides out
+                // with the error so the caller can store it.
+                Err(e) => {
+                    return Err(IgniteFailure {
+                        error: e,
+                        rotated: Some(refreshed),
+                    })
+                }
             };
             Ok(IgniteOutcome {
                 exit_code,
@@ -237,7 +246,7 @@ pub fn ignite(
             })
         }
         Err(DriverError::TokenDead) => dead(),
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -489,6 +498,50 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&rotated.bytes).unwrap();
         assert_eq!(v["oauth_creds"]["access_token"], "at-2");
         token.assert_hits(1);
+    }
+
+    #[test]
+    fn a_rotation_survives_a_retry_that_fails_for_its_own_reasons() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        // A reply that rotates the refresh token too: that generation exists
+        // nowhere but in this reply, so losing it would strand the slot on a
+        // token the server has already spent.
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).body(
+                r#"{"access_token":"at-2","refresh_token":"rt-2","expires_in":3599,"scope":"openid","id_token":"h.e30.s"}"#,
+            );
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .body(include_str!("fixtures/load_code_assist.json"));
+        });
+        // Not an answer about the credential — the retry just failed.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:retrieveUserQuota");
+            then.status(500);
+        });
+        let driver = GeminiDriver::new(
+            GeminiEndpoints {
+                oauth: server.base_url(),
+                cloudcode: server.base_url(),
+            },
+            crate::driver::gemini::oauth::ClientSource::for_tests(),
+        );
+        let home = temp_home();
+        let env = env_with(&home, []);
+        let failure = match ignite(&driver, &env, 1, &login(1_000)) {
+            Err(failure) => failure,
+            Ok(outcome) => panic!("expected the 500 to propagate, got {}", outcome.exit_code),
+        };
+        assert!(matches!(failure.error, DriverError::Http(_)));
+        let rotated = failure
+            .rotated
+            .expect("the refresh happened before the 500");
+        let v: serde_json::Value = serde_json::from_str(&rotated.bytes).unwrap();
+        assert_eq!(v["oauth_creds"]["refresh_token"], "rt-2");
     }
 
     #[test]

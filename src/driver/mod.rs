@@ -9,6 +9,7 @@ pub mod lockdir;
 pub mod marker;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -211,6 +212,51 @@ pub struct IgniteOutcome {
     pub rotated: Option<Login>,
 }
 
+/// An ignite that produced no exit status at all, and whatever rotation the
+/// attempt had already made.
+///
+/// The same reasoning as `IgniteOutcome`, one step further: a rotation is not
+/// only independent of the exit code, it is independent of there *being* one.
+/// A driver that refreshes before its request and then fails that request for
+/// an unrelated reason (a 500, a timeout) holds a credential the server has
+/// already issued — so the error travels with it rather than in place of it,
+/// and the caller persists before it reports.
+pub struct IgniteFailure {
+    pub error: DriverError,
+    /// A rotation the failed attempt made, if any. The caller persists it
+    /// exactly as it persists `IgniteOutcome::rotated`.
+    pub rotated: Option<Login>,
+}
+
+/// So a driver's `?` on an ordinary `DriverError` still reads as one: nothing
+/// was rotated unless the driver says so.
+impl From<DriverError> for IgniteFailure {
+    fn from(error: DriverError) -> Self {
+        IgniteFailure {
+            error,
+            rotated: None,
+        }
+    }
+}
+
+impl From<std::io::Error> for IgniteFailure {
+    fn from(error: std::io::Error) -> Self {
+        DriverError::from(error).into()
+    }
+}
+
+/// By hand, and not derived through `Login`: a test's `unwrap` prints this, and
+/// `Login` holds the credential. Whether there IS a rotation is the part a
+/// reader needs; its bytes are not.
+impl fmt::Debug for IgniteFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IgniteFailure")
+            .field("error", &self.error)
+            .field("rotated", &self.rotated.is_some())
+            .finish()
+    }
+}
+
 /// Per-slot environment for `run`/`ignite`: env overrides plus a working
 /// dir, with a cleanup hook that runs on drop (e.g. removing a temp dir).
 pub struct RunProfile {
@@ -328,8 +374,9 @@ pub trait Driver: Send + Sync {
     /// `Ok` for any *normal* exit, zero or not, carrying both the exit code and
     /// any rotation the CLI made while running (see `IgniteOutcome`); the caller
     /// persists the rotation before reporting a non-zero code. Only a run that
-    /// produced no exit status at all — a timeout, a signal — is `Err`.
-    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, DriverError>;
+    /// produced no exit status at all — a timeout, a signal — is `Err`, and even
+    /// that carries the rotation the attempt made (see `IgniteFailure`).
+    fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, IgniteFailure>;
     fn run_profile(&self, env: &Env, slot: u32, login: &Login) -> Result<RunProfile, DriverError>; // per-slot profile for `run`/`ignite`
     /// Record that `login` is what the caller's store now holds for this slot,
     /// after a `read_back`/`ignite` rotation has been persisted.

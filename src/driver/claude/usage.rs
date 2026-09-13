@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 use crate::contract::{Pace, Window, WindowKind};
 use crate::driver::claude::oauth::{self, Endpoints};
+use crate::driver::http_auth;
 use crate::driver::DriverError;
-use crate::http;
 
 /// Weekly windows reset on a fixed 7-day cadence (`pace.py:26`).
 const WEEKLY_PERIOD_S: f64 = 7.0 * 86400.0;
@@ -40,44 +40,33 @@ const AHEAD_THRESHOLD_PCT: f64 = 15.0;
 /// an absent or unparseable header is `retry_after: None` rather than a guess.
 /// No error carries the response body.
 pub fn fetch(ep: &Endpoints, access_token: &str) -> Result<Value, DriverError> {
-    let response = http::agent(oauth::READ_TIMEOUT_S)
-        .get(oauth::usage_url(ep))
-        .config()
-        // Non-2xx is classified here (429 is a distinct outcome), not thrown.
-        .http_status_as_error(false)
-        .build()
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("anthropic-beta", oauth::BETA_HEADER)
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Timeout(_) => DriverError::Http("usage: timeout".to_string()),
-            _ => DriverError::Http("usage: network".to_string()),
-        })?;
+    // Non-2xx is classified here (429 is a distinct outcome), not thrown.
+    let reply = http_auth::get(
+        oauth::usage_url(ep),
+        oauth::READ_TIMEOUT_S,
+        access_token,
+        "usage",
+        &[("anthropic-beta", oauth::BETA_HEADER)],
+    )?;
 
-    let status = response.status().as_u16();
-    if status == 429 {
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
+    if reply.status == 429 {
+        let retry_after = reply
+            .retry_after
             .and_then(|v| v.trim().parse::<f64>().ok())
             .map(|v| v.max(0.0));
         return Err(DriverError::Throttled { retry_after });
     }
-    if status == 401 {
+    if reply.status == 401 {
         // The token the caller handed us is not (or no longer) good. Refreshing
         // here would spend a single-use refresh token whose rotation the caller
         // never sees, so the caller is told to do it and retry.
         return Err(DriverError::NeedsRefresh);
     }
-    if status != 200 {
-        return Err(DriverError::Http(format!("usage: http-{status}")));
+    if reply.status != 200 {
+        return Err(DriverError::Http(format!("usage: http-{}", reply.status)));
     }
-    let text = response
-        .into_body()
-        .read_to_string()
-        .map_err(|_| DriverError::Http("usage: network".to_string()))?;
-    serde_json::from_str(&text).map_err(|_| DriverError::Http("usage: bad-response".to_string()))
+    serde_json::from_str(&reply.body)
+        .map_err(|_| DriverError::Http("usage: bad-response".to_string()))
 }
 
 /// `build_usage_result` against the current clock.

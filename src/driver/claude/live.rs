@@ -26,6 +26,7 @@ use crate::core::store::write_json_atomic;
 use crate::driver::claude::oauth::Endpoints;
 use crate::driver::claude::{locks, paths};
 use crate::driver::fsutil::write_private_file;
+use crate::driver::lockdir;
 use crate::driver::{DriverError, Env, Identity, Login};
 use crate::errors::ErrorCode;
 #[cfg(target_os = "macos")]
@@ -129,7 +130,7 @@ impl ClaudeDriver {
     /// `read_live` under Claude Code's own locks, in the order `write_live`
     /// takes them (credentials, then config).
     ///
-    /// The budget is `locks::READ_TIMEOUT`, not the 9s write budget: this is a
+    /// The budget is `lockdir::READ_TIMEOUT`, not the 9s write budget: this is a
     /// status read, and a caller that waited out two write budgets would stall
     /// a `list` for ~18s behind a CLI that is merely busy. `Locked` on timeout,
     /// which the collector degrades on.
@@ -164,20 +165,20 @@ impl ClaudeDriver {
     fn read_locks(
         &self,
         env: &Env,
-    ) -> Result<(Vec<locks::LockGuard>, locks::LockGuard), DriverError> {
-        let credentials = locks::credentials_lock(env, locks::READ_TIMEOUT)?;
-        let config = locks::config_lock(env, locks::READ_TIMEOUT)?;
+    ) -> Result<(Vec<lockdir::LockGuard>, lockdir::LockGuard), DriverError> {
+        let credentials = locks::credentials_lock(env, lockdir::READ_TIMEOUT)?;
+        let config = locks::config_lock(env, lockdir::READ_TIMEOUT)?;
         Ok((credentials, config))
     }
 
     /// Replace it, under Claude Code's own locks, with the 9s production
     /// per-lock budget.
     pub fn write_live(&self, env: &Env, login: &Login) -> Result<(), DriverError> {
-        self.write_live_with_timeout(env, login, locks::DEFAULT_TIMEOUT)
+        self.write_live_with_timeout(env, login, lockdir::DEFAULT_TIMEOUT)
     }
 
     /// `write_live` with an explicit per-lock wait budget (the suite uses a
-    /// few hundred ms; production uses `locks::DEFAULT_TIMEOUT`).
+    /// few hundred ms; production uses `lockdir::DEFAULT_TIMEOUT`).
     ///
     /// Splits the envelope, takes the credential locks and then the config lock
     /// (Claude Code's order), composes the credential with the machine's live

@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use crate::driver::claude::locks::{proper_lockfile, LockGuard, DEFAULT_TIMEOUT, READ_TIMEOUT};
 use crate::driver::fsutil::write_private_file;
 use crate::driver::gemini::paths;
 use crate::driver::gemini::GeminiDriver;
+use crate::driver::lockdir::{proper_lockfile, LockGuard, DEFAULT_TIMEOUT, READ_TIMEOUT};
 use crate::driver::{DriverError, Env, Login};
 
 /// How long a swapd holder may go without touching the lock before another
@@ -255,15 +255,12 @@ impl GeminiDriver {
     }
 }
 
-/// Takes swapd's own lock around the pair, wrapping the message so it reads
-/// as swapd's rather than Claude Code's (`proper_lockfile`'s wording belongs
-/// to the Claude module; its integration test pins it, so it is left alone).
+/// Takes swapd's own lock around the pair. This artifact is swapd's, not the
+/// Gemini CLI's — the CLI takes no lock of its own on the file pair — so a
+/// timeout blames swapd.
 fn take_live_lock(env: &Env, timeout: Duration) -> Result<LockGuard, DriverError> {
     let path = paths::live_lock(env)?;
-    proper_lockfile(&path, LIVE_LOCK_STALENESS, timeout).map_err(|e| match e {
-        DriverError::Locked(_) => DriverError::Locked(format!("swapd holds {}", path.display())),
-        other => other,
-    })
+    proper_lockfile(&path, "swapd", LIVE_LOCK_STALENESS, timeout)
 }
 
 #[cfg(test)]

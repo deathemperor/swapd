@@ -4,6 +4,7 @@
 pub mod claude;
 pub mod fsutil;
 pub mod gemini;
+pub mod lockdir;
 pub mod marker;
 
 use std::collections::HashMap;

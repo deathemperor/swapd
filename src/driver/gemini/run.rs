@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::driver::claude::live::write_private_file;
+use crate::driver::fsutil::{create_private_dir_all, is_executable, write_private_file};
 use crate::driver::gemini::live::{Envelope, OAUTH_PERSONAL};
 use crate::driver::gemini::{identity, oauth, usage, GeminiDriver};
 use crate::driver::marker;
@@ -37,24 +37,6 @@ fn binary_names() -> &'static [&'static str] {
         &["gemini.cmd", "gemini.exe", "gemini"]
     } else {
         &["gemini"]
-    }
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
     }
 }
 
@@ -83,16 +65,6 @@ pub fn profile_dir(env: &Env, slot: u32) -> PathBuf {
         .join("profiles")
         .join("gemini")
         .join(slot.to_string())
-}
-
-fn create_private_dir_all(dir: &Path) -> Result<(), DriverError> {
-    fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 fn seed(dir: &Path, envelope: &Envelope) -> Result<(), DriverError> {

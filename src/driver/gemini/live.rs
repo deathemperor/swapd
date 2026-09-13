@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use crate::driver::claude::live::write_private_file;
 use crate::driver::claude::locks::{proper_lockfile, LockGuard, DEFAULT_TIMEOUT, READ_TIMEOUT};
+use crate::driver::fsutil::write_private_file;
 use crate::driver::gemini::paths;
 use crate::driver::gemini::GeminiDriver;
 use crate::driver::{DriverError, Env, Login};

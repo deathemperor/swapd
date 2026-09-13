@@ -2,6 +2,7 @@
 //! verbs resolve a provider through.
 
 pub mod claude;
+pub mod fsutil;
 pub mod gemini;
 pub mod marker;
 

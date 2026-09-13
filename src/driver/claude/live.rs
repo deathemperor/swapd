@@ -15,7 +15,7 @@
 //! receives the `oauthAccount` key, and `~/.claude.json` receives nothing else.
 
 use std::fs;
-use std::io::{ErrorKind, Write as _};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +25,7 @@ use serde_json::{Map, Value};
 use crate::core::store::write_json_atomic;
 use crate::driver::claude::oauth::Endpoints;
 use crate::driver::claude::{locks, paths};
+use crate::driver::fsutil::write_private_file;
 use crate::driver::{DriverError, Env, Identity, Login};
 use crate::errors::ErrorCode;
 #[cfg(target_os = "macos")]
@@ -499,22 +500,6 @@ pub fn write_credentials_file(env: &Env, value: &str) -> Result<(), DriverError>
             Err(e)
         }
     }
-}
-
-/// Create `path` with 0600 and write `value` to it.
-pub fn write_private_file(path: &Path, value: &str) -> Result<(), DriverError> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
-    file.write_all(value.as_bytes())?;
-    // Durable before the rename, as `core::store::write_json_atomic` does.
-    file.sync_all()?;
-    Ok(())
 }
 
 /// The envelope's `oauthAccount` (from `~/.claude.json`) glued onto the raw

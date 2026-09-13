@@ -138,10 +138,20 @@ pub fn run(
     let outcome = match driver.ignite(&ctx.env, slot, &login) {
         Ok(outcome) => outcome,
         Err(failure) => {
+            // The persist's own failure does not replace the run's: the run is
+            // why this call failed, and a store error reported in its place
+            // would send the reader looking in the wrong direction. It is
+            // carried as a warning on the error instead.
+            let mut err: SwapdError = failure.error.into();
             if let Some(login) = &failure.rotated {
-                persist_rotation(ctx, driver, slot, login)?;
+                if let Err(store) = persist_rotation(ctx, driver, slot, login) {
+                    err.message = format!(
+                        "{}; the run's rotation was not stored: {}",
+                        err.message, store.message
+                    );
+                }
             }
-            return Err(failure.error.into());
+            return Err(err);
         }
     };
 

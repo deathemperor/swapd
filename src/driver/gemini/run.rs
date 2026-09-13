@@ -256,6 +256,28 @@ mod tests {
         }
     }
 
+    /// Every directory on the way to a profile is swapd's own and holds a
+    /// credential at the end of it, so each component gets 0700 — including
+    /// `profiles/` and `profiles/gemini/`, which took the umask default until
+    /// both drivers shared one `create_private_dir_all` (#17).
+    #[cfg(unix)]
+    #[test]
+    fn every_component_of_a_profile_path_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let env = env_with(&home, []);
+        run_profile(&env, 3, &login(1_000)).unwrap();
+        for path in [
+            env.home.join("profiles"),
+            env.home.join("profiles").join("gemini"),
+            profile_dir(&env, 3),
+            profile_dir(&env, 3).join(".gemini"),
+        ] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", path.display());
+        }
+    }
+
     #[test]
     fn a_profile_is_seeded_once_and_points_gemini_cli_home_at_itself() {
         let home = temp_home();

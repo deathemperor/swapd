@@ -12,7 +12,7 @@
 //! leaks in. A board with no accounts polls nothing, so no request is ever
 //! made. Nothing here sets a process-wide env var.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -67,21 +67,38 @@ impl Fixture {
     }
 }
 
-fn wait_for_exit(child: &mut Child, within: Duration) -> Option<i32> {
-    let deadline = Instant::now() + within;
+fn wait_for_exit(child: &mut Child, within: Duration) -> Option<(i32, Duration)> {
+    let start = Instant::now();
+    let deadline = start + within;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
-            return Some(status.code().unwrap_or(-1));
+            return Some((status.code().unwrap_or(-1), start.elapsed()));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     None
 }
 
+/// How long the EOF exit is given before the test calls it broken.
+///
+/// Generous on purpose. What is under test is that EOF ends the daemon at all
+/// — a watcher that never fires never exits, so any finite deadline catches
+/// the bug this guards. "Promptly" is a scheduling property of the runner, not
+/// of the code: a 2 s deadline failed once on a loaded macos-14 runner while
+/// the sibling test's daemons were starting, and the rerun of the same sha
+/// passed everywhere (#19). So the deadline answers the question the test is
+/// for, and the time actually taken rides out as a measured note.
+const EXIT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// What the exit should take on an unloaded machine; over this the test still
+/// passes and says how long it took, so a real regression shows up in the log
+/// before it becomes a flake.
+const EXIT_PROMPT: Duration = Duration::from_secs(2);
+
 /// A supervisor holds the daemon's stdin open; closing it is how it says it is
 /// gone. An orphaned daemon would keep switching accounts under a user who has
-/// quit the app, so EOF is an exit — promptly, and with a zero status, because
-/// being told to stop is not a failure.
+/// quit the app, so EOF is an exit — with a zero status, because being told to
+/// stop is not a failure.
 #[test]
 fn supervised_exits_on_stdin_eof() {
     let fixture = Fixture::new();
@@ -96,11 +113,25 @@ fn supervised_exits_on_stdin_eof() {
     assert!(first["ts"].as_str().unwrap().ends_with('Z'));
 
     drop(child.stdin.take());
-    let code = wait_for_exit(&mut child, Duration::from_secs(2));
-    if code.is_none() {
+    let exit = wait_for_exit(&mut child, EXIT_DEADLINE);
+    if exit.is_none() {
         let _ = child.kill();
     }
-    assert_eq!(code, Some(0), "EOF on stdin must end the daemon");
+    let (code, took) = exit.unwrap_or_else(|| {
+        panic!("EOF on stdin must end the daemon; still running after {EXIT_DEADLINE:?}")
+    });
+    assert_eq!(
+        code, 0,
+        "EOF on stdin must end the daemon with a zero status"
+    );
+    if took > EXIT_PROMPT {
+        // Straight to the fd, not `eprintln!`: libtest captures the print
+        // macros for a passing test, and a note nobody reads is not a note.
+        let _ = writeln!(
+            std::io::stderr(),
+            "note: the EOF exit took {took:?} (over the {EXIT_PROMPT:?} it takes idle)"
+        );
+    }
 }
 
 /// Two engines polling and switching one credential store is never what the

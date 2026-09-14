@@ -19,6 +19,7 @@
 //!
 //! Rows hold windows and timestamps only — never a token, never a credential.
 
+use std::borrow::Cow;
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +147,15 @@ pub struct Row {
     /// bind to it, so any credential-writing path heals them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dead_fingerprint: Option<String>,
+    /// When a consumer reported that the provider refused this account — the
+    /// 429 a running CLI saw, which lands up to a poll interval before the
+    /// usage endpoint admits it (`swapd limit-hit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_limit_at: Option<f64>,
+    /// When that refusal lifts, as reported or as read off the stored 5-hour
+    /// window at report time. `None` when neither was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_limit_resets_at: Option<f64>,
 }
 
 /// `usage.json` as stored.
@@ -183,6 +193,12 @@ pub struct Entry {
     /// the scheduler itself chose the cadence. Capped at the trust ceiling.
     pub trust_extended: bool,
     pub claim_until: Option<f64>,
+    pub reported_limit_at: Option<f64>,
+    pub reported_limit_resets_at: Option<f64>,
+    /// Whether that report still outranks the stored measurement, resolved
+    /// against the clock at snapshot time — like `trust_extended`, so every
+    /// reader of one `entries()` pass judges it identically.
+    pub reported_limit_held: bool,
 }
 
 impl Entry {
@@ -243,18 +259,83 @@ impl Entry {
     }
 
     /// The windows switch decisions run on (`usage_store.py:376-392`):
-    /// last-good while it is recent enough to trust, else `None` (unknown).
-    /// Display code reads `last_good`/`age_s` directly instead — it may show
-    /// older data, annotated with its age.
-    pub fn decision_windows(&self) -> Option<&[Window]> {
-        let windows = self.last_good.as_deref()?;
-        let age_s = self.age_s?;
-        if age_s <= STALE_OK_S || self.trust_extended {
-            Some(windows)
-        } else {
-            None
+    /// last-good while it is recent enough to trust, else `None` (unknown) —
+    /// with a held `limit-hit` report folded in. Display code reads
+    /// `last_good`/`age_s` directly instead: it may show older data, annotated
+    /// with its age, and it must not show a window the account never reported.
+    ///
+    /// The report is applied HERE, in the one function every decision path
+    /// already shares, rather than at each of them: the collector's
+    /// `nextCandidate`, `rotate` and the `auto` engine must not be able to
+    /// disagree about whether an account is refused.
+    pub fn decision_windows(&self) -> Option<Cow<'_, [Window]>> {
+        let trusted = match (self.last_good.as_deref(), self.age_s) {
+            (Some(windows), Some(age_s)) if age_s <= STALE_OK_S || self.trust_extended => {
+                Some(windows)
+            }
+            _ => None,
+        };
+        if !self.reported_limit_held {
+            return trusted.map(Cow::Borrowed);
         }
+        Some(Cow::Owned(at_limit(trusted, self.reported_limit_resets_at)))
     }
+}
+
+/// Whether a consumer's reported refusal is still the better evidence
+/// (`swapd limit-hit`).
+///
+/// Two ways it can be, and either is enough. A known reset is proof the account
+/// is still blocked, exactly as the engine's own no-return bar reads a
+/// departure (`core::auto::left_at_limit_holds`). Without one, the report
+/// stands until a measurement lands at least `MIN_INTERVAL_S` after it — the
+/// endpoint lags a real limit by up to a poll interval, so until then it is not
+/// disagreeing with the report, it simply has not caught up. After that the
+/// endpoint wins: a refusal swapd cannot corroborate must not strand an account
+/// that has since recovered.
+fn reported_limit_holds(row: &Row, now: f64) -> bool {
+    let Some(reported_at) = row.reported_limit_at else {
+        return false;
+    };
+    if row.reported_limit_resets_at.is_some_and(|at| now < at) {
+        return true;
+    }
+    row.fetched_at
+        .is_none_or(|at| at < reported_at + poll_policy::MIN_INTERVAL_S)
+}
+
+/// `windows` with the 5-hour window at 100%, creating one when there is none
+/// — the shape a reported refusal has to take to be read by `core::gating`.
+///
+/// The 5-hour window and not the binding one: a fast burn is what outruns the
+/// poll cadence, and marking a 40%-used weekly window exhausted would park the
+/// account until its weekly reset. A weekly refusal is caught by the confirming
+/// fetch instead. On a provider that reports only scoped windows (Gemini) the
+/// injected window makes `gating::relevant` ignore those while the report
+/// holds; the verdict — refused, headroom 0 — is still the right one.
+fn at_limit(windows: Option<&[Window]>, resets_at: Option<f64>) -> Vec<Window> {
+    let resets_at = resets_at.and_then(format_ts);
+    let mut out = windows.map(<[Window]>::to_vec).unwrap_or_default();
+    if let Some(five) = out.iter_mut().find(|w| w.kind == WindowKind::FiveHour) {
+        five.pct = five.pct.max(100.0);
+        // An explicit report is the better stamp; a stored one is kept when the
+        // report carried none.
+        if resets_at.is_some() {
+            five.resets_at = resets_at;
+        }
+        return out;
+    }
+    out.push(Window {
+        kind: WindowKind::FiveHour,
+        name: None,
+        pct: 100.0,
+        resets_at,
+        pace: None,
+        used: None,
+        limit: None,
+        currency: None,
+    });
+    out
 }
 
 /// Whether a collector's fetch lease on a row is still live. The single source
@@ -613,6 +694,9 @@ impl UsageStore {
                     dead_fingerprint: row.dead_fingerprint.clone(),
                     trust_extended,
                     claim_until: row.claim_until,
+                    reported_limit_at: row.reported_limit_at,
+                    reported_limit_resets_at: row.reported_limit_resets_at,
+                    reported_limit_held: reported_limit_holds(row, now),
                 },
             );
         }
@@ -747,8 +831,67 @@ impl UsageStore {
         row.last_error = None;
         row.backoff_until = None;
         row.auth_dead_strikes = 0;
+        // Forget a report this very measurement has outlived, so a refusal
+        // swapd could never corroborate does not sit on the row forever. One
+        // that still holds survives: this fetch may be the lagging read the
+        // report exists to overrule.
+        if !reported_limit_holds(row, now) {
+            row.reported_limit_at = None;
+            row.reported_limit_resets_at = None;
+        }
         release_claim(row);
         self.write_rows(rows)
+    }
+
+    /// Record that a consumer was refused by the provider on this account
+    /// (`swapd limit-hit`): the 429 a running CLI saw, which arrives up to a
+    /// poll interval before the usage endpoint reports the account spent.
+    ///
+    /// Identity-guarded like every other writer, and deliberately NOT fenced by
+    /// a claim: the report is a fact about the account, not the outcome of a
+    /// fetch this process won the right to make. `next_poll_at` collapses to
+    /// now so the next pass spends a request confirming it.
+    ///
+    /// `resets_at` is the refusal's own deadline when the caller knows it;
+    /// otherwise the stored 5-hour window's, which is that window's end and so
+    /// the same instant. With neither, the report rests on the lag horizon in
+    /// `reported_limit_holds` alone.
+    pub fn record_reported_limit(
+        &self,
+        key: &str,
+        email: &str,
+        org: &str,
+        resets_at: Option<f64>,
+    ) -> Result<Option<f64>> {
+        let now = self.now();
+        let _lock = self.lock()?;
+        let mut rows = self.read_rows()?;
+        let row = match rows.entry(key.to_string()) {
+            MapEntry::Occupied(slot) if matches(slot.get(), email, org) => slot.into_mut(),
+            MapEntry::Occupied(mut slot) => {
+                slot.insert(Row {
+                    email: email.to_string(),
+                    org: org.to_string(),
+                    ..Row::default()
+                });
+                slot.into_mut()
+            }
+            MapEntry::Vacant(slot) => slot.insert(Row {
+                email: email.to_string(),
+                org: org.to_string(),
+                ..Row::default()
+            }),
+        };
+        let resets_at = resets_at.or_else(|| {
+            let windows = row.last_good.as_deref()?;
+            let five = windows.iter().find(|w| w.kind == WindowKind::FiveHour)?;
+            parse_reset_ts(five.resets_at.as_deref())
+        });
+        row.reported_limit_at = Some(now);
+        row.reported_limit_resets_at = resets_at;
+        row.next_poll_at = Some(now);
+        self.write_rows(rows)?;
+        Ok(resets_at)
     }
 
     /// Merge a failed fetch, fenced by its lease (`usage_store.py:1116-1137`).
@@ -1235,7 +1378,7 @@ mod tests {
 
         fetch_ok(&store, five(10.0));
         assert_eq!(
-            entry(&store).decision_windows(),
+            entry(&store).decision_windows().as_deref(),
             Some(five(10.0).as_slice())
         );
 
@@ -1430,7 +1573,7 @@ mod tests {
             .unwrap();
         let e = entry(&store);
         assert!(e.trust_extended);
-        assert_eq!(e.decision_windows(), Some(five(10.0).as_slice()));
+        assert_eq!(e.decision_windows().as_deref(), Some(five(10.0).as_slice()));
         // But never past the general ceiling.
         clock.set(T0 + TRUST_MAX_AGE_S + 1.0);
         let e = entry(&store);
@@ -1545,6 +1688,82 @@ mod tests {
             due_candidate(&all3, &entries, T0).as_deref(),
             Some("claude:2")
         );
+    }
+
+    /// Report a refusal against `claude:1`, the way `swapd limit-hit` does.
+    fn report_limit(store: &UsageStore, resets_at: Option<f64>) {
+        store
+            .record_reported_limit("claude:1", "you@example.com", "org-0000", resets_at)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_reported_limit_reads_as_spent_before_the_endpoint_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        // The measurement every surface would otherwise decide on: plenty left.
+        fetch_ok(&store, five(10.0));
+        clock.advance(30.0);
+        report_limit(&store, None);
+
+        let e = entry(&store);
+        assert!(e.reported_limit_held);
+        let windows = e.decision_windows().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].kind, WindowKind::FiveHour);
+        assert_eq!(windows[0].pct, 100.0);
+        // Due at once, so the next pass is the one that confirms.
+        assert_eq!(e.next_poll_at, Some(T0 + 30.0));
+    }
+
+    #[test]
+    fn a_reported_limit_lapses_once_a_later_measurement_can_disagree() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        fetch_ok(&store, five(10.0));
+        report_limit(&store, None);
+
+        // A fetch inside the endpoint's own lag horizon is no evidence: it may
+        // be exactly the reading the report exists to overrule.
+        clock.advance(MIN_INTERVAL_S - 1.0);
+        fetch_ok(&store, five(12.0));
+        assert!(entry(&store).reported_limit_held);
+
+        // One past it is, and the mark is forgotten rather than left on the row.
+        clock.advance(2.0);
+        fetch_ok(&store, five(12.0));
+        let e = entry(&store);
+        assert!(!e.reported_limit_held);
+        assert_eq!(e.reported_limit_at, None);
+        assert_eq!(e.decision_windows().unwrap()[0].pct, 12.0);
+    }
+
+    #[test]
+    fn a_reported_reset_outlasts_the_lag_horizon_and_then_lifts_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        fetch_ok(&store, five(10.0));
+        report_limit(&store, Some(T0 + 3600.0));
+
+        // A known reset is proof the account is still blocked, whatever the
+        // endpoint answers in the meantime.
+        clock.advance(MIN_INTERVAL_S + 1.0);
+        fetch_ok(&store, five(12.0));
+        let e = entry(&store);
+        assert!(e.reported_limit_held);
+        let windows = e.decision_windows().unwrap();
+        assert_eq!(windows[0].pct, 100.0);
+        assert_eq!(windows[0].resets_at, format_ts(T0 + 3600.0));
+
+        // And it lifts on the clock alone — no fetch has to land to free it.
+        clock.set(T0 + 3600.5);
+        assert!(!entry(&store).reported_limit_held);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! other external readers. Field order mirrors the emitted JSON.
 //!
 //! `ProviderView.active_unreadable` was added additively (issue #8), and so was
-//! `last_known_active_slot` beside it; `schemaVersion` stays 1.
+//! `last_known_active_slot` beside it, and `AccountView.reported_limit_at` with
+//! its reset; `schemaVersion` stays 1.
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,16 @@ pub struct AccountView {
     /// When the failure backoff lifts, RFC 3339; absent when none is running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff_until: Option<String>,
+    /// When a consumer reported the provider refusing this account
+    /// (`swapd limit-hit`), RFC 3339. Present only while that report still
+    /// outranks the stored measurement — which is exactly while decisions read
+    /// the account as spent, whatever `windows` says. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_limit_at: Option<String>,
+    /// When the reported refusal lifts, RFC 3339; absent when it was reported
+    /// without one and none could be read off the stored 5-hour window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_limit_resets_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -219,6 +230,8 @@ mod tests {
                     }),
                     last_error: None,
                     backoff_until: None,
+                    reported_limit_at: None,
+                    reported_limit_resets_at: None,
                 }],
             }],
         };

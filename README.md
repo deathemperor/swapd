@@ -35,6 +35,7 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | `switch <ident>` | make an account the live login, by slot number, alias or email |
 | `rotate [--strategy s]` | switch to the next account a strategy picks |
 | `auto` | run the switching daemon: poll usage, switch when policy says to |
+| `limit-hit <ident> [--resets-at ts]` | report that the provider refused this account, ahead of the usage endpoint admitting it |
 | `ignite <ident>` | start an account's usage window: one short run in its own profile |
 | `run <ident> -- <args>` | run the provider's CLI as one account, without touching the live login |
 | `alias <ident> [name\|--unset]` | set or clear a slot's short name |
@@ -75,7 +76,7 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
 | `SWAPD_URL_ANTHROPIC_API` | overrides the Anthropic API base URL |
 | `SWAPD_URL_PLATFORM` | overrides the platform (console) base URL |
 | `SWAPD_CLAUDE_CLI` | the `claude` binary to run, overriding PATH lookup |
-| `SWAPD_SUPERVISED` | set to `1` by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF |
+| `SWAPD_SUPERVISED` | set to `1` by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF, and re-evaluates at once on any line written to it |
 
 ## Storage
 

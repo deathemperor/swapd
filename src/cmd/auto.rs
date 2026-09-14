@@ -10,7 +10,7 @@
 //! thread blocked in `read`: no polling loop, no timer thread, nothing that
 //! wakes to discover it has nothing to do.
 
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Write as _};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -65,43 +65,63 @@ pub fn run(ctx: Ctx, driver: &dyn Driver, json: bool) -> Result<i32> {
     // this content, is the authority.
     mutex.note(&json!({ "pid": std::process::id() }).to_string());
 
-    if ctx.env.vars.get(SUPERVISED_ENV).map(String::as_str) == Some("1") {
-        exit_on_stdin_eof();
-    }
-
     // The channel is the sleep: `recv_timeout` blocks the thread outright, so
     // an idle daemon costs nothing between ticks. The sender is kept alive for
     // the loop's lifetime on purpose — dropping it would make every
     // `recv_timeout` return `Disconnected` at once and spin the loop.
-    let (_wake, rx) = mpsc::channel::<()>();
+    let (wake, rx) = mpsc::channel::<()>();
+    if ctx.env.vars.get(SUPERVISED_ENV).map(String::as_str) == Some("1") {
+        watch_stdin(wake.clone());
+    }
+
     let mut engine = AutoEngine::new(ctx, driver, Box::new(move |emit| print_event(emit, json)));
     loop {
         let outcome = engine.tick();
         let delay = engine.schedule(outcome, rand::random::<f64>);
         match rx.recv_timeout(Duration::from_secs_f64(delay.max(0.0))) {
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            // Nothing sends today; either arm means the wake channel is gone,
-            // which is not a state a daemon should keep looping in.
-            _ => break,
+            // Woken early by the supervisor. Whatever it knows is already in
+            // the store (`swapd limit-hit`), so the wake carries nothing but
+            // "look now" — and a burst of them is one tick, not one each.
+            Ok(()) => {
+                drain(&rx);
+                continue;
+            }
+            // The outer sender above outlives the loop, so this cannot be the
+            // ordinary end of the stdin watcher; it means the channel itself is
+            // gone, which is not a state a daemon should keep looping in.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(0)
 }
 
-/// Exit as soon as the supervising parent closes our stdin.
+/// Discard wakes that queued while a tick ran.
+///
+/// A supervisor reporting a refusal on four accounts at once wants one
+/// re-evaluation, not four: the tick reads the whole store either way, and each
+/// extra pass costs a live-login read for nothing.
+fn drain(rx: &mpsc::Receiver<()>) {
+    while rx.try_recv().is_ok() {}
+}
+
+/// Read the supervising parent's stdin: each line is "re-evaluate now", and
+/// EOF — the parent gone — exits the process.
 ///
 /// The thread blocks in `read` — it is not a poll — so a supervised daemon
-/// costs exactly one sleeping thread more than an unsupervised one. Reading
-/// (rather than waiting for the fd to close) also means a parent that writes
-/// to us is simply ignored instead of being mistaken for EOF.
-fn exit_on_stdin_eof() {
-    std::thread::spawn(|| {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 256];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+/// costs exactly one sleeping thread more than an unsupervised one. A line
+/// carries nothing: whatever the parent knows it has already written to the
+/// store (`swapd limit-hit`), and the tick reads the store. That keeps this end
+/// of the pipe a single byte's worth of protocol, and leaves a parsed command
+/// line free to mean something later without breaking a parent that just writes
+/// a newline.
+fn watch_stdin(wake: mpsc::Sender<()>) {
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            // A send that fails means the loop is gone, which EOF handles; a
+            // read error is the pipe breaking, same as EOF.
+            if line.is_err() || wake.send(()).is_err() {
+                break;
             }
         }
         let _ = std::io::stdout().flush();
@@ -123,4 +143,27 @@ fn print_event(emit: &Emit, json: bool) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A burst of wakes is one re-evaluation, not one each: the tick reads the
+    /// whole store, so by the time it runs the second line has nothing left to
+    /// tell it.
+    #[test]
+    fn queued_wakes_collapse_into_one_tick() {
+        let (wake, rx) = mpsc::channel::<()>();
+        for _ in 0..4 {
+            wake.send(()).unwrap();
+        }
+
+        // What the loop does: take the wake that ended the sleep, then drop the
+        // ones that arrived behind it.
+        assert!(rx.recv_timeout(Duration::from_secs(0)).is_ok());
+        drain(&rx);
+
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
 }

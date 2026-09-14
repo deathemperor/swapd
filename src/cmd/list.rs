@@ -176,6 +176,8 @@ mod tests {
             last_good: None,
             last_error: None,
             backoff_until: None,
+            reported_limit_at: None,
+            reported_limit_resets_at: None,
         }
     }
 

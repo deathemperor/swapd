@@ -163,6 +163,7 @@ Crates: `clap` (derive), `serde` + `serde_json`, `ureq` (rustls),
 | `ignite <slot>` | human | the driver's cheapest request under that slot's login, then `refresh --slot`; returns `list` |
 | `run <slot> -- <args>` | human | the CLI as that slot, this process only |
 | `auto --json` | daemon | NDJSON events (section 6) |
+| `limit-hit <slot> [--resets-at ts]` | write (usage store) | a consumer reports the provider refusing this account; every surface reads it as spent until a fetch past the endpoint's lag horizon disagrees, or the reported reset passes. Returns `list`. |
 | `config list\|get\|set\|unset` | | `settings.json` keys below |
 | `history [--limit n]` | read | switches, oldest last |
 | `notify` | read | which push channels are set (masked) |
@@ -267,7 +268,17 @@ that driver's sub-spec is written.
   `sleep` names the delay before the next tick; `config-warning` reports
   a `settings.json` key the daemon could not use and what it fell back
   to. A reader that does not know an event drops it. Under
-  `SWAPD_SUPERVISED=1` the daemon exits on stdin EOF.
+  `SWAPD_SUPERVISED=1` the daemon exits on stdin EOF, and any line
+  written to it means "re-evaluate now" — the wake carries nothing, since
+  whatever the supervisor knows it has already written to the store
+  (`limit-hit`); queued wakes collapse into one tick.
+- **Reported limits**: the usage endpoint lags a real limit by up to a
+  poll interval, so a consumer that is refused reports it with
+  `limit-hit`. The row's report overrides the stored 5-hour window for
+  every decision (`Entry::decision_windows`) while it holds — until the
+  reported reset passes, or a fetch lands later than the lag horizon and
+  disagrees — so the engine's existing `at-limit` trigger and no-return
+  bar do the rest.
 
 ## 7. Infinitus adapter
 

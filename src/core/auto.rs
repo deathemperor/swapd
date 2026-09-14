@@ -1077,7 +1077,7 @@ impl<'a> AutoEngine<'a> {
             let windows: Vec<Window> = measurable
                 .then(|| entry.and_then(|e| e.decision_windows()))
                 .flatten()
-                .map(<[Window]>::to_vec)
+                .map(std::borrow::Cow::into_owned)
                 .unwrap_or_default();
             let headroom = binding_pct(&windows, &self.ctx.settings.models).map(|pct| 100.0 - pct);
             if headroom.is_none() {

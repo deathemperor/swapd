@@ -30,6 +30,7 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | `refresh [--slot n]` | fetch usage now, then list |
 | `add [--slot n] [--alias name] [--force]` | capture the CLI's current live login into a slot, moving it there if it already owns a different one |
 | `add-token - [--slot n] [--email addr] [--alias name] [--force]` | register a raw OAuth setup token or API key read from stdin |
+| `add-oauth [--slot n] [--alias name] [--force] [--timeout s]` | sign an account in through the browser and register it — no prior login on this machine |
 | `import <path\|-> [--force]` | import accounts from an export file |
 | `export <path\|-> [--slot n] [--full]` | write an export envelope to a file |
 | `switch <ident>` | make an account the live login, by slot number, alias or email |
@@ -53,6 +54,11 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 machine-readable output; `--provider <name>` picks a provider other than the
 default (`claude`).
 
+`add-oauth` prints two lines: the URL to open, flushed the moment its loopback
+listener is up, and then the usual `add` envelope once the sign-in has been
+redeemed and stored. A caller opens the first and reads the second; cancelling
+is killing the process.
+
 `export --full` embeds the active account's whole `~/.claude.json` — which
 includes its project paths and prompt history — beside the credentials, so
 treat a `--full` export as the same kind of secret as the login itself. A plain
@@ -74,6 +80,8 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
 | `SWAPD_LIVE_STORE` | `file` \| `keychain` — overrides where the Claude CLI's live login is written |
 | `SWAPD_URL_ANTHROPIC_API` | overrides the Anthropic API base URL |
 | `SWAPD_URL_PLATFORM` | overrides the platform (console) base URL |
+| `SWAPD_URL_CLAUDE_WEB` | overrides the base URL `add-oauth`'s authorize page hangs off |
+| `SWAPD_OAUTH_PORT` | overrides the loopback port `add-oauth` listens on (tests only: a real authorization server refuses a redirect its client registration does not name) |
 | `SWAPD_CLAUDE_CLI` | the `claude` binary to run, overriding PATH lookup |
 | `SWAPD_SUPERVISED` | set to `1` by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF |
 

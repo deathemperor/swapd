@@ -2,6 +2,7 @@
 //! human renderer and the machine one describe exactly the same pass.
 
 pub mod add;
+pub mod add_oauth;
 pub mod add_token;
 pub mod alias;
 pub mod auto;

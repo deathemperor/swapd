@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::driver::{
-    Caps, Driver, DriverError, Env, Identity, IgniteFailure, IgniteOutcome, Login, RunProfile,
-    Usage,
+    Caps, Driver, DriverError, Env, Identity, IgniteFailure, IgniteOutcome, Login, OauthStart,
+    RunProfile, Usage,
 };
 
 pub struct GeminiDriver {
@@ -134,10 +134,16 @@ impl Driver for GeminiDriver {
         Caps {
             ignite: true,
             add_token: false,
+            add_oauth: false,
             prefer: true,
             refresh: true,
             run: true,
         }
+    }
+    /// The Gemini CLI holds its own OAuth client; swapd captures what it wrote
+    /// (`add`) rather than signing in for it.
+    fn oauth_begin(&self, _env: &Env) -> Result<OauthStart, DriverError> {
+        Err(DriverError::Unsupported("gemini has no browser sign-in"))
     }
     /// Anything with a refresh token can be made live; there is no other axis.
     fn can_activate(&self, login: &Login) -> Result<(), DriverError> {

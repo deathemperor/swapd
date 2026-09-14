@@ -58,6 +58,24 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Sign an account in through the browser and register it.
+    ///
+    /// Prints the page to open, then waits for the sign-in to land on its
+    /// loopback port. Nothing is pasted.
+    AddOauth {
+        /// Store it in this slot instead of the account's own (or the next free one).
+        #[arg(long)]
+        slot: Option<u32>,
+        /// Short name to reach this account by.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Overwrite a slot that holds a different account.
+        #[arg(long)]
+        force: bool,
+        /// Seconds to wait for the browser round trip.
+        #[arg(long, default_value_t = cmd::add_oauth::DEFAULT_TIMEOUT_S)]
+        timeout: u64,
+    },
     /// Register a raw OAuth setup token or API key read from stdin.
     AddToken {
         /// Must be `-`: the token is read from stdin, never from argv.
@@ -292,6 +310,33 @@ fn run(cli: &Cli) -> Result<()> {
                 force: *force,
             };
             let out = cmd::add::run(&ctx, driver.as_ref(), &opts)?;
+            emit(&out, cli.json, || cmd::add::print_human(&out))
+        }
+        Command::AddOauth {
+            slot,
+            alias,
+            force,
+            timeout,
+        } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            let opts = cmd::add_oauth::AddOauthOpts {
+                slot: *slot,
+                alias: alias.clone(),
+                force: *force,
+                timeout_s: *timeout,
+            };
+            // Two lines, and the first one has to reach the caller while the
+            // verb is still blocked on the browser — which it does because
+            // Rust's stdout flushes on a newline.
+            let json = cli.json;
+            let out = cmd::add_oauth::run(&ctx, driver.as_ref(), &opts, |url| {
+                if json {
+                    output::emit_json(url);
+                } else {
+                    cmd::add_oauth::print_human(url);
+                }
+            })?;
             emit(&out, cli.json, || cmd::add::print_human(&out))
         }
         Command::AddToken {

@@ -131,44 +131,7 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, opts: &AddOpts) -> Result<AddOutput
             check_alias(existing, alias, owner.as_ref().map(|(n, _)| *n))?;
         }
 
-        // An explicit `--slot` decides; otherwise the account's own slot
-        // refreshes in place and a new account takes the next free one.
-        let (slot, created, prior, moved_from) = match (opts.slot, owner) {
-            (None, Some((slot, meta))) => (slot, false, Some(meta), None),
-            (None, None) => (existing.next_free(), true, None, None),
-            (Some(slot), owner) => {
-                if slot < 1 {
-                    return Err(SwapdError::new(
-                        ErrorCode::InvalidInput,
-                        "slot numbers start at 1",
-                    ));
-                }
-                let same_account = owner.as_ref().is_some_and(|(n, _)| *n == slot);
-                let occupant = existing.slots.get(&slot).cloned();
-                if let Some(occupant) = &occupant {
-                    if !same_account && !opts.force {
-                        return Err(SwapdError::new(
-                            ErrorCode::InvalidInput,
-                            format!(
-                                "slot {slot} holds {}; pass --force to overwrite it",
-                                occupant.email
-                            ),
-                        ));
-                    }
-                }
-                // The account already owns a DIFFERENT slot: `--slot slot`
-                // moves it there instead of duplicating the row, so `prior`
-                // is the account's OWN meta (alias, icon, …) — not
-                // `occupant`, which (when `--force` allowed one) is a
-                // different account being overwritten, not this one's past.
-                match owner {
-                    Some((from, meta)) if from != slot => {
-                        (slot, occupant.is_none(), Some(meta), Some(from))
-                    }
-                    _ => (slot, occupant.is_none(), occupant, None),
-                }
-            }
-        };
+        let (slot, created, prior, moved_from) = place(existing, owner, opts.slot, opts.force)?;
 
         let meta = compose(&identity, prior.as_ref(), opts.alias.as_deref(), ctx.now());
         Ok((slot, meta, login, moved_from, created))
@@ -198,6 +161,59 @@ fn read_live(ctx: &Ctx, provider: &dyn Driver) -> Result<Login> {
         )),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Which slot a freshly obtained credential lands in, and what the row it
+/// lands on used to be. Shared by `add` and `add-oauth`: the credential's
+/// provenance differs, where it goes does not.
+///
+/// `owner` is the slot this account already holds, if any. Answers the slot,
+/// whether the row is new, the meta to compose over, and the slot a move
+/// vacated.
+pub fn place(
+    existing: &ProviderSlots,
+    owner: Option<(u32, Slot)>,
+    slot: Option<u32>,
+    force: bool,
+) -> Result<(u32, bool, Option<Slot>, Option<u32>)> {
+    // An explicit `--slot` decides; otherwise the account's own slot refreshes
+    // in place and a new account takes the next free one.
+    Ok(match (slot, owner) {
+        (None, Some((slot, meta))) => (slot, false, Some(meta), None),
+        (None, None) => (existing.next_free(), true, None, None),
+        (Some(slot), owner) => {
+            if slot < 1 {
+                return Err(SwapdError::new(
+                    ErrorCode::InvalidInput,
+                    "slot numbers start at 1",
+                ));
+            }
+            let same_account = owner.as_ref().is_some_and(|(n, _)| *n == slot);
+            let occupant = existing.slots.get(&slot).cloned();
+            if let Some(occupant) = &occupant {
+                if !same_account && !force {
+                    return Err(SwapdError::new(
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "slot {slot} holds {}; pass --force to overwrite it",
+                            occupant.email
+                        ),
+                    ));
+                }
+            }
+            // The account already owns a DIFFERENT slot: `--slot slot` moves it
+            // there instead of duplicating the row, so `prior` is the account's
+            // OWN meta (alias, icon, …) — not `occupant`, which (when `--force`
+            // allowed one) is a different account being overwritten, not this
+            // one's past.
+            match owner {
+                Some((from, meta)) if from != slot => {
+                    (slot, occupant.is_none(), Some(meta), Some(from))
+                }
+                _ => (slot, occupant.is_none(), occupant, None),
+            }
+        }
+    })
 }
 
 /// The slot row for a captured login: the identity's fields, over whatever the

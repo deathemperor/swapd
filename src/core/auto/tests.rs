@@ -228,10 +228,17 @@ impl Driver for FakeDriver {
         Caps {
             ignite: true,
             add_token: true,
+            add_oauth: false,
             prefer: true,
             refresh: true,
             run: true,
         }
+    }
+    fn oauth_begin(
+        &self,
+        _env: &crate::driver::Env,
+    ) -> std::result::Result<crate::driver::OauthStart, DriverError> {
+        Err(DriverError::Unsupported("fake"))
     }
 }
 

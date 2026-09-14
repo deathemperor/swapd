@@ -42,6 +42,9 @@ pub const READ_TIMEOUT_S: u64 = 5;
 pub struct Endpoints {
     pub api: String,
     pub platform: String,
+    /// Where the human signs in. A different host from `platform`, which is
+    /// the console: this one is claude.ai, where a subscription lives.
+    pub web: String,
 }
 
 impl Endpoints {
@@ -52,6 +55,7 @@ impl Endpoints {
         Self {
             api: http::base_url_from("anthropic-api", |k| env.vars.get(k).cloned()),
             platform: http::base_url_from("platform", |k| env.vars.get(k).cloned()),
+            web: http::base_url_from("claude-web", |k| env.vars.get(k).cloned()),
         }
     }
 }
@@ -60,12 +64,206 @@ pub fn token_url(ep: &Endpoints) -> String {
     format!("{}/v1/oauth/token", ep.platform)
 }
 
+pub fn authorize_url_base(ep: &Endpoints) -> String {
+    format!("{}/cai/oauth/authorize", ep.web)
+}
+
 pub fn profile_url(ep: &Endpoints) -> String {
     format!("{}/api/oauth/profile", ep.api)
 }
 
 pub fn usage_url(ep: &Endpoints) -> String {
     format!("{}/api/oauth/usage", ep.api)
+}
+
+/// The loopback port the OAuth client is registered to redirect to.
+///
+/// Not a choice: the authorization server refuses a `redirect_uri` the client
+/// registration does not name, so this is read off Claude Code's own flow
+/// rather than picked. One fixed port also means a second sign-in cannot start
+/// while one is in flight, which is the behaviour we want anyway.
+pub const REDIRECT_PORT: u16 = 54545;
+
+/// What a real Claude Code login asks for today, read off the credentials its
+/// own `/login` writes. Asking for a scope the registration does not grant
+/// fails the authorization, so this list is copied rather than composed.
+const SCOPES: [&str; 5] = [
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+
+/// The exchange is a person's browser round trip away and may land on a cold
+/// path; `refresh`'s 10s budget exists because callers hold credential locks
+/// around it, and this one holds nothing.
+const EXCHANGE_TIMEOUT_S: u64 = 30;
+
+/// The port this sign-in will listen on.
+///
+/// `REDIRECT_PORT` unless the driver's `Env` names another. Not a user knob:
+/// the authorization server refuses a `redirect_uri` the client registration
+/// does not name, so an override only ever points at a mock upstream — which
+/// is what makes the round trip testable without taking one global socket.
+pub fn redirect_port(env: &Env) -> u16 {
+    env.vars
+        .get("SWAPD_OAUTH_PORT")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(REDIRECT_PORT)
+}
+
+pub fn redirect_uri(port: u16) -> String {
+    format!("http://localhost:{port}/callback")
+}
+
+/// A PKCE pair: the verifier to keep, and the S256 challenge to publish.
+///
+/// 32 bytes of randomness, base64url without padding — RFC 7636's own shape,
+/// and what Claude Code sends.
+pub fn pkce() -> (String, String) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut bytes = [0u8; 32];
+    for chunk in bytes.chunks_mut(8) {
+        chunk.copy_from_slice(&rand::random::<u64>().to_le_bytes());
+    }
+    let verifier = b64.encode(bytes);
+    let challenge = b64.encode(sha2::Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// An opaque value the callback must echo, so a request that lands on the
+/// listener from anywhere else is refused rather than redeemed.
+pub fn state() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        chunk.copy_from_slice(&rand::random::<u64>().to_le_bytes());
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The page to open in the browser.
+///
+/// `code=true` is Claude Code's own parameter: it asks the success page to
+/// display the `code#state` pair for a manual paste. We send it because the
+/// upstream flow does, and it costs nothing — the loopback redirect is what
+/// actually carries the code back here.
+pub fn authorize_url(ep: &Endpoints, port: u16, challenge: &str, state: &str) -> String {
+    let params = [
+        ("code", "true"),
+        ("client_id", CLIENT_ID),
+        ("response_type", "code"),
+        ("redirect_uri", &redirect_uri(port)),
+        ("scope", &SCOPES.join(" ")),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", state),
+    ]
+    .iter()
+    .map(|(k, v)| format!("{k}={}", urlencode(v)))
+    .collect::<Vec<_>>()
+    .join("&");
+    format!("{}?{params}", authorize_url_base(ep))
+}
+
+/// Percent-encode for a query value: everything but RFC 3986's unreserved set.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Redeem an authorization code for the credential envelope Claude Code keeps.
+///
+/// The result is a complete `Login`: `claudeAiOauth` from the grant, and
+/// whatever identity the response carried folded into `oauthAccount` by the
+/// same rule a refresh uses — so the account has an offline identity from the
+/// moment it is signed in, and `add-oauth` need not go to the profile endpoint.
+pub fn exchange(
+    ep: &Endpoints,
+    port: u16,
+    code: &str,
+    verifier: &str,
+    state: &str,
+) -> Result<Login, DriverError> {
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri(port),
+        "client_id": CLIENT_ID,
+        "code_verifier": verifier,
+        "state": state,
+    });
+    let response = http::agent(EXCHANGE_TIMEOUT_S)
+        .post(token_url(ep))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .header("Content-Type", "application/json")
+        .send_json(&body)
+        .map_err(|_| DriverError::Http("sign-in: the token request failed".to_string()))?;
+
+    let status = response.status().as_u16();
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|_| DriverError::Http("sign-in: the token response was unreadable".to_string()))?;
+    if status != 200 {
+        // A code is single-use and short-lived, so a 4xx here is almost always
+        // "that code is spent or stale" — say so rather than print a number.
+        return Err(DriverError::Http(match status {
+            400 | 401 => "sign-in: the authorization code was rejected; sign in again".to_string(),
+            _ => format!("sign-in: http {status}"),
+        }));
+    }
+
+    let Ok(Value::Object(resp)) = serde_json::from_str::<Value>(&text) else {
+        return Err(DriverError::Http(
+            "sign-in: malformed token response".to_string(),
+        ));
+    };
+    let (Some(access_token), Some(refresh_token), Some(expires_in)) = (
+        resp.get("access_token").and_then(Value::as_str),
+        resp.get("refresh_token").and_then(Value::as_str),
+        resp.get("expires_in").and_then(Value::as_f64),
+    ) else {
+        return Err(DriverError::Http(
+            "sign-in: malformed token response".to_string(),
+        ));
+    };
+
+    let scopes: Vec<Value> = match resp.get("scope").and_then(Value::as_str) {
+        Some(scope) if !scope.is_empty() => scope.split_whitespace().map(Value::from).collect(),
+        _ => SCOPES.iter().map(|s| Value::from(*s)).collect(),
+    };
+    let mut oauth = Map::new();
+    oauth.insert("accessToken".to_string(), Value::from(access_token));
+    oauth.insert("refreshToken".to_string(), Value::from(refresh_token));
+    oauth.insert(
+        "expiresAt".to_string(),
+        Value::from(now_ms() + (expires_in * 1000.0) as i64),
+    );
+    oauth.insert("scopes".to_string(), Value::Array(scopes));
+
+    let mut data = Map::new();
+    data.insert("claudeAiOauth".to_string(), Value::Object(oauth));
+    merge_token_account(&mut data, &resp);
+
+    Ok(Login {
+        bytes: serde_json::to_string(&Value::Object(data))
+            .map_err(|_| DriverError::Http("sign-in: malformed token response".to_string()))?,
+    })
 }
 
 /// Milliseconds since the epoch, matching Python's
@@ -382,10 +580,73 @@ mod tests {
         let ep = Endpoints {
             api: "http://api.test".to_string(),
             platform: "http://platform.test".to_string(),
+            web: "http://web.test".to_string(),
         };
         assert_eq!(token_url(&ep), "http://platform.test/v1/oauth/token");
+        assert_eq!(
+            authorize_url_base(&ep),
+            "http://web.test/cai/oauth/authorize"
+        );
         assert_eq!(profile_url(&ep), "http://api.test/api/oauth/profile");
         assert_eq!(usage_url(&ep), "http://api.test/api/oauth/usage");
+    }
+
+    #[test]
+    fn a_pkce_pair_is_a_verifier_and_its_sha256() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let (verifier, challenge) = pkce();
+        // 32 bytes, base64url without padding.
+        assert_eq!(b64.decode(&verifier).unwrap().len(), 32);
+        assert!(!verifier.contains('=') && !verifier.contains('+') && !verifier.contains('/'));
+        assert_eq!(
+            challenge,
+            b64.encode(sha2::Sha256::digest(verifier.as_bytes()))
+        );
+        // Two calls are two sign-ins.
+        assert_ne!(pkce().0, verifier);
+        assert_ne!(state(), state());
+    }
+
+    #[test]
+    fn the_authorize_url_carries_the_challenge_the_redirect_and_the_scopes() {
+        let ep = Endpoints {
+            api: "http://api.test".to_string(),
+            platform: "http://platform.test".to_string(),
+            web: "http://web.test".to_string(),
+        };
+        let url = authorize_url(&ep, 54545, "chal-1", "st/1");
+        assert!(url.starts_with("http://web.test/cai/oauth/authorize?"));
+        assert!(url.contains(&format!("client_id={CLIENT_ID}")));
+        assert!(url.contains("code_challenge=chal-1"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("response_type=code"));
+        // Reserved characters are encoded, in the value and in the redirect.
+        assert!(url.contains("state=st%2F1"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback"));
+        // Space-joined, so every scope arrives as one parameter.
+        assert!(url.contains("scope=user%3Aprofile%20user%3Ainference"));
+    }
+
+    #[test]
+    fn the_port_is_fixed_unless_the_env_names_another() {
+        let env = |vars: &[(&str, &str)]| Env {
+            home: std::path::PathBuf::new(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert_eq!(redirect_port(&env(&[])), REDIRECT_PORT);
+        assert_eq!(redirect_port(&env(&[("SWAPD_OAUTH_PORT", "1234")])), 1234);
+        // Anything unparseable is the default, not a panic.
+        assert_eq!(
+            redirect_port(&env(&[("SWAPD_OAUTH_PORT", "nope")])),
+            REDIRECT_PORT
+        );
+        assert_eq!(redirect_uri(1234), "http://localhost:1234/callback");
     }
 
     #[test]
@@ -409,6 +670,7 @@ mod tests {
         let ep = Endpoints {
             api: "http://127.0.0.1:1".to_string(),
             platform: "http://127.0.0.1:1".to_string(),
+            web: "http://127.0.0.1:1".to_string(),
         };
         // Structurally complete OAuth object, genuinely missing the field:
         // cswap's `no_refresh_token`, permanent. No request is made.

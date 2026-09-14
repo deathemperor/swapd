@@ -314,10 +314,33 @@ impl Drop for RunProfile {
 pub struct Caps {
     pub ignite: bool,
     pub add_token: bool,
+    pub add_oauth: bool,
     pub prefer: bool,
     pub refresh: bool,
     pub run: bool,
 }
+
+/// A browser sign-in that has been started but not yet redeemed.
+///
+/// The listener is the caller's: a socket is the same socket whatever the
+/// provider, and `add-oauth` wants one shape of refusal when the port is
+/// taken. What is the driver's is the URL to open, the `state` that proves a
+/// callback belongs to *this* attempt, and the redemption — which holds the
+/// PKCE verifier, so the verifier lives in a closure for the length of one
+/// command and is never written anywhere.
+pub struct OauthStart {
+    /// The loopback port to listen on. Not the caller's choice: a redirect the
+    /// provider's client registration does not name is refused by its
+    /// authorization server.
+    pub port: u16,
+    pub url: String,
+    pub state: String,
+    pub redeem: OauthRedeem,
+}
+
+/// The second half of a browser sign-in: the authorization code in, the
+/// credential out. `FnOnce` because the code is single-use.
+pub type OauthRedeem = Box<dyn FnOnce(&str) -> Result<Login, DriverError> + Send>;
 
 pub trait Driver: Send + Sync {
     fn id(&self) -> &'static str; // "claude"
@@ -417,6 +440,13 @@ pub trait Driver: Send + Sync {
     /// is asked here rather than by reaching into a driver's paths.
     fn live_config_text(&self, env: &Env) -> Result<Option<String>, DriverError>;
     fn capabilities(&self) -> Caps; // ignite, add_token, prefer, refresh…
+    /// Begin a browser sign-in for an account that is not on this machine yet
+    /// (`Caps::add_oauth`).
+    ///
+    /// No default: a driver cannot inherit one, because an authorize URL is a
+    /// claim about a client registration only that engine holds. `Unsupported`
+    /// is what a driver without one answers.
+    fn oauth_begin(&self, env: &Env) -> Result<OauthStart, DriverError>;
     /// Whether this login can be made the live one at all, asked *before* any
     /// side effect.
     ///
@@ -601,6 +631,7 @@ mod tests {
             Caps {
                 ignite: true,
                 add_token: true,
+                add_oauth: true,
                 prefer: true,
                 refresh: true,
                 run: true,
@@ -609,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_supports_every_verb_but_add_token() {
+    fn gemini_supports_every_verb_but_the_two_that_mint_a_credential() {
         let home = tempfile::TempDir::new().unwrap();
         let env = Env {
             home: home.path().to_path_buf(),
@@ -621,6 +652,7 @@ mod tests {
             Caps {
                 ignite: true,
                 add_token: false,
+                add_oauth: false,
                 prefer: true,
                 refresh: true,
                 run: true,

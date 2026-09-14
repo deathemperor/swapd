@@ -148,7 +148,12 @@ impl Driver for FakeDriver {
             email: value.get("email")?.as_str()?.to_string(),
             organization_uuid: String::new(),
             organization_name: String::new(),
-            plan: None,
+            // The envelope's own label, when the login carries one — what a
+            // real `oauthAccount` advertises and the collector re-stamps from.
+            plan: value
+                .get("plan")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             uuid: None,
         })
     }
@@ -388,6 +393,14 @@ pub fn login_for(email: &str, token: &str) -> String {
 pub fn login_expiring(email: &str, token: &str, expires_at: i64) -> String {
     format!(
         r#"{{"email":"{email}","claudeAiOauth":{{"refreshToken":"{token}","expiresAt":{expires_at}}}}}"#
+    )
+}
+
+/// A login whose envelope advertises a plan label, the way a real
+/// `oauthAccount` carries the account's rate-limit tier.
+pub fn login_with_plan(email: &str, token: &str, plan: &str) -> String {
+    format!(
+        r#"{{"email":"{email}","plan":"{plan}","claudeAiOauth":{{"refreshToken":"{token}","expiresAt":4102444800000}}}}"#
     )
 }
 
@@ -840,4 +853,117 @@ fn shadow_never_heals_the_live_store() {
     assert!(driver.refreshes.lock().unwrap().is_empty());
     assert_eq!(driver.live_bytes().unwrap(), live);
     assert_eq!(view.accounts[0].usage_status, UsageStatus::Ok);
+}
+
+/// The plan label is written at `add` time and never again, so a fleet added
+/// before its tier changed — or added while `~/.claude.json` named another
+/// account, which is every slot but the live one — advertises a stale label or
+/// none at all. Each pass re-derives it from the credential it already holds.
+#[test]
+fn the_plan_label_follows_the_credential_the_pass_already_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_for(dir.path());
+    // Slot 1 was captured with no plan at all, slot 2 on an older tier.
+    for (slot, email, token) in [
+        (1, "one@example.com", "rt-1"),
+        (2, "two@example.com", "rt-2"),
+    ] {
+        ctx.secrets
+            .set(
+                &slot_key("claude", slot),
+                &login_with_plan(email, token, "Max 20x"),
+            )
+            .unwrap();
+        slots::update(&ctx.home.slots_file(), |file| {
+            let provider = file.providers.entry("claude".to_string()).or_default();
+            let mut row = slot_row(email);
+            if slot == 2 {
+                row.plan = Some("Max 5x".to_string());
+            }
+            provider.insert(slot, row);
+            Ok((true, ()))
+        })
+        .unwrap();
+    }
+    let driver = FakeDriver::new(&login_with_plan("one@example.com", "rt-1", "Max 20x"))
+        .usable("rt-1")
+        .usable("rt-2");
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert_eq!(view.accounts[0].plan.as_deref(), Some("Max 20x"));
+    assert_eq!(
+        view.accounts[1].plan.as_deref(),
+        Some("Max 20x"),
+        "an upgraded account must not keep advertising the tier it was captured on"
+    );
+    // Persisted, not just served: the next pass starts from the new label, and
+    // so does every reader of `slots.json`.
+    let file: SlotsFile = read_json(&ctx.home.slots_file()).unwrap();
+    let slots = &file.providers["claude"].slots;
+    assert_eq!(slots[&1].plan.as_deref(), Some("Max 20x"));
+    assert_eq!(slots[&2].plan.as_deref(), Some("Max 20x"));
+}
+
+/// A credential that advertises no plan says nothing about the account's tier —
+/// a profile-endpoint identity never carries one — so the stored label stands
+/// rather than being cleared by that silence.
+#[test]
+fn a_credential_with_no_plan_leaves_the_stored_label_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_for(dir.path());
+    ctx.secrets
+        .set(
+            &slot_key("claude", 1),
+            &login_for("one@example.com", "rt-1"),
+        )
+        .unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        let mut row = slot_row("one@example.com");
+        row.plan = Some("Max 20x".to_string());
+        provider.insert(1, row);
+        provider.active_slot = Some(1);
+        Ok((true, ()))
+    })
+    .unwrap();
+    let driver = FakeDriver::new(&login_for("one@example.com", "rt-1")).usable("rt-1");
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert_eq!(view.accounts[0].plan.as_deref(), Some("Max 20x"));
+}
+
+/// The live store can hold another account's login for a moment around a
+/// switch. Its tier is that account's, and stamping it onto this row would be
+/// worse than the stale label it replaces.
+#[test]
+fn a_credential_naming_another_account_never_restamps_the_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_for(dir.path());
+    // Slot 1's stored credential belongs to somebody else entirely.
+    ctx.secrets
+        .set(
+            &slot_key("claude", 1),
+            &login_with_plan("other@example.com", "rt-1", "Pro"),
+        )
+        .unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        let mut row = slot_row("one@example.com");
+        row.plan = Some("Max 20x".to_string());
+        provider.insert(1, row);
+        Ok((true, ()))
+    })
+    .unwrap();
+    let driver = FakeDriver::new(&login_with_plan("one@example.com", "rt-9", "Max 20x"));
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+
+    assert_eq!(view.accounts[0].plan.as_deref(), Some("Max 20x"));
+    let file: SlotsFile = read_json(&ctx.home.slots_file()).unwrap();
+    assert_eq!(
+        file.providers["claude"].slots[&1].plan.as_deref(),
+        Some("Max 20x")
+    );
 }

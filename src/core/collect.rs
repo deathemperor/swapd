@@ -370,6 +370,21 @@ pub fn prepare(
 
         let sentinel = credential_sentinel(provider, *slot, login.as_ref(), unreadable_active);
 
+        // The plan label is written at `add` time and never again, so an
+        // account whose tier changed since goes on advertising the one it was
+        // captured on, and one captured while `~/.claude.json` named a
+        // different account — the envelope's `oauthAccount` is the LIVE
+        // account's, so every `add` but the live one's got a thinner identity
+        // off the profile endpoint, which reports no plan — never got a label
+        // at all. The credential this pass already holds carries the profile
+        // Claude Code itself advertises for that account, so the label is
+        // re-derived from it here: offline, no fetch, no extra secret read.
+        let mut meta = meta;
+        if let Some(plan) = refreshed_plan(provider, login.as_ref(), &meta) {
+            record_slot_plan(ctx, id, *slot, &plan)?;
+            meta.plan = Some(plan);
+        }
+
         states.push(SlotState {
             slot: *slot,
             meta,
@@ -705,6 +720,46 @@ pub fn record_slot_fingerprint(
             return Ok((false, ()));
         }
         entry.fingerprint = fingerprint;
+        Ok((true, ()))
+    })
+}
+
+/// The plan label this slot's credential advertises, when it differs from the
+/// one `slots.json` holds — `None` when there is nothing to change.
+///
+/// Read from the credential the pass already has in hand (`identity_offline`:
+/// no network, no second secret read), and only ever from a credential that
+/// names the SAME account as the slot: the live store can hold another
+/// account's login for a moment around a switch, and stamping its tier onto
+/// this row would be worse than the stale label it replaces.
+///
+/// A credential that advertises no plan leaves the stored one alone. The label
+/// is an account fact the envelope may simply not carry (a profile-endpoint
+/// identity never does), and dropping a good label on that silence would make
+/// the chip flicker with whatever the pass could read.
+fn refreshed_plan(provider: &dyn Driver, login: Option<&Login>, meta: &Slot) -> Option<String> {
+    let identity = provider.identity_offline(login?)?;
+    if !slots::same_account(&identity, meta) {
+        return None;
+    }
+    let plan = identity.plan.filter(|plan| !plan.is_empty())?;
+    (meta.plan.as_deref() != Some(plan.as_str())).then_some(plan)
+}
+
+/// Re-stamp one slot's plan label in `slots.json`, under its lock.
+fn record_slot_plan(ctx: &Ctx, provider: &str, slot: u32, plan: &str) -> Result<()> {
+    slots::update(&ctx.home.slots_file(), |file| {
+        let Some(entry) = file
+            .providers
+            .get_mut(provider)
+            .and_then(|p| p.slots.get_mut(&slot))
+        else {
+            return Ok((false, ()));
+        };
+        if entry.plan.as_deref() == Some(plan) {
+            return Ok((false, ()));
+        }
+        entry.plan = Some(plan.to_string());
         Ok((true, ()))
     })
 }

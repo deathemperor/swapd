@@ -4,6 +4,7 @@
 
 - A credential carrying no refresh token reports `relogin-required` instead of `token-expired`: nothing can renew it, so naming a retry that can never land left the status stuck on "retrying" forever (#30).
 - `refresh --slot n` now fetches through the failure backoff, which was a cadence rule for automatic passes and silently dropped an explicit ask; the reply's `skipped` names the two gates a force still does not override (a live claim, a dead-token quarantine) rather than returning the unchanged list as if the fetch had happened (#31).
+- The plan label is re-derived each pass from the credential the collector already holds, instead of being frozen at `add` time: an account whose tier changed went on advertising the one it was captured on, and an account added while another was live never got a label at all, because the envelope's `oauthAccount` describes only the live account. The re-stamp is offline (no fetch, no extra secret read), skips a credential naming a different account, and a credential advertising no plan leaves the stored label alone (#35).
 - ignite: the forced re-fetch after the run is repeated on a short backoff (3, 7, 15, 30 s) while the usage endpoint still reads the account as cold, and the reply's `ignited.windowSeen` says whether the 5h window ever showed a reset ahead; the human line adds "window not visible yet" when it did not.
 
 ## 0.1.0 — 2026-09-11

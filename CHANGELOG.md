@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-09-15
 
+- `swapd limit-hit <ident> [--resets-at <rfc3339>]` records a refusal the consumer saw before the usage endpoint could: the mark overrides the stored 5-hour window at the one decision point `auto`, `list`'s `nextCandidate` and `rotate` read, is believed while the reported reset is ahead or until a later measurement lands, and a supervised daemon (`SWAPD_SUPERVISED=1`) re-evaluates on any stdin line instead of discarding it, so the switch happens now rather than a poll later (#38).
+- `swapd --json --provider <p> add-oauth` signs an account in through the browser: swapd is the OAuth client, prints the sign-in URL once its loopback listener is up, catches the redirect itself (the PKCE verifier never leaves the process) and prints the `add` envelope once the account is stored (#39).
 - A credential carrying no refresh token reports `relogin-required` instead of `token-expired`: nothing can renew it, so naming a retry that can never land left the status stuck on "retrying" forever (#30).
 - `refresh --slot n` now fetches through the failure backoff, which was a cadence rule for automatic passes and silently dropped an explicit ask; the reply's `skipped` names the two gates a force still does not override (a live claim, a dead-token quarantine) rather than returning the unchanged list as if the fetch had happened (#31).
 - The plan label is re-derived each pass from the credential the collector already holds, instead of being frozen at `add` time: an account whose tier changed went on advertising the one it was captured on, and an account added while another was live never got a label at all, because the envelope's `oauthAccount` describes only the live account. The re-stamp is offline (no fetch, no extra secret read), skips a credential naming a different account, and a credential advertising no plan leaves the stored label alone (#35).

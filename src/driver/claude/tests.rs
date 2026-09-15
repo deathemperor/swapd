@@ -26,6 +26,7 @@ pub fn endpoints() -> Endpoints {
     Endpoints {
         api: "http://127.0.0.1:1".to_string(),
         platform: "http://127.0.0.1:1".to_string(),
+        web: "http://127.0.0.1:1".to_string(),
     }
 }
 
@@ -81,6 +82,7 @@ mod http_tests {
         Endpoints {
             api: server.base_url(),
             platform: server.base_url(),
+            web: server.base_url(),
         }
     }
 
@@ -318,6 +320,88 @@ mod http_tests {
         assert_eq!(value["claudeAiOauth"]["accessToken"], "at-2");
         assert_eq!(value["oauthAccount"]["emailAddress"], "you@example.com");
         assert!(value["oauthAccount"].get("accountUuid").is_none());
+    }
+
+    #[test]
+    fn exchange_posts_the_grant_and_builds_the_envelope() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                // The verifier and the redirect are what make this grant
+                // redeemable: the server checks both against the authorize
+                // request, so both must go out exactly as they were sent there.
+                .json_body_partial(format!(
+                    r#"{{"grant_type":"authorization_code","code":"ac-1","client_id":"{}","code_verifier":"ver-1","state":"st-1","redirect_uri":"http://localhost:54545/callback"}}"#,
+                    oauth::CLIENT_ID
+                ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(TOKEN_REFRESH);
+        });
+
+        let before = oauth::now_ms();
+        let login = oauth::exchange(
+            &endpoints_at(&server),
+            oauth::REDIRECT_PORT,
+            "ac-1",
+            "ver-1",
+            "st-1",
+        )
+        .unwrap();
+        mock.assert();
+
+        let value: Value = serde_json::from_str(&login.bytes).unwrap();
+        assert_eq!(value["claudeAiOauth"]["accessToken"], "at-2");
+        assert_eq!(value["claudeAiOauth"]["refreshToken"], "rt-2");
+        assert_eq!(value["claudeAiOauth"]["scopes"][0], "user:inference");
+        let expires_at = value["claudeAiOauth"]["expiresAt"].as_i64().unwrap();
+        assert!(expires_at >= before + 28800 * 1000);
+        // A fresh sign-in has no envelope to merge into, so the grant's own
+        // account is the only identity there is — and `add-oauth` refuses a
+        // credential it cannot name.
+        assert_eq!(value["oauthAccount"]["emailAddress"], "you@example.com");
+        assert_eq!(value["oauthAccount"]["accountUuid"], "acc-0001");
+    }
+
+    #[test]
+    fn exchange_without_a_scope_falls_back_to_the_ones_claude_code_asks_for() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            // No `scope` member: the grant is for what was asked for.
+            then.status(200).body(
+                r#"{"access_token":"at-2","refresh_token":"rt-2","expires_in":28800,"account":{"uuid":"acc-1","email_address":"you@example.com"}}"#,
+            );
+        });
+
+        let login =
+            oauth::exchange(&endpoints_at(&server), 54545, "ac-1", "ver-1", "st-1").unwrap();
+        let value: Value = serde_json::from_str(&login.bytes).unwrap();
+        assert_eq!(value["claudeAiOauth"]["scopes"][0], "user:profile");
+        assert_eq!(value["claudeAiOauth"]["scopes"][1], "user:inference");
+    }
+
+    #[test]
+    fn exchange_refuses_a_spent_code_in_words() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            then.status(400).body(r#"{"error":"invalid_grant"}"#);
+        });
+
+        let err = expect_err(oauth::exchange(
+            &endpoints_at(&server),
+            54545,
+            "ac-1",
+            "ver-1",
+            "st-1",
+        ));
+        // Not `TokenDead`: no slot has this credential yet, so there is nothing
+        // to quarantine — the user simply signs in again.
+        assert!(
+            matches!(&err, DriverError::Http(m) if m == "sign-in: the authorization code was rejected; sign in again"),
+        );
     }
 
     #[test]

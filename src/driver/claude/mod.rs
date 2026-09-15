@@ -21,8 +21,8 @@ use std::path::PathBuf;
 
 use crate::driver::claude::live::ClaudeDriver;
 use crate::driver::{
-    Caps, Driver, DriverError, Env, Identity, IgniteFailure, IgniteOutcome, Login, RunProfile,
-    Usage,
+    Caps, Driver, DriverError, Env, Identity, IgniteFailure, IgniteOutcome, Login, OauthStart,
+    RunProfile, Usage,
 };
 
 impl Driver for ClaudeDriver {
@@ -164,9 +164,31 @@ impl Driver for ClaudeDriver {
         Caps {
             ignite: true,
             add_token: true,
+            add_oauth: true,
             prefer: true,
             refresh: true,
             run: true,
         }
+    }
+
+    /// Claude Code's own sign-in, minus Claude Code: swapd is the OAuth client
+    /// here, so it holds the PKCE verifier and redeems the code itself. The
+    /// endpoints come from the driver's `Endpoints`, so the httpmock suite can
+    /// point the exchange at a local server.
+    fn oauth_begin(&self, env: &Env) -> Result<OauthStart, DriverError> {
+        let (verifier, challenge) = oauth::pkce();
+        let state = oauth::state();
+        let port = oauth::redirect_port(env);
+        let url = oauth::authorize_url(&self.endpoints, port, &challenge, &state);
+        let endpoints = self.endpoints.clone();
+        let redeem_state = state.clone();
+        Ok(OauthStart {
+            port,
+            url,
+            state,
+            redeem: Box::new(move |code| {
+                oauth::exchange(&endpoints, port, code, &verifier, &redeem_state)
+            }),
+        })
     }
 }

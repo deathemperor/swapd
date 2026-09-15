@@ -974,3 +974,57 @@ fn a_credential_naming_another_account_never_restamps_the_plan() {
         Some("Max 20x")
     );
 }
+
+/// `nextCandidate` is the slot `rotate` and the switcher land on, so a reported
+/// refusal has to take an account out of the rotation the moment it lands —
+/// before any measurement agrees with it.
+#[test]
+fn a_reported_limit_takes_a_slot_out_of_the_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _probe) = two_slots(dir.path());
+    // A third slot, so there is somewhere else for the rotation to go.
+    ctx.secrets
+        .set(
+            &slot_key("claude", 3),
+            &login_for("three@example.com", "rt-3"),
+        )
+        .unwrap();
+    slots::update(&ctx.home.slots_file(), |file| {
+        let provider = file.providers.entry("claude".to_string()).or_default();
+        provider.insert(3, slot_row("three@example.com"));
+        Ok((true, ()))
+    })
+    .unwrap();
+    let driver = both_usable()
+        .usable("rt-3")
+        .usage_answers(vec![vec![Window {
+            kind: crate::contract::WindowKind::FiveHour,
+            name: None,
+            pct: 10.0,
+            resets_at: None,
+            pace: None,
+            used: None,
+            limit: None,
+            currency: None,
+        }]]);
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert_eq!(view.next_candidate, Some(2));
+
+    ctx.store
+        .record_reported_limit(&slot_key("claude", 2), "two@example.com", "", None)
+        .unwrap();
+
+    let view = collect(&ctx, &driver, &CollectOpts::default()).unwrap();
+    assert_eq!(view.next_candidate, Some(3));
+    let two = view.accounts.iter().find(|a| a.slot == 2).unwrap();
+    assert!(two.reported_limit_at.is_some(), "{two:?}");
+    // The board still shows what was measured: the report overrides what
+    // swapd decides on, and says so in its own field, rather than inventing a
+    // reading the endpoint never returned.
+    assert!(
+        two.windows.iter().all(|w| w.pct < 90.0),
+        "{:?}",
+        two.windows
+    );
+}

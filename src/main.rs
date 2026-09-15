@@ -133,6 +133,15 @@ enum Command {
         #[arg(long)]
         unset: bool,
     },
+    /// Record that the provider refused this account, ahead of the usage
+    /// endpoint reporting it: every surface reads it as spent from now on.
+    LimitHit {
+        ident: String,
+        /// When the refusal lifts, RFC 3339. Defaults to the stored 5-hour
+        /// window's own reset.
+        #[arg(long)]
+        resets_at: Option<String>,
+    },
     /// Pin (`on`) or unpin (`off`) an account the rotation lands on first.
     Prefer { ident: String, state: String },
     /// Take an account out of the rotation, keeping its login.
@@ -434,6 +443,14 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             emit_list(
                 &cmd::icon::run(&ctx, driver.as_ref(), ident, icon.as_deref(), *unset)?,
+                cli.json,
+            )
+        }
+        Command::LimitHit { ident, resets_at } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::limit_hit::run(&ctx, driver.as_ref(), ident, resets_at.as_deref())?,
                 cli.json,
             )
         }

@@ -1206,6 +1206,19 @@ fn account_view(st: &SlotState, entry: &Entry, now: f64) -> AccountView {
             .backoff_until
             .filter(|until| now < *until)
             .and_then(format_ts),
+        // Only while the report is what decisions are reading: a lapsed one is
+        // a historical note, and showing it would explain a switch that the
+        // engine is no longer making.
+        reported_limit_at: entry
+            .reported_limit_held
+            .then_some(entry.reported_limit_at)
+            .flatten()
+            .and_then(format_ts),
+        reported_limit_resets_at: entry
+            .reported_limit_held
+            .then_some(entry.reported_limit_resets_at)
+            .flatten()
+            .and_then(format_ts),
     }
 }
 
@@ -1260,7 +1273,7 @@ pub fn rotatable_status(status: Option<UsageStatus>, disabled: bool) -> bool {
 }
 
 fn healthy(ctx: &Ctx, st: &SlotState, entry: &Entry) -> bool {
-    rotatable(st) && within_threshold(ctx, entry.decision_windows().unwrap_or(&[]))
+    rotatable(st) && within_threshold(ctx, entry.decision_windows().as_deref().unwrap_or(&[]))
 }
 
 /// The slots a rotation may land on, by the rule AND the inputs
@@ -1294,7 +1307,7 @@ pub fn healthy_slots(ctx: &Ctx, provider: &str, view: &ProviderView) -> Result<V
         .iter()
         .filter(|a| {
             let entry = entry_of(&entries, &slot_key(provider, a.slot));
-            within_threshold(ctx, entry.decision_windows().unwrap_or(&[]))
+            within_threshold(ctx, entry.decision_windows().as_deref().unwrap_or(&[]))
         })
         .map(|a| a.slot)
         .collect())
@@ -1325,7 +1338,7 @@ fn next_recovery(
         .filter(|st| rotatable(st))
         .filter_map(|st| {
             let windows = entry_of(entries, &st.key).decision_windows()?;
-            let at = limiting_reset_ts(windows, &ctx.settings.models)?;
+            let at = limiting_reset_ts(&windows, &ctx.settings.models)?;
             Some((at, st.slot))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))

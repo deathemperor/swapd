@@ -683,6 +683,58 @@ fn cooldown_blocks_proactive_switch() {
     assert_eq!(board.live_email(), "two@example.com");
 }
 
+/// The usage endpoint lags a real limit by up to a poll interval, so a thread
+/// can be refused while the stored measurement still reads healthy. A consumer
+/// that saw the refusal reports it (`swapd limit-hit`), and the tick acts on it
+/// without waiting for a measurement to agree — through the cooldown, which
+/// holds back the switches swapd chose to make, not the ones it is forced into.
+#[test]
+fn a_reported_limit_switches_at_once_and_through_the_cooldown() {
+    let board = Board::new();
+    // What the endpoint still says: half the window left on the active account.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+    board.set_state(&AutoState {
+        schema_version: 1,
+        cooldown_until: Some(T0 + 300.0),
+        ..AutoState::default()
+    });
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    assert_eq!(
+        board.last("no-switch").unwrap()["reason"],
+        "below-threshold"
+    );
+
+    // The 429 a running CLI saw, reported against the account it was refused on.
+    board
+        .ctx()
+        .store
+        .record_reported_limit(
+            &slot_key("claude", 1),
+            "one@example.com",
+            "",
+            Some(T0 + 1800.0),
+        )
+        .unwrap();
+
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    let switched = board.last("switch").unwrap();
+    assert_eq!(switched["trigger"], "at-limit");
+    assert_eq!(switched["to"]["number"], 2);
+    assert_eq!(board.live_email(), "two@example.com");
+
+    // The no-return bar is set from the reported reset, so the fetch that keeps
+    // reading slot 1 as healthy cannot flap the fleet straight back onto it.
+    let departure = board.state().left_at_limit.unwrap();
+    assert_eq!(departure.trigger, "at-limit");
+    assert_eq!(departure.recovery_at, Some(T0 + 1800.0));
+}
+
 #[test]
 fn dead_target_is_quarantined_and_skipped() {
     let board = Board::new();

@@ -14,6 +14,7 @@ pub mod hold;
 pub mod icon;
 pub mod ignite;
 pub mod import;
+pub mod limit_hit;
 pub mod list;
 pub mod notify;
 pub mod prefer;

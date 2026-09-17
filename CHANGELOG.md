@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-09-17
+
+- Automatic account switching recovers after a temporary macOS Keychain failure instead of reporting no candidates until the daemon restarts. Keychain retries back off for one minute, and credentials saved during the outage remain usable.
+
 ## 0.2.0 — 2026-09-15
 
 - `swapd limit-hit <ident> [--resets-at <rfc3339>]` records a refusal the consumer saw before the usage endpoint could: the mark overrides the stored 5-hour window at the one decision point `auto`, `list`'s `nextCandidate` and `rotate` read, is believed while the reported reset is ahead or until a later measurement lands, and a supervised daemon (`SWAPD_SUPERVISED=1`) re-evaluates on any stdin line instead of discarding it, so the switch happens now rather than a poll later (#38).

@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "macos")]
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::paths::Home;
@@ -48,7 +48,7 @@ impl Secrets for SecuritySecrets {
     fn set(&self, key: &str, value: &str) -> Result<()> {
         // `security -i add-generic-password ... -X` with an empty hex string is
         // rejected by `security` itself (exit 2), which would otherwise read as a
-        // backend error and permanently degrade `StickySecrets` to the file backend.
+        // backend error and temporarily degrade `StickySecrets` to the file backend.
         if value.is_empty() {
             return Err(SwapdError::new(ErrorCode::InvalidInput, "empty secret"));
         }
@@ -194,25 +194,36 @@ impl Secrets for MemorySecrets {
     }
 }
 
-/// Ported sticky per-process fallback: once `primary` errors with
-/// `ErrorCode::KeychainUnavailable` — a backend failure, not a caller mistake — every
-/// later call in this process goes straight to `fallback`. Any other error
-/// (`InvalidInput`, `Io`, …) propagates as-is without degrading: it means the call was
-/// wrong, not that the backend is unreachable. A `None` result from `primary` is not a
-/// failure either. `delete` fans out to both backends best-effort (so a plaintext copy
-/// the file backend may hold can't outlive the keychain item, and vice versa) but
-/// reports `primary`'s result while not degraded, `fallback`'s once degraded. A
-/// successful `set` on `primary` also clears any stale copy in `fallback` left by an
-/// earlier degraded run, ignoring that delete's result.
-///
-/// Only `platform_default` (macOS) ever wires this up — `primary` is always
-/// `SecuritySecrets` there — so it is `#[cfg(target_os = "macos")]` along
-/// with them, even though the fallback logic itself is backend-agnostic.
+/// Use the file store while Keychain is unavailable, then retry after a minute.
+/// Keep writes made during an outage authoritative until a caller next writes
+/// that key to Keychain: a fallback refresh token may have spent the primary's.
+/// Recovery reads must not copy tokens back outside the caller's refresh lock.
+/// The mutex serializes recovery with reads and writes from collector workers.
 #[cfg(target_os = "macos")]
 pub struct StickySecrets {
     primary: Box<dyn Secrets>,
     fallback: Box<dyn Secrets>,
-    degraded: AtomicBool,
+    state: Mutex<FallbackState>,
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct FallbackState {
+    retry_at: Option<Instant>,
+    // None keeps a fallback deletion authoritative for this process too.
+    pending: HashMap<String, Option<String>>,
+}
+
+#[cfg(target_os = "macos")]
+impl FallbackState {
+    fn can_retry(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    fn unavailable(&mut self, now: Instant) {
+        self.retry_at = Some(now + Duration::from_secs(60));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -221,7 +232,20 @@ impl StickySecrets {
         Self {
             primary,
             fallback,
-            degraded: AtomicBool::new(false),
+            state: Mutex::new(FallbackState::default()),
+            clock: Box::new(Instant::now),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        primary: Box<dyn Secrets>,
+        fallback: Box<dyn Secrets>,
+        clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        Self {
+            clock,
+            ..Self::new(primary, fallback)
         }
     }
 }
@@ -229,63 +253,64 @@ impl StickySecrets {
 #[cfg(target_os = "macos")]
 impl Secrets for StickySecrets {
     fn get(&self, key: &str) -> Result<Option<String>> {
-        if self.degraded.load(Ordering::SeqCst) {
-            return self.fallback.get(key);
-        }
-        match self.primary.get(key) {
-            Ok(v) => Ok(v),
-            Err(e) if e.code == ErrorCode::KeychainUnavailable => {
-                self.degraded.store(true, Ordering::SeqCst);
-                self.fallback.get(key)
+        let mut state = self.state.lock().unwrap();
+        if state.can_retry((self.clock)()) {
+            match self.primary.get(key) {
+                Ok(value) => {
+                    state.retry_at = None;
+                    return Ok(state.pending.get(key).cloned().unwrap_or(value));
+                }
+                Err(e) if e.code == ErrorCode::KeychainUnavailable => {
+                    state.unavailable((self.clock)())
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+        self.fallback.get(key)
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
-        if self.degraded.load(Ordering::SeqCst) {
-            return self.fallback.set(key, value);
-        }
-        match self.primary.set(key, value) {
-            Ok(()) => {
-                // Clear any plaintext copy an earlier degraded run may have left in
-                // the fallback, so it can't outlive the keychain item. Ignore the
-                // result: a missing copy isn't an error, and the write already
-                // succeeded via `primary`.
-                let _ = self.fallback.delete(key);
-                Ok(())
+        let mut state = self.state.lock().unwrap();
+        if state.can_retry((self.clock)()) {
+            match self.primary.set(key, value) {
+                Ok(()) => {
+                    state.retry_at = None;
+                    state.pending.remove(key);
+                    let _ = self.fallback.delete(key);
+                    return Ok(());
+                }
+                Err(e) if e.code == ErrorCode::KeychainUnavailable => {
+                    state.unavailable((self.clock)())
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) if e.code == ErrorCode::KeychainUnavailable => {
-                self.degraded.store(true, Ordering::SeqCst);
-                self.fallback.set(key, value)
-            }
-            Err(e) => Err(e),
         }
+        self.fallback.set(key, value)?;
+        state.pending.insert(key.to_owned(), Some(value.to_owned()));
+        Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        if self.degraded.load(Ordering::SeqCst) {
-            return self.fallback.delete(key);
-        }
-        match self.primary.delete(key) {
-            Ok(()) => {
-                // Best-effort fan-out: a copy in the fallback shouldn't outlive a
-                // keychain item `primary` just deleted, but its result never
-                // overrides `primary`'s — that's the one the caller asked about.
-                let _ = self.fallback.delete(key);
-                Ok(())
+        let mut state = self.state.lock().unwrap();
+        if state.can_retry((self.clock)()) {
+            match self.primary.delete(key) {
+                Ok(()) => {
+                    state.retry_at = None;
+                    state.pending.remove(key);
+                    let _ = self.fallback.delete(key);
+                    return Ok(());
+                }
+                Err(e) if e.code == ErrorCode::KeychainUnavailable => {
+                    state.unavailable((self.clock)())
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) if e.code == ErrorCode::KeychainUnavailable => {
-                // Same shape as get/set: degrade, then answer from the fallback.
-                self.degraded.store(true, Ordering::SeqCst);
-                self.fallback.delete(key)
-            }
-            Err(e) => Err(e),
         }
+        self.fallback.delete(key)?;
+        state.pending.insert(key.to_owned(), None);
+        Ok(())
     }
 
-    /// The primary's name, degraded or not: `doctor` reports what the store
-    /// is configured to prefer, not which one a past failure fell back to.
     fn name(&self) -> &'static str {
         self.primary.name()
     }
@@ -487,7 +512,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn sticky_stays_on_fallback_for_process_lifetime() {
+    fn sticky_waits_before_retrying_unavailable_primary() {
         let calls = Arc::new(Mutex::new(0u32));
         let sticky = StickySecrets::new(
             Box::new(CountingFailingSecrets(calls.clone())),
@@ -499,8 +524,144 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             1,
-            "primary should only be tried once"
+            "do not hammer Keychain while the retry interval is pending"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    struct RecoveringSecrets {
+        available: Arc<std::sync::atomic::AtomicBool>,
+        values: Arc<MemorySecrets>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RecoveringSecrets {
+        fn check(&self) -> Result<()> {
+            if self.available.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(SwapdError::new(ErrorCode::KeychainUnavailable, "offline"))
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Secrets for RecoveringSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.check()?;
+            self.values.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<()> {
+            self.check()?;
+            self.values.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.check()?;
+            self.values.delete(key)
+        }
+        fn name(&self) -> &'static str {
+            "recovering"
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn retry_now(store: &StickySecrets) {
+        store.state.lock().unwrap().retry_at = Some(Instant::now());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_recovers_alternate_accounts_without_losing_refreshed_tokens() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let available = Arc::new(AtomicBool::new(false));
+        let primary = Arc::new(MemorySecrets::new());
+        let fallback = Arc::new(MemorySecrets::new());
+        primary.set("claude:7", "spent-refresh-token").unwrap();
+        primary.set("claude:8", "available-account").unwrap();
+        let store = StickySecrets::new(
+            Box::new(RecoveringSecrets {
+                available: available.clone(),
+                values: primary.clone(),
+            }),
+            Box::new(SharedSecrets(fallback.clone())),
+        );
+
+        // The daemon adopts the active login while Keychain is unavailable.
+        store.set("claude:7", "refreshed-token").unwrap();
+        assert_eq!(store.get("claude:8").unwrap(), None);
+        available.store(true, Ordering::SeqCst);
+        // Recovery is bounded, not one Keychain probe per account per tick.
+        assert_eq!(store.get("claude:8").unwrap(), None);
+        retry_now(&store);
+        assert_eq!(
+            store.get("claude:8").unwrap().as_deref(),
+            Some("available-account")
+        );
+        assert_eq!(
+            store.get("claude:7").unwrap().as_deref(),
+            Some("refreshed-token")
+        );
+        // Reads do not replay an old write over another process's newer token.
+        primary.set("claude:7", "another-process-token").unwrap();
+        assert_eq!(
+            store.get("claude:7").unwrap().as_deref(),
+            Some("refreshed-token")
+        );
+        assert_eq!(
+            primary.get("claude:7").unwrap().as_deref(),
+            Some("another-process-token")
+        );
+        // The next explicit write returns this key to the recovered primary.
+        store.set("claude:7", "next-refresh").unwrap();
+        assert_eq!(
+            store.get("claude:7").unwrap().as_deref(),
+            Some("next-refresh")
+        );
+        assert_eq!(
+            primary.get("claude:7").unwrap().as_deref(),
+            Some("next-refresh")
+        );
+        assert_eq!(fallback.get("claude:7").unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_failed_retries_back_off_and_keep_pending_credentials() {
+        let calls = Arc::new(Mutex::new(0));
+        let store = StickySecrets::new(
+            Box::new(CountingFailingSecrets(calls.clone())),
+            Box::new(MemorySecrets::new()),
+        );
+        store.set("claude:7", "refreshed-token").unwrap();
+        retry_now(&store);
+        assert_eq!(
+            store.get("claude:7").unwrap().as_deref(),
+            Some("refreshed-token")
+        );
+        assert_eq!(store.get("claude:8").unwrap(), None);
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_recovery_does_not_resurrect_deleted_credentials() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let available = Arc::new(AtomicBool::new(false));
+        let primary = Arc::new(MemorySecrets::new());
+        primary.set("claude:7", "removed-account").unwrap();
+        let store = StickySecrets::new(
+            Box::new(RecoveringSecrets {
+                available: available.clone(),
+                values: primary.clone(),
+            }),
+            Box::new(MemorySecrets::new()),
+        );
+        store.delete("claude:7").unwrap();
+        available.store(true, Ordering::SeqCst);
+        retry_now(&store);
+        assert_eq!(store.get("claude:7").unwrap(), None);
+        store.delete("claude:7").unwrap();
+        assert_eq!(primary.get("claude:7").unwrap(), None);
     }
 
     #[test]

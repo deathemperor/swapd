@@ -577,6 +577,73 @@ fn a_quiet_tick_fetches_the_active_account_and_one_candidate() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_long_running_engine_recovers_candidates_after_a_keychain_failure() {
+    use crate::errors::SwapdError;
+    use crate::secrets::{MemorySecrets, StickySecrets};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct FailOnceSecrets {
+        fail: AtomicBool,
+        inner: Box<dyn Secrets>,
+    }
+    impl Secrets for FailOnceSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(SwapdError::new(ErrorCode::KeychainUnavailable, "temporary"));
+            }
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn name(&self) -> &'static str {
+            "fail-once"
+        }
+    }
+
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(100.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+    let clock = Arc::new(Mutex::new(Instant::now()));
+    let read_clock = clock.clone();
+    let mut ctx = board.ctx();
+    ctx.secrets = Box::new(StickySecrets::with_clock(
+        Box::new(FailOnceSecrets {
+            fail: AtomicBool::new(true),
+            inner: board.secrets(),
+        }),
+        Box::new(MemorySecrets::new()),
+        Box::new(move || *read_clock.lock().unwrap()),
+    ));
+    let sink = board.events.clone();
+    let mut engine = AutoEngine::new(
+        ctx,
+        &board.driver,
+        Box::new(move |emit| sink.borrow_mut().push(emit.to_json())),
+    );
+
+    engine.tick();
+    assert_eq!(board.last("no-switch").unwrap()["reason"], "no-candidates");
+    assert_eq!(board.live_email(), "one@example.com");
+
+    // Same daemon and stores: no restart and no manual rotation.
+    board.advance(61.0);
+    *clock.lock().unwrap() += Duration::from_secs(61);
+    assert_eq!(engine.tick(), TickOutcome::Switched);
+    assert_eq!(board.live_email(), "two@example.com");
+    assert_eq!(board.last("switch").unwrap()["to"]["number"], 2);
+}
+
 #[test]
 fn at_threshold_switches_to_ranked_candidate() {
     let board = Board::new();

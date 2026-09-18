@@ -322,6 +322,9 @@ pub fn run(ctx: &Ctx, provider: &dyn Driver, path: &str, force: bool) -> Result<
                             icon: entry.icon.clone(),
                             disabled: entry.disabled,
                             preferred: entry.preferred,
+                            // A local policy, like a quarantine: the machine
+                            // that runs the daemon decides whose clocks it keeps.
+                            auto_ignite: false,
                             added: entry.added.clone(),
                             fingerprint,
                         },

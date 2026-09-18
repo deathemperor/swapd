@@ -48,6 +48,11 @@ pub struct Slot {
     pub disabled: bool,
     #[serde(default)]
     pub preferred: bool,
+    /// The daemon keeps this account's 5h window running: whenever the
+    /// window has gone cold it ignites the account (`cmd::ignite`), so a
+    /// switch onto it lands on a clock that is already ticking.
+    #[serde(default)]
+    pub auto_ignite: bool,
     #[serde(default)]
     pub added: Option<String>, // RFC 3339
     #[serde(default)]
@@ -222,6 +227,7 @@ mod tests {
             icon: None,
             disabled: false,
             preferred: false,
+            auto_ignite: false,
             added: None,
             fingerprint: None,
         }

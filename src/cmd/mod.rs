@@ -6,6 +6,7 @@ pub mod add_oauth;
 pub mod add_token;
 pub mod alias;
 pub mod auto;
+pub mod auto_ignite;
 pub mod compact;
 pub mod config;
 pub mod export;

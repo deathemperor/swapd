@@ -1,5 +1,6 @@
 ---
 source: tests/list_refresh.rs
+assertion_line: 469
 expression: payload
 ---
 {
@@ -10,6 +11,7 @@ expression: payload
           "active": false,
           "ageSeconds": "[age]",
           "alias": "one",
+          "autoIgnite": false,
           "disabled": false,
           "email": "one@example.com",
           "fetchedAt": "[fetched-at]",
@@ -34,6 +36,7 @@ expression: payload
           "active": false,
           "ageSeconds": "[age]",
           "alias": "two",
+          "autoIgnite": false,
           "disabled": false,
           "email": "two@example.com",
           "fetchedAt": "[fetched-at]",

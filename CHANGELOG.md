@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `swapd auto-ignite <ident> on|off` keeps an account's 5h window running: on every tick the daemon ignites the first flagged account whose 5h window has gone cold (no 5h reset ahead on an account that reports a 7d window), skipping the active account, held, quarantined and API-key accounts, accounts it could not measure this tick, and accounts whose 7d or scoped window is 95% spent; each slot is then left alone for 20 minutes, since the endpoint shows the new window minutes after the run. The flag travels on `list --json` as `autoIgnite`, and the run is reported on a new `ignited` event (`ok`, `detail`), never as the tick's error. `import` does not carry the flag: it is a policy of the machine running the daemon.
+
 ## 0.2.2 — 2026-09-18
 
 - Weekly account gauges report ahead/behind pace starting one minute after reset instead of staying blank for the first day.

@@ -169,6 +169,7 @@ mod tests {
             active: false,
             disabled: false,
             preferred: false,
+            auto_ignite: false,
             usage_status: UsageStatus::Ok,
             fetched_at: None,
             age_seconds: None,

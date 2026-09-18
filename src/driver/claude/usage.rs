@@ -27,10 +27,10 @@ use crate::timefmt::format_ts;
 
 /// Weekly windows reset on a fixed 7-day cadence (`pace.py:26`).
 const WEEKLY_PERIOD_S: f64 = 7.0 * 86400.0;
-/// Suppress pace for this long after a reset (`pace.py:33`): elapsed is tiny
-/// right after one, so expected is near zero and almost any usage reads as "far
-/// ahead" — a false positive rather than a warning.
-const SUPPRESS_AFTER_RESET_S: f64 = 24.0 * 3600.0;
+/// Keep a positive span for rate projections just after reset. The ahead
+/// threshold already filters small overshoots; suppressing a whole day hides
+/// meaningful usage during the first day of every weekly window.
+const MIN_ELAPSED_S: f64 = 60.0;
 /// Minimum (actual - expected) gap before a window counts as ahead of pace
 /// (`pace.py:41`). Below it, "ahead" is within normal variance.
 const AHEAD_THRESHOLD_PCT: f64 = 15.0;
@@ -202,7 +202,7 @@ struct PaceResult {
     expected_pct: f64,
     actual_pct: f64,
     /// Time since this window's current cycle started. Always
-    /// `>= SUPPRESS_AFTER_RESET_S`, hence always positive — the guard below is
+    /// `>= MIN_ELAPSED_S`, hence always positive — the guard below is
     /// what lets the projections downstream be total.
     elapsed_s: f64,
     period_s: f64,
@@ -225,7 +225,7 @@ fn compute_pace(pct: f64, resets_at: Option<&str>, fetched_at: f64) -> Option<Pa
     } else {
         WEEKLY_PERIOD_S - remaining
     };
-    if elapsed < SUPPRESS_AFTER_RESET_S {
+    if elapsed < MIN_ELAPSED_S {
         return None;
     }
 
@@ -249,7 +249,7 @@ fn compute_pace(pct: f64, resets_at: Option<&str>, fetched_at: f64) -> Option<Pa
 /// report `false` while showing no ahead marker.
 ///
 /// cswap's `will_last_to_reset` has a "no measurable rate" (`None`) arm for
-/// `elapsed_s <= 0`; `compute_pace`'s 24-hour suppression makes that
+/// `elapsed_s <= 0`; `compute_pace`'s minimum elapsed span makes that
 /// unreachable here, which is why this returns a plain `bool` and the contract's
 /// field is not optional.
 fn pace_fields(pct: f64, resets_at: Option<&str>, fetched_at: f64) -> Option<Pace> {
@@ -301,15 +301,42 @@ mod tests {
     }
 
     #[test]
-    fn pace_is_suppressed_for_the_first_day_after_a_reset() {
-        // Half a day in: expected is near zero, so any usage would read as far
-        // ahead. Suppressed instead.
-        assert!(pace_fields(40.0, Some(RESET), fetched_at(0.5)).is_none());
-        // Just past the day mark it is computable.
-        assert!(pace_fields(40.0, Some(RESET), fetched_at(1.01)).is_some());
+    fn pace_starts_one_minute_after_reset() {
+        let start = fetched_at(0.0);
+        assert!(pace_fields(40.0, Some(RESET), start).is_none());
+        assert!(pace_fields(40.0, Some(RESET), start + 59.0).is_none());
+        assert!(pace_fields(40.0, Some(RESET), start + 60.0).is_some());
         // No resets_at, or an unparseable one, is never computable.
         assert!(pace_fields(40.0, None, fetched_at(3.0)).is_none());
         assert!(pace_fields(40.0, Some("not a date"), fetched_at(3.0)).is_none());
+    }
+
+    #[test]
+    fn first_day_windows_carry_ahead_and_behind_pace() {
+        let raw = serde_json::json!({
+            "five_hour": {"utilization": 50.0, "resets_at": RESET},
+            "seven_day": {"utilization": 33.0, "resets_at": RESET},
+            "limits": [{"scope": {"model": {"display_name": "Fable"}},
+                        "percent": 1.0, "resets_at": RESET}],
+        });
+        let windows = windows_at(&raw, fetched_at(0.5));
+        assert!(windows[0].pace.is_none());
+        let ahead = windows[1].pace.as_ref().unwrap();
+        assert_eq!(ahead.expected_pct, 7.1);
+        assert!(ahead.ahead);
+        assert!(!ahead.lasts_to_reset);
+        assert!(ahead.exhausts_at.is_some());
+        let behind = windows[2].pace.as_ref().unwrap();
+        assert_eq!(behind.expected_pct, 7.1);
+        assert!(!behind.ahead);
+        assert!(behind.lasts_to_reset);
+
+        // A small overshoot still does not trigger the ahead effect.
+        assert!(
+            !pace_fields(10.0, Some(RESET), fetched_at(0.5))
+                .unwrap()
+                .ahead
+        );
     }
 
     #[test]

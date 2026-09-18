@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 — 2026-09-18
+
+- Weekly account gauges report ahead/behind pace starting one minute after reset instead of staying blank for the first day.
+
 ## 0.2.1 — 2026-09-17
 
 - Automatic account switching recovers after a temporary macOS Keychain failure instead of reporting no candidates until the daemon restarts. Keychain retries back off for one minute, and credentials saved during the outage remain usable.

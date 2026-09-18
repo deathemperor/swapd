@@ -421,9 +421,22 @@ pub fn prepare(
     // condemned. Clearing the sentinel is not enough: `reserve` gates on the
     // raw strike count, so a row left struck would never be fetched again and
     // the account would freeze at its last-known-good measurement forever.
-    let healed: Vec<&String> = adopted
+    //
+    // The adopt is not the only way a slot comes to hold a generation the
+    // strikes never saw: `cmd::persist_login` rotates one without clearing
+    // them, on the grounds that they bind to the fingerprint they were earned
+    // by — true of the sentinel below, false of that gate. So the binding
+    // itself is what heals here, whatever wrote the credential. Without it the
+    // account froze for good: `stale` with nothing naming a reason, ignored by
+    // every pass, and a forced `refresh --slot` reporting the wrong gate (#42).
+    let healed: Vec<&String> = states
         .iter()
-        .filter(|key| entry_of(&entries, key).auth_dead_strikes > 0)
+        .filter(|st| {
+            let entry = entry_of(&entries, &st.key);
+            entry.auth_dead_strikes > 0
+                && (adopted.contains(&st.key) || !entry.token_dead(st.fingerprint.as_deref()))
+        })
+        .map(|st| &st.key)
         .collect();
     if !healed.is_empty() {
         for key in healed {

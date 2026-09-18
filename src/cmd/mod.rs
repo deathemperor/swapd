@@ -118,7 +118,10 @@ pub fn login_to_run(ctx: &Ctx, driver: &dyn Driver, slot: u32) -> Result<Login> 
 /// The bytes lead because a row pointing at a credential that never landed is a
 /// slot that cannot authenticate, while a stale fingerprint only mis-labels one.
 /// No `clear_dead`: a quarantine is recorded against the fingerprint it was
-/// earned by, so a new generation lifts it by itself (`Entry::token_dead`).
+/// earned by, and `collect::prepare` lifts the strikes a slot's current
+/// credential does not answer for. Do not read that as `Entry::token_dead`
+/// lifting it on its own — the fetch gate reads the strike COUNT, so until
+/// `prepare` clears the row nothing fetches it (#42).
 pub fn persist_login(ctx: &Ctx, provider: &str, slot: u32, login: &Login) -> Result<()> {
     ctx.secrets.set(&slot_key(provider, slot), &login.bytes)?;
     record_slot_fingerprint(ctx, provider, slot, Some(&login.fingerprint()))

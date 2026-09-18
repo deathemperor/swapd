@@ -759,6 +759,40 @@ fn a_struck_slot_is_fetched_again_after_a_new_credential() {
     assert_eq!(usage["rows"]["claude:2"]["authDeadStrikes"], 0);
 }
 
+/// The strikes bind to the credential generation they condemned, and only one
+/// route used to act on that: an adopt of the live login. A slot whose stored
+/// credential moved on some other way — a rotation an earlier pass persisted, a
+/// `run`'s pre-flight refresh; `cmd::persist_login` does not clear strikes —
+/// kept a quarantine that described a generation it no longer held. The
+/// sentinel honoured the binding and read nothing, the fetch gate read the
+/// strike count and refused every pass, and the account froze at its last
+/// measurement: `stale` with no reason on it, for hours (#42).
+#[test]
+fn a_struck_slot_whose_credential_moved_on_is_fetched_again() {
+    let fx = Fixture::new();
+    // Nothing is the live login here, so no adopt can heal this row: slot 2 is
+    // struck against a generation the slot does not hold (its login is `rt-2`).
+    let mut row = UsageRow::new(2, "two@example.com", "org-2", 3600.0, 42.0);
+    row.strikes = 1;
+    row.dead_fp = Some(fingerprint_of("rt-2-spent"));
+    fx.write_usage_row(row);
+    let one = fx.usage_mock(1, 200, usage_body(12.0, 34.0));
+    let two = fx.usage_mock(2, 200, usage_body(56.0, 7.0));
+
+    let listed = fx.list();
+    assert_eq!(account(&listed, 2)["usageStatus"], "ok");
+    assert_eq!(account(&listed, 2)["windows"][0]["pct"], 56.0);
+    two.assert_hits(1);
+    one.assert_hits(1);
+
+    // Lifted in the table, so the row plans its next poll like any other.
+    let usage: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.home.path().join("usage.json")).unwrap())
+            .unwrap();
+    assert_eq!(usage["rows"]["claude:2"]["authDeadStrikes"], 0);
+    assert!(usage["rows"]["claude:2"]["deadFingerprint"].is_null());
+}
+
 #[test]
 fn a_gated_active_slot_with_an_expired_login_reports_token_expired() {
     let fx = Fixture::new();

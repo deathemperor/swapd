@@ -63,6 +63,9 @@ pub struct AccountView {
     pub active: bool,
     pub disabled: bool,
     pub preferred: bool,
+    /// The daemon ignites this account whenever its 5h window is cold
+    /// (`swapd auto-ignite <ident> on|off`).
+    pub auto_ignite: bool,
     pub usage_status: UsageStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<String>,
@@ -183,6 +186,7 @@ mod tests {
                     active: false,
                     disabled: false,
                     preferred: false,
+                    auto_ignite: false,
                     usage_status: UsageStatus::Ok,
                     fetched_at: Some("2026-09-09T01:11:03Z".to_string()),
                     age_seconds: Some(7.6),

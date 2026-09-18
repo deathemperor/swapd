@@ -232,6 +232,7 @@ pub fn compose(identity: &Identity, prior: Option<&Slot>, alias: Option<&str>, n
         icon: prior.and_then(|p| p.icon.clone()),
         disabled: prior.is_some_and(|p| p.disabled),
         preferred: prior.is_some_and(|p| p.preferred),
+        auto_ignite: prior.is_some_and(|p| p.auto_ignite),
         added: prior
             .and_then(|p| p.added.clone())
             .or_else(|| crate::timefmt::format_ts(now)),

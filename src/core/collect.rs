@@ -1190,6 +1190,7 @@ fn account_view(st: &SlotState, entry: &Entry, now: f64) -> AccountView {
         active: st.active,
         disabled: st.meta.disabled,
         preferred: st.meta.preferred,
+        auto_ignite: st.meta.auto_ignite,
         usage_status: status,
         fetched_at: current
             .then(|| entry.fetched_at.and_then(format_ts))

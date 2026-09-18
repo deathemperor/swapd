@@ -113,6 +113,53 @@ pub fn run(
             format!("{id} cannot ignite an account"),
         ));
     }
+    let rotated = ignite_slot(ctx, driver, slot)?;
+
+    // The point of the whole verb: the window the run just opened is only
+    // visible in a fetch made after it, so these ignore the serve TTL and the
+    // slot's poll plan. Repeated while the endpoint still reads the account as
+    // cold: it lags the request, and one fetch straight after the run reports
+    // the board from before it.
+    let forced = || {
+        collect(
+            ctx,
+            driver,
+            &CollectOpts {
+                force_slots: vec![slot],
+                ..CollectOpts::default()
+            },
+        )
+    };
+    let mut view = forced()?;
+    let mut seen = window_seen(&view, slot, ctx.now());
+    for secs in WINDOW_WAITS_S {
+        if seen != Some(false) {
+            break;
+        }
+        wait(Duration::from_secs(secs));
+        view = forced()?;
+        seen = window_seen(&view, slot, ctx.now());
+    }
+    Ok(IgniteOutput {
+        list: ListPayload {
+            schema_version: output::SCHEMA_VERSION,
+            providers: vec![view],
+        },
+        ignited: Ignited {
+            slot,
+            at: format_ts(ctx.now()).unwrap_or_default(),
+            rotated,
+            window_seen: seen,
+        },
+    })
+}
+
+/// The ignite itself, without the wait for the window to show: one run as
+/// the slot, its rotation persisted whatever the run did. Answers whether the
+/// run rotated the credential. The daemon's auto-ignite calls this alone and
+/// lets its own later ticks see the window.
+pub fn ignite_slot(ctx: &Ctx, driver: &dyn Driver, slot: u32) -> Result<bool> {
+    let id = driver.id();
     // Asked before the profile is seeded and — more importantly — before the
     // login is refreshed: a refresh token is single-use, so spending one for a
     // run that cannot happen costs the account a generation for nothing.
@@ -166,44 +213,7 @@ pub fn run(
             format!("igniter exited {}", outcome.exit_code),
         ));
     }
-
-    // The point of the whole verb: the window the run just opened is only
-    // visible in a fetch made after it, so these ignore the serve TTL and the
-    // slot's poll plan. Repeated while the endpoint still reads the account as
-    // cold: it lags the request, and one fetch straight after the run reports
-    // the board from before it.
-    let forced = || {
-        collect(
-            ctx,
-            driver,
-            &CollectOpts {
-                force_slots: vec![slot],
-                ..CollectOpts::default()
-            },
-        )
-    };
-    let mut view = forced()?;
-    let mut seen = window_seen(&view, slot, ctx.now());
-    for secs in WINDOW_WAITS_S {
-        if seen != Some(false) {
-            break;
-        }
-        wait(Duration::from_secs(secs));
-        view = forced()?;
-        seen = window_seen(&view, slot, ctx.now());
-    }
-    Ok(IgniteOutput {
-        list: ListPayload {
-            schema_version: output::SCHEMA_VERSION,
-            providers: vec![view],
-        },
-        ignited: Ignited {
-            slot,
-            at: format_ts(ctx.now()).unwrap_or_default(),
-            rotated,
-            window_seen: seen,
-        },
-    })
+    Ok(rotated)
 }
 
 pub fn print_human(out: &IgniteOutput) {

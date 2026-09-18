@@ -144,6 +144,9 @@ enum Command {
     },
     /// Pin (`on`) or unpin (`off`) an account the rotation lands on first.
     Prefer { ident: String, state: String },
+    /// Keep (`on`) or stop keeping (`off`) an account's 5h window running:
+    /// the daemon ignites it whenever the window has gone cold.
+    AutoIgnite { ident: String, state: String },
     /// Take an account out of the rotation, keeping its login.
     Hold { ident: String },
     /// Put a held account back into the rotation.
@@ -459,6 +462,14 @@ fn run(cli: &Cli) -> Result<()> {
             let ctx = ctx::Ctx::from_env()?;
             emit_list(
                 &cmd::prefer::run(&ctx, driver.as_ref(), ident, state)?,
+                cli.json,
+            )
+        }
+        Command::AutoIgnite { ident, state } => {
+            let driver = single_driver(cli)?;
+            let ctx = ctx::Ctx::from_env()?;
+            emit_list(
+                &cmd::auto_ignite::run(&ctx, driver.as_ref(), ident, state)?,
                 cli.json,
             )
         }

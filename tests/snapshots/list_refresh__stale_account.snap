@@ -1,10 +1,12 @@
 ---
 source: tests/list_refresh.rs
+assertion_line: 490
 expression: "account(&payload, 1)"
 ---
 {
   "active": false,
   "alias": "one",
+  "autoIgnite": false,
   "backoffUntil": "[backoff-until]",
   "disabled": false,
   "email": "one@example.com",

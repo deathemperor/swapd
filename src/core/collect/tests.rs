@@ -428,6 +428,7 @@ fn slot_row(email: &str) -> Slot {
         icon: None,
         disabled: false,
         preferred: false,
+        auto_ignite: false,
         added: None,
         fingerprint: None,
     }

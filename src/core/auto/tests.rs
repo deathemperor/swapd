@@ -47,6 +47,11 @@ struct FakeDriver {
     /// How many times the collector's preamble read the live login. One per
     /// `prepare`, which is what says how many preambles a tick ran.
     live_reads: Mutex<usize>,
+    /// Every account `ignite()` ran as, in order.
+    ignites: Mutex<Vec<String>>,
+    /// email → the windows `usage()` reports for it once it has been ignited
+    /// (the window the run opened). An email not listed stays as it was.
+    warm: Mutex<BTreeMap<String, Vec<Window>>>,
 }
 
 impl FakeDriver {
@@ -58,6 +63,8 @@ impl FakeDriver {
             writes: Mutex::new(Vec::new()),
             usage_calls: Mutex::new(Vec::new()),
             live_reads: Mutex::new(0),
+            ignites: Mutex::new(Vec::new()),
+            warm: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -80,6 +87,13 @@ impl FakeDriver {
     }
 
     /// The accounts fetched since the last `take_usage_calls`.
+    fn take_ignites(&self) -> Vec<String> {
+        std::mem::take(&mut *self.ignites.lock().unwrap())
+    }
+    /// What `usage()` answers for `email` after it has been ignited.
+    fn warm_on_ignite(&self, email: &str, windows: Vec<Window>) {
+        self.warm.lock().unwrap().insert(email.to_string(), windows);
+    }
     fn take_usage_calls(&self) -> Vec<String> {
         std::mem::take(&mut *self.usage_calls.lock().unwrap())
     }
@@ -108,7 +122,7 @@ impl Driver for FakeDriver {
         "claude"
     }
     fn installed(&self, _env: &Env) -> Option<std::path::PathBuf> {
-        None
+        Some(std::path::PathBuf::from("/fake/claude"))
     }
     fn read_live(&self, _env: &Env) -> std::result::Result<Login, DriverError> {
         match self.live.lock().unwrap().clone() {
@@ -178,9 +192,17 @@ impl Driver for FakeDriver {
         &self,
         _env: &Env,
         _slot: u32,
-        _login: &Login,
+        login: &Login,
     ) -> std::result::Result<IgniteOutcome, crate::driver::IgniteFailure> {
-        Err(DriverError::Unsupported("ignite").into())
+        let email = Self::email_of(login);
+        self.ignites.lock().unwrap().push(email.clone());
+        if let Some(windows) = self.warm.lock().unwrap().get(&email) {
+            self.usage.lock().unwrap().insert(email, windows.clone());
+        }
+        Ok(IgniteOutcome {
+            exit_code: 0,
+            rotated: None,
+        })
     }
     fn run_profile(
         &self,
@@ -334,6 +356,7 @@ impl Board {
                         icon: None,
                         disabled: false,
                         preferred: false,
+                        auto_ignite: false,
                         added: None,
                         fingerprint: None,
                     },
@@ -451,6 +474,27 @@ impl Board {
     fn set_state(&self, state: &AutoState) {
         crate::core::store::write_json_atomic(&self.home().auto_state_file(), state).unwrap();
     }
+
+    /// Flag a slot for auto-ignite, the way `swapd auto-ignite <n> on` does.
+    fn flag_auto_ignite(&self, slot: u32) {
+        slots::update(&self.home().slots_file(), |file| {
+            file.providers
+                .get_mut("claude")
+                .unwrap()
+                .slots
+                .get_mut(&slot)
+                .unwrap()
+                .auto_ignite = true;
+            Ok((true, ()))
+        })
+        .unwrap();
+    }
+}
+
+/// A 7d window at `pct` and no 5h window: an account nothing has used since
+/// its last 5h window closed.
+fn cold(pct: f64, now: f64) -> Vec<Window> {
+    vec![window(WindowKind::SevenDay, pct, now + 86_400.0)]
 }
 
 fn login(email: &str, refresh: &str, expires_at: f64) -> String {
@@ -1063,6 +1107,7 @@ fn an_entry_without_a_fingerprint_is_released_not_moved() {
                 icon: None,
                 disabled: false,
                 preferred: false,
+                auto_ignite: false,
                 added: None,
                 fingerprint: None,
             },
@@ -1703,6 +1748,7 @@ fn the_account_just_left_is_not_taken_straight_back() {
             headroom: Some(23.0),
             recovery_at: Some(T0 + 3600.0),
         }),
+        ignited_at: BTreeMap::new(),
     });
 
     assert_eq!(board.tick(), TickOutcome::Switched);
@@ -1806,4 +1852,192 @@ fn a_switch_tick_re_prepares() {
         "the two-phase commit's re-measure reads the live login again"
     );
     assert_eq!(board.live_email(), "two@example.com");
+}
+
+// -- auto-ignite ---------------------------------------------------------------
+
+#[test]
+fn a_flagged_cold_account_is_ignited_once() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board.driver.set_usage("two@example.com", cold(10.0, T0));
+    board
+        .driver
+        .warm_on_ignite("two@example.com", usage_at(1.0, T0, 18_000.0));
+    board.flag_auto_ignite(2);
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+
+    assert_eq!(board.driver.take_ignites(), vec!["two@example.com"]);
+    let ignited = board.last("ignited").unwrap();
+    assert_eq!(ignited["slot"], 2);
+    assert_eq!(ignited["email"], "two@example.com");
+    assert_eq!(ignited["ok"], true);
+    assert_eq!(board.state().ignited_at.get("2").copied(), Some(T0));
+    // The switch decision is untouched by it.
+    assert_eq!(
+        board.last("no-switch").unwrap()["reason"],
+        "below-threshold"
+    );
+
+    // The endpoint has not shown the window yet: the hold-off, not a re-run.
+    board.advance(300.0);
+    board.tick();
+    assert!(board.driver.take_ignites().is_empty());
+
+    // Past the hold-off with the window now visible, still nothing to do.
+    board.advance(20.0 * 60.0);
+    board.tick();
+    assert!(board.driver.take_ignites().is_empty());
+}
+
+#[test]
+fn a_re_ignite_needs_a_cold_reading_fetched_after_the_last_one() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board.driver.set_usage("two@example.com", cold(10.0, T0));
+    board.flag_auto_ignite(2);
+
+    board.tick();
+    assert_eq!(board.driver.take_ignites(), vec!["two@example.com"]);
+
+    // The endpoint is down: the only reading of slot 2 is the one from before
+    // the run. Past the hold-off it must not qualify the slot again.
+    board.driver.fail_usage("two@example.com");
+    board.advance(21.0 * 60.0);
+    board.tick();
+    assert!(board.driver.take_ignites().is_empty());
+
+    // A fresh reading that still shows it cold (the window closed again).
+    board
+        .driver
+        .set_usage("two@example.com", cold(10.0, board.now()));
+    board.advance(60.0);
+    let mut ignites = Vec::new();
+    for _ in 0..3 {
+        board.tick();
+        ignites.extend(board.driver.take_ignites());
+        board.advance(60.0);
+    }
+    assert_eq!(ignites, vec!["two@example.com"]);
+}
+
+#[test]
+fn an_unflagged_cold_account_is_left_cold() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board.driver.set_usage("two@example.com", cold(10.0, T0));
+
+    board.tick();
+
+    assert!(board.driver.take_ignites().is_empty());
+    assert_eq!(board.count("ignited"), 0);
+    assert!(board.state().ignited_at.is_empty());
+}
+
+#[test]
+fn a_cold_5h_window_with_a_past_reset_counts_as_cold() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board.driver.set_usage(
+        "two@example.com",
+        vec![
+            window(WindowKind::FiveHour, 0.0, T0 - 60.0),
+            window(WindowKind::SevenDay, 10.0, T0 + 86_400.0),
+        ],
+    );
+    board.flag_auto_ignite(2);
+
+    board.tick();
+
+    assert_eq!(board.driver.take_ignites(), vec!["two@example.com"]);
+}
+
+#[test]
+fn the_active_account_and_a_spent_or_held_one_are_not_ignited() {
+    let board = Board::new();
+    board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+    board.seed(4, "four@example.com", "rt-4", T0 + 86_400.0);
+    // Active, and flagged: never ignited, whatever its window reads.
+    board.driver.set_usage("one@example.com", cold(50.0, T0));
+    board.flag_auto_ignite(1);
+    // Weekly reserve at the floor.
+    board.driver.set_usage("two@example.com", cold(95.0, T0));
+    board.flag_auto_ignite(2);
+    // Held out of the rotation.
+    board.driver.set_usage("three@example.com", cold(10.0, T0));
+    board.flag_auto_ignite(3);
+    crate::cmd::hold::run(&board.ctx(), &board.driver, "3", true).unwrap();
+    // Unmeasurable this tick.
+    board.driver.fail_usage("four@example.com");
+    board.flag_auto_ignite(4);
+
+    for _ in 0..4 {
+        board.tick();
+        board.advance(60.0);
+    }
+
+    assert!(board.driver.take_ignites().is_empty());
+    assert_eq!(board.count("ignited"), 0);
+}
+
+#[test]
+fn two_flagged_cold_accounts_are_ignited_one_per_tick() {
+    let board = Board::new();
+    board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board.driver.set_usage("two@example.com", cold(10.0, T0));
+    board.driver.set_usage("three@example.com", cold(10.0, T0));
+    board.flag_auto_ignite(2);
+    board.flag_auto_ignite(3);
+
+    let mut ignites = Vec::new();
+    for _ in 0..4 {
+        board.tick();
+        ignites.extend(board.driver.take_ignites());
+        board.advance(60.0);
+    }
+
+    ignites.sort();
+    assert_eq!(ignites, vec!["three@example.com", "two@example.com"]);
+    assert_eq!(board.count("ignited"), 2);
+}
+
+#[test]
+fn a_failed_ignite_is_reported_and_not_retried_every_tick() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+    board.driver.set_usage("two@example.com", cold(10.0, T0));
+    board.flag_auto_ignite(2);
+    // A login the run cannot refresh: the ignite fails before the run.
+    board.driver.dead.lock().unwrap().push("rt-2".to_string());
+    board
+        .secrets()
+        .set(
+            &slot_key("claude", 2),
+            &login("two@example.com", "rt-2", T0 - 1.0),
+        )
+        .unwrap();
+
+    assert_eq!(board.tick(), TickOutcome::NoAction);
+    let ignited = board.last("ignited").unwrap();
+    assert_eq!(ignited["ok"], false);
+    assert_ne!(ignited["detail"], "");
+    assert_eq!(board.count("error"), 0);
+
+    board.advance(60.0);
+    board.tick();
+    assert_eq!(board.count("ignited"), 1);
 }

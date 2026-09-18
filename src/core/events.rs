@@ -74,6 +74,14 @@ pub enum Event {
     AllExhausted {
         earliest_reset_at: Option<String>,
     },
+    /// The daemon ignited (or failed to ignite) a flagged account whose 5h
+    /// window had gone cold. `detail` is the failure's own message; empty on
+    /// success.
+    Ignited {
+        account: SlotRef,
+        ok: bool,
+        detail: String,
+    },
     Sleep {
         seconds: f64,
         until: String,
@@ -107,6 +115,7 @@ impl Event {
             Event::Quarantined { .. } => "account-quarantined",
             Event::Unquarantined { .. } => "account-unquarantined",
             Event::AllExhausted { .. } => "all-exhausted",
+            Event::Ignited { .. } => "ignited",
             Event::Sleep { .. } => "sleep",
             Event::Error { .. } => "error",
             Event::EngineRefused { .. } => "engine-refused",
@@ -168,6 +177,17 @@ impl Event {
             }
             Event::AllExhausted { earliest_reset_at } => {
                 out.insert("earliestResetAt".into(), json!(earliest_reset_at));
+            }
+            Event::Ignited {
+                account,
+                ok,
+                detail,
+            } => {
+                out.insert("number".into(), json!(account.slot));
+                out.insert("slot".into(), json!(account.slot));
+                out.insert("email".into(), json!(account.email));
+                out.insert("ok".into(), json!(ok));
+                out.insert("detail".into(), json!(detail));
             }
             Event::Sleep { seconds, until } => {
                 out.insert("seconds".into(), json!((seconds * 10.0).round() / 10.0));
@@ -262,6 +282,17 @@ impl Emit {
                 Some(at) => format!("all accounts exhausted; earliest reset {at}"),
                 None => "all accounts exhausted; no reset time known".to_string(),
             },
+            Event::Ignited {
+                account,
+                ok,
+                detail,
+            } => {
+                if *ok {
+                    format!("ignited {}: its 5h window starts now", label(account))
+                } else {
+                    format!("could not ignite {}: {detail}", label(account))
+                }
+            }
             Event::Sleep { seconds, until } => {
                 format!("sleeping {:.0}m (until {until})", seconds / 60.0)
             }

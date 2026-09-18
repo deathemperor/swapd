@@ -26,6 +26,7 @@ expression: payload
           "active": false,
           "disabled": false,
           "preferred": false,
+          "autoIgnite": false,
           "usageStatus": "ok",
           "fetchedAt": "2026-09-09T01:11:03Z",
           "ageSeconds": 7.6,

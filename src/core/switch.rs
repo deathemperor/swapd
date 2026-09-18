@@ -715,6 +715,7 @@ mod tests {
             icon: None,
             disabled: false,
             preferred: false,
+            auto_ignite: false,
             added: None,
             fingerprint: None,
         }

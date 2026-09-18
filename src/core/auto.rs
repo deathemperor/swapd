@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{AccountView, ProviderView, UsageStatus, Window};
+use crate::contract::{AccountView, ProviderView, UsageStatus, Window, WindowKind};
 use crate::core::collect::{self, collect, CollectOpts, FetchOpts, Prepared};
 use crate::core::events::{pct_label, window_label, Emit, Event};
 use crate::core::gating::relevant;
@@ -55,6 +55,15 @@ use crate::timefmt::format_ts;
 
 /// `auto-state.json`'s layout.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
+
+/// How long after an auto-ignite the same slot is left alone. The window an
+/// ignite opened was first visible 6.5-10 min after the run (measured, see
+/// `cmd::ignite`); this covers that lag with room.
+const IGNITE_HOLDOFF_S: f64 = 20.0 * 60.0;
+
+/// An account whose weekly reserve (7d and every scoped window) is this spent
+/// is not warmed up: the fleet's last headroom is not for an idle clock.
+const IGNITE_RESERVE_FLOOR_PCT: f64 = 95.0;
 
 /// How long a state-file read-modify-write waits for its lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -118,6 +127,10 @@ pub struct AutoState {
     /// The last switch this engine made, as the account it left looked at the
     /// moment it left. The no-return bar's whole evidence base.
     pub left_at_limit: Option<Departure>,
+    /// Slot (as a string) → epoch of the daemon's last auto-ignite of it. The
+    /// usage endpoint shows a window minutes after the run that opened it, so
+    /// without this a flagged account would be ignited every tick until then.
+    pub ignited_at: BTreeMap<String, f64>,
 }
 
 /// Re-key the quarantine entries of slots a renumber moved (`core::compact`),
@@ -191,6 +204,8 @@ struct Snapshot {
     /// Slot → whether its measurement is fresh enough to act on right now
     /// (the consume-first commit gate).
     fresh: BTreeMap<u32, bool>,
+    /// Slot → when its trusted measurement was fetched.
+    fetched_at: BTreeMap<u32, Option<f64>>,
 }
 
 impl Snapshot {
@@ -206,6 +221,10 @@ impl Snapshot {
 
     fn windows(&self, slot: u32) -> &[Window] {
         self.windows.get(&slot).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn fetched_at(&self, slot: u32) -> Option<f64> {
+        self.fetched_at.get(&slot).copied().flatten()
     }
 }
 
@@ -350,6 +369,10 @@ impl<'a> AutoEngine<'a> {
         if !self.model_check_done {
             self.check_model_names(&view, &snap, &quarantined);
         }
+
+        // Before the master switch and before `classify`: an ignite is not a
+        // switch, and the below-threshold tick returns early from `classify`.
+        self.auto_ignite(&view, &snap, current, &quarantined)?;
 
         // The master switch, checked AFTER the poll event so usage keeps
         // flowing to every display while switching is off.
@@ -773,6 +796,65 @@ impl<'a> AutoEngine<'a> {
         })
     }
 
+    /// Keep flagged accounts' 5h windows running (`swapd auto-ignite`): the
+    /// first flagged, measured, healthy candidate whose window is cold is
+    /// ignited, at most one per tick. Afterwards the slot is left alone for
+    /// `IGNITE_HOLDOFF_S` and until a measurement fetched AFTER the ignite
+    /// still reads it cold — the reading that qualified it is the one from
+    /// before the run, and would qualify it again for as long as it is
+    /// trusted. A failure is reported on the `ignited` event, not as the
+    /// tick's error: the switch decision that follows is unaffected by it.
+    fn auto_ignite(
+        &mut self,
+        view: &ProviderView,
+        snap: &Snapshot,
+        current: u32,
+        quarantined: &BTreeSet<u32>,
+    ) -> Result<()> {
+        let now = self.ctx.now();
+        let state = self.read_state();
+        let Some(slot) = view
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.auto_ignite
+                    && a.slot != current
+                    && !quarantined.contains(&a.slot)
+                    && switchable(a)
+                    && !is_api_key(a)
+                    // Measured this tick: a login the collector could not use
+                    // is not spent a run on, and a run would refresh it.
+                    && snap.headroom(a.slot).is_some()
+                    && five_hour_cold(snap.windows(a.slot), now)
+                    && weekly_reserve_pct(snap.windows(a.slot)) < IGNITE_RESERVE_FLOOR_PCT
+                    && !state
+                        .ignited_at
+                        .get(&a.slot.to_string())
+                        .is_some_and(|at| {
+                            now - at < IGNITE_HOLDOFF_S
+                                || !snap.fetched_at(a.slot).is_some_and(|f| f > *at)
+                        })
+            })
+            .map(|a| a.slot)
+            .next()
+        else {
+            return Ok(());
+        };
+        // Recorded before the run: a run that failed still spent the endpoint's
+        // patience, and a failure retried every tick is the loop this guards.
+        self.mutate_state(|state| {
+            state.ignited_at.insert(slot.to_string(), now);
+        })?;
+        let account = account_ref(view, slot);
+        let result = crate::cmd::ignite::ignite_slot(&self.ctx, self.driver, slot);
+        self.emit(Event::Ignited {
+            account,
+            ok: result.is_ok(),
+            detail: result.err().map(|e| e.message).unwrap_or_default(),
+        });
+        Ok(())
+    }
+
     /// Nothing qualified: which of the five ways that can happen this is
     /// (`autoswitch.py:1441-1522`).
     #[allow(clippy::too_many_arguments)]
@@ -1070,6 +1152,7 @@ impl<'a> AutoEngine<'a> {
             windows: BTreeMap::new(),
             fetch_errors: BTreeMap::new(),
             fresh: BTreeMap::new(),
+            fetched_at: BTreeMap::new(),
         };
         for account in &view.accounts {
             let entry = entries.get(&self.key_of(account.slot));
@@ -1089,6 +1172,8 @@ impl<'a> AutoEngine<'a> {
                 .insert(account.slot, entry.is_some_and(|entry| entry.fresh(now)));
             snap.headroom.insert(account.slot, headroom);
             snap.windows.insert(account.slot, windows);
+            snap.fetched_at
+                .insert(account.slot, entry.and_then(|e| e.fetched_at));
         }
         snap
     }
@@ -1988,6 +2073,29 @@ fn parked_exhausted(entry: Option<&Entry>, headroom: Option<f64>, now: f64) -> b
 /// is out by their choice, and one whose credential cannot be used is out until
 /// someone logs in again. swapd adds the two statuses cswap has no equivalent
 /// for — a dead lineage and a credential the driver refuses.
+/// Whether the account's 5h clock is not running: no 5h window resetting
+/// ahead of now, on an account that reports a 7d window (the shape whose 5h
+/// window opens on first use; a provider without one has nothing to ignite).
+fn five_hour_cold(windows: &[Window], now: f64) -> bool {
+    let has_weekly = windows
+        .iter()
+        .any(|w| matches!(w.kind, WindowKind::SevenDay));
+    let warm = windows.iter().any(|w| {
+        matches!(w.kind, WindowKind::FiveHour)
+            && parse_reset_ts(w.resets_at.as_deref()).is_some_and(|reset| reset > now)
+    });
+    has_weekly && !warm
+}
+
+/// The worst of the account's 7d and scoped windows, in pct used.
+fn weekly_reserve_pct(windows: &[Window]) -> f64 {
+    windows
+        .iter()
+        .filter(|w| matches!(w.kind, WindowKind::SevenDay | WindowKind::Scoped))
+        .map(|w| w.pct)
+        .fold(0.0, f64::max)
+}
+
 fn switchable(account: &AccountView) -> bool {
     !account.disabled
         && !matches!(

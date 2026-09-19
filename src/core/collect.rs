@@ -34,6 +34,11 @@ use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::secrets::slot_key;
 use crate::timefmt::format_ts;
 
+/// Most secret reads in flight at once. Each is a `/usr/bin/security` spawn on
+/// macOS (0.05–0.4 s measured), and a 13-slot fleet read them one after another
+/// on every `list` — the floor under every poll (infinitus #1481).
+const MAX_SECRET_THREADS: usize = 4;
+
 /// Most usage fetches in flight at once. Each is one short HTTPS round trip and
 /// the accounts are independent, so the cap is about being a good citizen of
 /// the upstream, not about throughput.
@@ -199,6 +204,45 @@ pub fn collect(ctx: &Ctx, provider: &dyn Driver, opts: &CollectOpts) -> Result<P
     execute_inner(ctx, provider, &mut prepared, &opts.into(), false)
 }
 
+/// Every table slot's stored credential, in `order`, read a few at a time.
+///
+/// The reads are independent and the preamble holds `engine.lock` across them,
+/// so their sum was both `list`'s latency and how long a switch waited on it.
+/// The results come back in rotation order and the caller takes them with `?`
+/// in that order, so the first fault a pass reports is the one the serial loop
+/// reported. A slot the table does not hold is not read, as before.
+fn read_stored(
+    ctx: &Ctx,
+    provider: &str,
+    order: &[u32],
+    slots: &ProviderSlots,
+) -> Vec<Result<Option<String>>> {
+    let keys: Vec<String> = order
+        .iter()
+        .filter(|slot| slots.slots.contains_key(slot))
+        .map(|slot| slot_key(provider, *slot))
+        .collect();
+    if keys.len() <= 1 {
+        return keys.iter().map(|key| ctx.secrets.get(key)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Result<Option<String>>>>> =
+        keys.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..keys.len().min(MAX_SECRET_THREADS) {
+            scope.spawn(|| loop {
+                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(key) = keys.get(at) else { break };
+                *results[at].lock().unwrap() = Some(ctx.secrets.get(key));
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|cell| cell.into_inner().unwrap().expect("every key was read"))
+        .collect()
+}
+
 /// Steps 1–3: the live login, every slot's credential, and the stored table
 /// they are judged against — everything a fetch pass needs and nothing that
 /// depends on which slots it fetches.
@@ -316,14 +360,15 @@ pub fn prepare(
     // dead-token quarantine bound to the generation they used to hold no longer
     // describes them (step 3 lifts it).
     let mut adopted = Vec::new();
+    let mut reads = read_stored(ctx, id, &order, &slots).into_iter();
     for slot in &order {
         let Some(meta) = slots.slots.get(slot).cloned() else {
             continue;
         };
         let key = slot_key(id, *slot);
-        let stored = ctx
-            .secrets
-            .get(&key)?
+        let stored = reads
+            .next()
+            .expect("one read per slot the table holds")?
             .filter(|bytes| !bytes.trim().is_empty())
             .map(|bytes| Login { bytes });
         let stored_fingerprint = stored.as_ref().map(Login::fingerprint);

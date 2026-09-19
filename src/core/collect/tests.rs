@@ -757,8 +757,12 @@ fn a_single_pass_collect_re_reads_no_secrets() {
         .accounts
         .iter()
         .all(|a| a.usage_status == UsageStatus::Ok));
+    // The preamble reads slots a few at a time, so the order they land in is
+    // not the rotation's.
+    let mut gets = probe.gets();
+    gets.sort();
     assert_eq!(
-        probe.gets(),
+        gets,
         vec![slot_key("claude", 1), slot_key("claude", 2)],
         "one preamble read per slot, and nothing after the fetches"
     );
@@ -1027,5 +1031,90 @@ fn a_reported_limit_takes_a_slot_out_of_the_rotation() {
         two.windows.iter().all(|w| w.pct < 90.0),
         "{:?}",
         two.windows
+    );
+}
+
+/// A pass over a many-slot fleet overlaps its secret reads instead of paying
+/// their sum, and still reports the first fault in rotation order.
+#[test]
+fn the_preamble_reads_stored_credentials_a_few_at_a_time() {
+    struct SlowSecrets {
+        inner: crate::secrets::MemorySecrets,
+        running: Arc<Mutex<(usize, usize)>>,
+        fail: Option<String>,
+    }
+    impl crate::secrets::Secrets for SlowSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            {
+                let mut running = self.running.lock().unwrap();
+                running.0 += 1;
+                running.1 = running.1.max(running.0);
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            self.running.lock().unwrap().0 -= 1;
+            if self.fail.as_deref() == Some(key) {
+                return Err(SwapdError::new(
+                    ErrorCode::Io,
+                    format!("{key} is unreadable"),
+                ));
+            }
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn name(&self) -> &'static str {
+            "memory"
+        }
+    }
+
+    let fleet = |fail: Option<String>| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_for(dir.path());
+        let running = Arc::new(Mutex::new((0, 0)));
+        ctx.secrets = Box::new(SlowSecrets {
+            inner: crate::secrets::MemorySecrets::new(),
+            running: running.clone(),
+            fail,
+        });
+        for slot in 1..=8u32 {
+            let email = format!("a{slot}@example.com");
+            ctx.secrets
+                .set(
+                    &slot_key("claude", slot),
+                    &login_for(&email, &format!("rt-{slot}")),
+                )
+                .unwrap();
+            slots::update(&ctx.home.slots_file(), |file| {
+                let provider = file.providers.entry("claude".to_string()).or_default();
+                provider.insert(slot, slot_row(&email));
+                Ok((true, ()))
+            })
+            .unwrap();
+        }
+        (dir, ctx, running)
+    };
+    let driver = FakeDriver::new(&login_for("a1@example.com", "rt-1"));
+    let opts = CollectOpts {
+        only: Some(Vec::new()),
+        ..CollectOpts::default()
+    };
+
+    let (_dir, ctx, running) = fleet(None);
+    let view = collect(&ctx, &driver, &opts).unwrap();
+    assert_eq!(view.accounts.len(), 8);
+    let peak = running.lock().unwrap().1;
+    assert!((2..=4).contains(&peak), "reads overlapped {peak} at a time");
+
+    // A slot whose read fails fails the pass, named.
+    let (_dir, ctx, _) = fleet(Some(slot_key("claude", 3)));
+    let err = collect(&ctx, &driver, &opts).unwrap_err();
+    assert!(
+        err.message.contains(&slot_key("claude", 3)),
+        "{}",
+        err.message
     );
 }

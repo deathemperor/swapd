@@ -177,11 +177,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
         let driver = FakeDriver::new(&login_for("one@example.com", "rt-1")).usable("rt-1");
-        let _held = FileLock::acquire(&ctx.home.engine_lock_base(), Duration::from_secs(5)).unwrap();
+        let _held =
+            FileLock::acquire(&ctx.home.engine_lock_base(), Duration::from_secs(5)).unwrap();
         let started = Instant::now();
         let reply = flip(&ctx, &driver);
-        assert!(started.elapsed() < Duration::from_secs(3), "waited {:?}", started.elapsed());
-        assert!(reply.providers[0].accounts[0].auto_ignite, "the flag landed");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            reply.providers[0].accounts[0].auto_ignite,
+            "the flag landed"
+        );
         assert_eq!(
             reply.providers[0].active_unreadable.as_deref(),
             Some("switch-in-progress")

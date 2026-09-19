@@ -264,7 +264,11 @@ impl Secrets for StickySecrets {
             let mut state = self.state.lock().unwrap();
             match read {
                 Ok(value) => {
-                    state.retry_at = None;
+                    // Only a backoff that has run out: one a concurrent read
+                    // set while this one was in flight stands.
+                    if state.can_retry((self.clock)()) {
+                        state.retry_at = None;
+                    }
                     return Ok(state.pending.get(key).cloned().unwrap_or(value));
                 }
                 Err(e) if e.code == ErrorCode::KeychainUnavailable => {

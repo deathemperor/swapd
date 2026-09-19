@@ -27,6 +27,8 @@ pub mod run;
 pub mod switch;
 pub mod unclaimed;
 
+use std::time::Duration;
+
 use crate::contract::ListPayload;
 use crate::core::collect::{collect, record_slot_fingerprint, CollectOpts};
 use crate::core::refresh::{refresh_slot, Refreshed};
@@ -54,9 +56,20 @@ pub fn edit_slots(
         let provider = file.providers.entry(driver.id().to_string()).or_default();
         Ok((mutate(provider)?, ()))
     })?;
-    // The same collection pass `list` makes, so the caller sees the edit in the
-    // board it already knows how to render.
-    let view = collect(ctx, driver, &CollectOpts::default())?;
+    // The board `list` renders, served from the store: a flag flip fetches no
+    // usage (the numbers did not change) and waits only `list`'s short beat for
+    // `engine.lock`, so a daemon tick in flight degrades the reply instead of
+    // stalling it — one press took 11 s and outlived the app's 10 s budget
+    // (infinitus #1481).
+    let view = collect(
+        ctx,
+        driver,
+        &CollectOpts {
+            only: Some(Vec::new()),
+            lock_wait: Duration::from_secs(1),
+            ..CollectOpts::default()
+        },
+    )?;
     Ok(ListPayload {
         schema_version: output::SCHEMA_VERSION,
         providers: vec![view],
@@ -125,4 +138,53 @@ pub fn login_to_run(ctx: &Ctx, driver: &dyn Driver, slot: u32) -> Result<Login> 
 pub fn persist_login(ctx: &Ctx, provider: &str, slot: u32, login: &Login) -> Result<()> {
     ctx.secrets.set(&slot_key(provider, slot), &login.bytes)?;
     record_slot_fingerprint(ctx, provider, slot, Some(&login.fingerprint()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::core::collect::tests::{login_for, one_slot, FakeDriver};
+    use crate::core::store::FileLock;
+
+    fn flip(ctx: &Ctx, driver: &FakeDriver) -> ListPayload {
+        edit_slots(ctx, driver, |slots| {
+            let slot = slots.slots.get_mut(&1).unwrap();
+            slot.auto_ignite = !slot.auto_ignite;
+            Ok(true)
+        })
+        .unwrap()
+    }
+
+    /// A flag flip answers with the stored board: no usage fetch, however
+    /// stale the store is.
+    #[test]
+    fn an_edit_serves_the_board_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1")).usable("rt-1");
+        let reply = flip(&ctx, &driver);
+        assert!(reply.providers[0].accounts[0].auto_ignite);
+        assert_eq!(*driver.usages.lock().unwrap(), 0, "an edit fetches nothing");
+    }
+
+    /// With `engine.lock` held (a switch or the daemon's tick) the edit still
+    /// lands and answers within about a second, degraded like `list`, instead
+    /// of waiting the writers' full timeout.
+    #[test]
+    fn an_edit_under_a_held_engine_lock_answers_within_a_beat() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = one_slot(dir.path(), "one@example.com", "rt-1");
+        let driver = FakeDriver::new(&login_for("one@example.com", "rt-1")).usable("rt-1");
+        let _held = FileLock::acquire(&ctx.home.engine_lock_base(), Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let reply = flip(&ctx, &driver);
+        assert!(started.elapsed() < Duration::from_secs(3), "waited {:?}", started.elapsed());
+        assert!(reply.providers[0].accounts[0].auto_ignite, "the flag landed");
+        assert_eq!(
+            reply.providers[0].active_unreadable.as_deref(),
+            Some("switch-in-progress")
+        );
+    }
 }

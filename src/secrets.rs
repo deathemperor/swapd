@@ -253,11 +253,22 @@ impl StickySecrets {
 #[cfg(target_os = "macos")]
 impl Secrets for StickySecrets {
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let mut state = self.state.lock().unwrap();
-        if state.can_retry((self.clock)()) {
-            match self.primary.get(key) {
+        // The state is not held across the primary read: a read is a
+        // `/usr/bin/security` spawn, and a pass reads every slot — under the
+        // lock they ran one after another however many threads asked
+        // (infinitus #1481). Writes and deletes keep it: they are rare, and
+        // `pending` must move with the store it describes.
+        let can_retry = self.state.lock().unwrap().can_retry((self.clock)());
+        if can_retry {
+            let read = self.primary.get(key);
+            let mut state = self.state.lock().unwrap();
+            match read {
                 Ok(value) => {
-                    state.retry_at = None;
+                    // Only a backoff that has run out: one a concurrent read
+                    // set while this one was in flight stands.
+                    if state.can_retry((self.clock)()) {
+                        state.retry_at = None;
+                    }
                     return Ok(state.pending.get(key).cloned().unwrap_or(value));
                 }
                 Err(e) if e.code == ErrorCode::KeychainUnavailable => {
@@ -446,6 +457,53 @@ mod tests {
         let sticky = StickySecrets::new(Box::new(FailingSecrets), Box::new(MemorySecrets::new()));
         sticky.set("k", "tok-1").unwrap();
         assert_eq!(sticky.get("k").unwrap(), Some("tok-1".to_string()));
+    }
+
+    /// Reads must overlap: a pass reads every slot, each read is a spawn, and
+    /// holding the fallback state across one ran them in series.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_reads_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct SlowPrimary {
+            running: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+        impl Secrets for SlowPrimary {
+            fn get(&self, _key: &str) -> Result<Option<String>> {
+                let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some("tok".to_string()))
+            }
+            fn set(&self, _key: &str, _value: &str) -> Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "keychain"
+            }
+        }
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let sticky = StickySecrets::new(
+            Box::new(SlowPrimary {
+                running: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+            }),
+            Box::new(MemorySecrets::new()),
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| assert_eq!(sticky.get("k").unwrap(), Some("tok".to_string())));
+            }
+        });
+        assert!(peak.load(Ordering::SeqCst) >= 2, "reads ran one at a time");
     }
 
     #[cfg(target_os = "macos")]

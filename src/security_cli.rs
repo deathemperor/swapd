@@ -21,6 +21,10 @@ use crate::errors::{ErrorCode, Result, SwapdError};
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const TIMEOUT: Duration = Duration::from_secs(15);
+/// How often a running `security` is checked. A read takes ~25 ms and a pass
+/// makes one per slot: a 20 ms tick nearly doubled each of them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const POLL: Duration = Duration::from_millis(2);
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn keychain_unavailable() -> SwapdError {
@@ -79,7 +83,7 @@ fn wait_for(mut child: Child) -> Result<(i32, String, String)> {
                     let _ = child.wait();
                     return Err(keychain_unavailable());
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(POLL);
             }
         }
     };

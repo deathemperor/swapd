@@ -629,13 +629,15 @@ fn a_long_running_engine_recovers_candidates_after_a_keychain_failure() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    // Down until the test says otherwise, not for one read: a pass reads its
+    // slots a few at a time, so "the first read" is not one particular slot.
     struct FailOnceSecrets {
-        fail: AtomicBool,
+        fail: Arc<AtomicBool>,
         inner: Box<dyn Secrets>,
     }
     impl Secrets for FailOnceSecrets {
         fn get(&self, key: &str) -> Result<Option<String>> {
-            if self.fail.swap(false, Ordering::SeqCst) {
+            if self.fail.load(Ordering::SeqCst) {
                 return Err(SwapdError::new(ErrorCode::KeychainUnavailable, "temporary"));
             }
             self.inner.get(key)
@@ -661,9 +663,10 @@ fn a_long_running_engine_recovers_candidates_after_a_keychain_failure() {
     let clock = Arc::new(Mutex::new(Instant::now()));
     let read_clock = clock.clone();
     let mut ctx = board.ctx();
+    let keychain_down = Arc::new(AtomicBool::new(true));
     ctx.secrets = Box::new(StickySecrets::with_clock(
         Box::new(FailOnceSecrets {
-            fail: AtomicBool::new(true),
+            fail: keychain_down.clone(),
             inner: board.secrets(),
         }),
         Box::new(MemorySecrets::new()),
@@ -681,6 +684,7 @@ fn a_long_running_engine_recovers_candidates_after_a_keychain_failure() {
     assert_eq!(board.live_email(), "one@example.com");
 
     // Same daemon and stores: no restart and no manual rotation.
+    keychain_down.store(false, Ordering::SeqCst);
     board.advance(61.0);
     *clock.lock().unwrap() += Duration::from_secs(61);
     assert_eq!(engine.tick(), TickOutcome::Switched);

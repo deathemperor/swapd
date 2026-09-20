@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 
 use crate::contract::{AccountView, LastGood, NextRecovery, ProviderView, UsageStatus, Window};
+use crate::core::auto;
 use crate::core::poll_policy::{binding_pct, limiting_reset_ts};
 use crate::core::refresh::{refresh_slot, Refreshed};
 use crate::core::slots::{self, ProviderSlots, Slot, SlotsFile};
@@ -640,6 +641,8 @@ fn execute_inner(
         }
     }
 
+    apply_quarantine_sentinels(ctx, &mut states);
+
     let accounts: Vec<AccountView> = states
         .iter()
         .map(|st| account_view(st, entry_of(&prepared.entries, &st.key), now))
@@ -724,6 +727,45 @@ fn credential_sentinel(
         Some(login) if provider.is_api_key(login) => Some(UsageStatus::ApiKey),
         Some(login) if !login.is_renewable() => Some(UsageStatus::ReloginRequired),
         Some(_) => None,
+    }
+}
+
+/// A slot the auto daemon benched for a dead refresh token reads
+/// `relogin-required`, the same as one the usage endpoint condemned.
+///
+/// The two verdicts are earned on different paths and only one of them used to
+/// reach a surface. A refusal on the SWITCH path cannot strike the usage row:
+/// `UsageStore::record_failure` is fenced by a fetch lease no switch holds, and
+/// deliberately so. It is recorded in the daemon's own state instead
+/// (`auto::quarantined_credentials`), where nothing that renders an account
+/// looks — so the account went on showing healthy usage, and the re-login it
+/// needs was offered nowhere, while the engine refused to rotate onto it and
+/// reported `no-viable-target`.
+///
+/// Bound to the credential generation the verdict condemned, exactly as
+/// `auto::release_recovered_quarantines` binds it: a re-login rewrites the
+/// secret, the fingerprints stop matching, and the row clears on the next pass
+/// without waiting for the daemon's own release. A more specific sentinel
+/// about the credential in hand always wins.
+///
+/// Laid on at the END of a pass, so it colours what the pass REPORTS and
+/// nothing about what it fetched: the account goes on being measured while it
+/// is benched, and the reading is current the moment the quarantine lifts.
+fn apply_quarantine_sentinels(ctx: &Ctx, states: &mut [SlotState]) {
+    let quarantined = auto::quarantined_credentials(&ctx.home);
+    if quarantined.is_empty() {
+        return;
+    }
+    for st in states.iter_mut() {
+        if st.sentinel.is_some() {
+            continue;
+        }
+        if quarantined
+            .get(&st.slot)
+            .is_some_and(|struck| *struck == st.fingerprint)
+        {
+            st.sentinel = Some(UsageStatus::ReloginRequired);
+        }
     }
 }
 

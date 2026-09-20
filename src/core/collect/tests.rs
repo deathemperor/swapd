@@ -1118,3 +1118,71 @@ fn the_preamble_reads_stored_credentials_a_few_at_a_time() {
         err.message
     );
 }
+/// Bench slot `slot` the way the auto daemon does when a switch onto it comes
+/// back `invalid_grant`: a record in its own state file and nowhere else.
+fn bench(ctx: &Ctx, slot: u32, fingerprint: Option<&str>) {
+    let state = crate::core::auto::AutoState {
+        schema_version: 1,
+        quarantine: [(
+            slot.to_string(),
+            crate::core::auto::Quarantine {
+                reason: "invalid_grant".to_string(),
+                since: "2026-09-20T02:03:24Z".to_string(),
+                fingerprint: fingerprint.map(str::to_string),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    crate::core::store::write_json_atomic(&ctx.home.auto_state_file(), &state).unwrap();
+}
+
+fn fingerprint_of(login: &str) -> String {
+    Login {
+        bytes: login.to_string(),
+    }
+    .fingerprint()
+}
+
+#[test]
+fn a_benched_slots_dead_token_reaches_the_view_the_surfaces_render() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _probe) = two_slots(dir.path());
+    bench(
+        &ctx,
+        2,
+        Some(&fingerprint_of(&login_for("two@example.com", "rt-2"))),
+    );
+
+    let view = collect(&ctx, &both_usable(), &CollectOpts::default()).unwrap();
+
+    // The usage endpoint has nothing against this account — only the switch
+    // path does, and its verdict used to live where no surface could read it.
+    let two = view.accounts.iter().find(|a| a.slot == 2).unwrap();
+    assert_eq!(two.usage_status, UsageStatus::ReloginRequired);
+    assert_eq!(
+        view.next_candidate, None,
+        "the rotation cannot land on a slot the daemon has benched"
+    );
+}
+
+#[test]
+fn a_re_login_clears_the_bench_before_the_daemon_gets_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _probe) = two_slots(dir.path());
+    // The record condemns the generation that failed; the slot holds a newer
+    // one, so the account is usable again this pass — not at the daemon's
+    // next tick, which is when the record itself is dropped.
+    bench(
+        &ctx,
+        2,
+        Some(&fingerprint_of(&login_for("two@example.com", "rt-old"))),
+    );
+
+    let view = collect(&ctx, &both_usable(), &CollectOpts::default()).unwrap();
+
+    let two = view.accounts.iter().find(|a| a.slot == 2).unwrap();
+    assert_eq!(two.usage_status, UsageStatus::Ok);
+    assert_eq!(view.next_candidate, Some(2));
+}

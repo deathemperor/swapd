@@ -46,7 +46,9 @@ use crate::core::settings::{self, Settings};
 use crate::core::slots;
 use crate::core::store::{read_json, write_json_atomic, FileLock};
 use crate::core::switch;
-use crate::core::usage_store::{due_candidate, plan_oversleeps_interval, Entry};
+use crate::core::usage_store::{
+    due_candidate, is_permanent_auth_error, plan_oversleeps_interval, Entry,
+};
 use crate::ctx::Ctx;
 use crate::driver::{Driver, Login};
 use crate::errors::{ErrorCode, Result};
@@ -171,6 +173,28 @@ pub struct Quarantine {
     /// RFC 3339, for a human reading the file.
     pub since: String,
     pub fingerprint: Option<String>,
+}
+
+/// The slots taken out of rotation for a dead refresh token, each with the
+/// credential generation the verdict condemned.
+///
+/// The collector lays these over the view it builds, so an account the SWITCH
+/// path found dead reads `relogin-required` wherever it is rendered instead of
+/// only in this file — see `collect::apply_quarantine_sentinels`.
+///
+/// Read without the state lock: the file is only ever written whole
+/// (`write_json_atomic`), so a reader sees one generation of it or the one
+/// before, and a verdict a tick out of date costs a render, not a decision.
+pub fn quarantined_credentials(home: &crate::paths::Home) -> BTreeMap<u32, Option<String>> {
+    let Ok(state) = read_json::<AutoState>(&home.auto_state_file()) else {
+        return BTreeMap::new();
+    };
+    state
+        .quarantine
+        .iter()
+        .filter(|(_, entry)| is_permanent_auth_error(&entry.reason))
+        .filter_map(|(slot, entry)| Some((slot.parse().ok()?, entry.fingerprint.clone())))
+        .collect()
 }
 
 /// Where the last switch came from, and what it looked like there.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- An account the daemon benched because a switch onto it was refused with `invalid_grant` now reports `relogin-required` and drops out of `nextCandidate`, instead of listing as a healthy account with usage to spare. The verdict is earned on the switch path, which cannot strike the usage row (the strike is fenced by a fetch lease no switch holds), so it was recorded in the daemon's state and nowhere a surface could read it: the fleet showed headroom it would never rotate onto, and the re-login the account needed was offered nowhere. The mark binds to the credential generation that was refused, so a re-login clears it on the next pass rather than at the daemon's next tick, and a benched account goes on being measured while it waits (#48).
+
 - An account whose refresh token was rejected once and whose credential has since been replaced is polled again instead of freezing at its last reading. The strike binds to the credential generation it condemned, but the fetch gate read the strike count alone, so a slot holding a newer generation was never fetched, reported no reason for it (a bare `stale`, aging out of every trust ceiling), and refused even `refresh --slot n` — while the rotation went on nominating it (#42).
 
 ## 0.3.0 — 2026-09-18

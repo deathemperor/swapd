@@ -196,9 +196,32 @@ impl Secrets for MemorySecrets {
 
 /// Use the file store while Keychain is unavailable, then retry after a minute.
 /// Keep writes made during an outage authoritative until a caller next writes
-/// that key to Keychain: a fallback refresh token may have spent the primary's.
-/// Recovery reads must not copy tokens back outside the caller's refresh lock.
+/// that key to Keychain, or until Keychain has answered for `PENDING_GRACE`:
+/// a fallback refresh token may have spent the primary's, but that evidence
+/// ages (see the constant). Recovery reads must not copy tokens back outside
+/// the caller's refresh lock.
 /// The mutex serializes recovery with reads and writes from collector workers.
+/// How long a write deferred to the file store stays authoritative over the
+/// primary once Keychain is answering again.
+///
+/// The shadow is worth keeping at all because a write made during an outage
+/// may have spent the token the primary still holds, and a read must not copy
+/// it back outside the caller's refresh lock. Both of those are facts about
+/// the minutes around the outage. Unbounded, the shadow outlives its evidence:
+/// a daemon that happens never to write that key again serves a
+/// process-local credential forever, another process moves the lineage on in
+/// Keychain, and every read here answers with a generation the server has
+/// already rotated away. On a live fleet that cost one `invalid_grant` on a
+/// healthy account, a quarantine whose own release test compared against the
+/// same stale value and so could never retire it, and five hours of an
+/// account benched with the only headroom left.
+///
+/// Long enough that the pass which deferred the write completes and writes
+/// again (a refresh persists its successor seconds later), short enough that a
+/// divergence cannot outlast a poll cadence unnoticed.
+#[cfg(target_os = "macos")]
+const PENDING_GRACE: Duration = Duration::from_secs(300);
+
 #[cfg(target_os = "macos")]
 pub struct StickySecrets {
     primary: Box<dyn Secrets>,
@@ -213,6 +236,10 @@ struct FallbackState {
     retry_at: Option<Instant>,
     // None keeps a fallback deletion authoritative for this process too.
     pending: HashMap<String, Option<String>>,
+    /// When the primary last started answering with deferred writes still
+    /// held — the clock `PENDING_GRACE` runs on. Cleared by an outage, so a
+    /// flapping Keychain never accumulates grace it did not serve.
+    healthy_since: Option<Instant>,
 }
 
 #[cfg(target_os = "macos")]
@@ -223,6 +250,7 @@ impl FallbackState {
 
     fn unavailable(&mut self, now: Instant) {
         self.retry_at = Some(now + Duration::from_secs(60));
+        self.healthy_since = None;
     }
 }
 
@@ -248,6 +276,32 @@ impl StickySecrets {
             ..Self::new(primary, fallback)
         }
     }
+
+    /// A successful primary access with the backoff clear: Keychain is
+    /// answering. Deferred writes stay authoritative for `PENDING_GRACE` past
+    /// that, then the primary is believed again and the copies it superseded
+    /// are dropped — one left on disk would only ever be read during some
+    /// later outage, long after the lineage moved on.
+    ///
+    /// Never writes to the primary: the caller's refresh lock, not a read, is
+    /// what may put a token there.
+    fn age_pending(&self, state: &mut FallbackState, now: Instant) {
+        if state.pending.is_empty() {
+            state.healthy_since = None;
+            return;
+        }
+        match state.healthy_since {
+            None => state.healthy_since = Some(now),
+            Some(since) if now.saturating_duration_since(since) >= PENDING_GRACE => {
+                for key in state.pending.keys() {
+                    let _ = self.fallback.delete(key);
+                }
+                state.pending.clear();
+                state.healthy_since = None;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -268,6 +322,7 @@ impl Secrets for StickySecrets {
                     // set while this one was in flight stands.
                     if state.can_retry((self.clock)()) {
                         state.retry_at = None;
+                        self.age_pending(&mut state, (self.clock)());
                     }
                     return Ok(state.pending.get(key).cloned().unwrap_or(value));
                 }
@@ -286,6 +341,7 @@ impl Secrets for StickySecrets {
             match self.primary.set(key, value) {
                 Ok(()) => {
                     state.retry_at = None;
+                    self.age_pending(&mut state, (self.clock)());
                     state.pending.remove(key);
                     let _ = self.fallback.delete(key);
                     return Ok(());
@@ -307,6 +363,7 @@ impl Secrets for StickySecrets {
             match self.primary.delete(key) {
                 Ok(()) => {
                     state.retry_at = None;
+                    self.age_pending(&mut state, (self.clock)());
                     state.pending.remove(key);
                     let _ = self.fallback.delete(key);
                     return Ok(());
@@ -698,6 +755,109 @@ mod tests {
         );
         assert_eq!(store.get("claude:8").unwrap(), None);
         assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_stops_shadowing_a_primary_that_has_answered_for_a_while() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let available = Arc::new(AtomicBool::new(false));
+        let primary = Arc::new(MemorySecrets::new());
+        let fallback = Arc::new(MemorySecrets::new());
+        primary.set("claude:6", "pre-outage").unwrap();
+        let base = Instant::now();
+        let now = Arc::new(Mutex::new(base));
+        let tick = now.clone();
+        let store = StickySecrets::with_clock(
+            Box::new(RecoveringSecrets {
+                available: available.clone(),
+                values: primary.clone(),
+            }),
+            Box::new(SharedSecrets(fallback.clone())),
+            Box::new(move || *tick.lock().unwrap()),
+        );
+
+        // A refresh lands while Keychain is down: its successor is deferred to
+        // the file store, and may have spent what the primary still holds.
+        store.set("claude:6", "outage-successor").unwrap();
+        available.store(true, Ordering::SeqCst);
+        // Another process then moves the lineage on in Keychain.
+        primary.set("claude:6", "another-process-token").unwrap();
+
+        // Just after recovery the deferred write is still what this process
+        // spends — the primary's copy may be the one ours spent.
+        *now.lock().unwrap() = base + Duration::from_secs(61);
+        assert_eq!(
+            store.get("claude:6").unwrap().as_deref(),
+            Some("outage-successor")
+        );
+
+        // Once Keychain has answered that long, the evidence has aged out and
+        // the primary is believed again. Unbounded, this shadow served a
+        // rotated-away generation until the process restarted: one
+        // `invalid_grant` on a healthy account, and a quarantine whose release
+        // test compared against this same stale value and so never retired.
+        *now.lock().unwrap() = base + Duration::from_secs(61) + PENDING_GRACE;
+        assert_eq!(
+            store.get("claude:6").unwrap().as_deref(),
+            Some("another-process-token")
+        );
+        assert_eq!(
+            fallback.get("claude:6").unwrap(),
+            None,
+            "the superseded copy must not wait on disk for the next outage"
+        );
+        // And it stays believed, without another grace period starting.
+        assert_eq!(
+            store.get("claude:6").unwrap().as_deref(),
+            Some("another-process-token")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_grace_runs_on_a_keychain_that_stays_up() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let available = Arc::new(AtomicBool::new(false));
+        let primary = Arc::new(MemorySecrets::new());
+        let base = Instant::now();
+        let now = Arc::new(Mutex::new(base));
+        let tick = now.clone();
+        let store = StickySecrets::with_clock(
+            Box::new(RecoveringSecrets {
+                available: available.clone(),
+                values: primary.clone(),
+            }),
+            Box::new(MemorySecrets::new()),
+            Box::new(move || *tick.lock().unwrap()),
+        );
+        store.set("claude:6", "outage-successor").unwrap();
+
+        // Keychain comes back, then drops again inside the grace period. The
+        // second outage restarts the clock: grace is time the primary actually
+        // served, not wall time since the write.
+        available.store(true, Ordering::SeqCst);
+        *now.lock().unwrap() = base + Duration::from_secs(61);
+        assert_eq!(
+            store.get("claude:6").unwrap().as_deref(),
+            Some("outage-successor")
+        );
+        available.store(false, Ordering::SeqCst);
+        *now.lock().unwrap() = base + Duration::from_secs(62);
+        assert_eq!(
+            store.get("claude:6").unwrap().as_deref(),
+            Some("outage-successor")
+        );
+
+        available.store(true, Ordering::SeqCst);
+        *now.lock().unwrap() = base + Duration::from_secs(62) + PENDING_GRACE;
+        assert_eq!(
+            store.get("claude:6").unwrap().as_deref(),
+            Some("outage-successor"),
+            "the outage reset the grace; this read only starts it again"
+        );
+        *now.lock().unwrap() = base + Duration::from_secs(62) + PENDING_GRACE * 2;
+        assert_eq!(store.get("claude:6").unwrap(), None);
     }
 
     #[cfg(target_os = "macos")]

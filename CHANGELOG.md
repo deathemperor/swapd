@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A sign-in whose token response names no scope is recorded with the scopes a claude.ai grant carries — the request minus `org:create_api_key` — not the request itself; #50 had made the request list the fallback, so such an account would have refreshed against a console-only scope (#51).
+
 - `add-oauth` asks for the scopes Claude Code itself asks for today — `org:create_api_key`, `user:plugins` and the five it already sent, in Claude Code's order — instead of a five-scope subset. The authorization server started refusing the subset with "Invalid request format", so every sign-in and re-login through the browser failed at the first page (#50).
 
 - A write deferred to the file store while the Keychain was unavailable stops shadowing the Keychain five minutes after it answers again, instead of for the life of the process. The deferred copy is kept authoritative for a grace period on purpose — it may have spent the token the Keychain still holds, and a read must not copy it back outside the caller's refresh lock — but unbounded it outlived that evidence: a daemon that never happened to write that key again went on spending a generation another process had already rotated away, which earned one `invalid_grant` on a healthy account, benched it, and left the quarantine unreleasable because its own release test compared against that same stale copy (#49).

@@ -89,10 +89,22 @@ pub const REDIRECT_PORT: u16 = 54545;
 /// hosts), in its order. The authorization server refuses a set that is not
 /// the registered one — a five-scope subset that was accepted until 2026-09-20
 /// now fails with "Invalid request format" (#50) — so this list is copied
-/// rather than composed, and `org:create_api_key` stays although a claude.ai
-/// grant never carries it.
-const SCOPES: [&str; 7] = [
+/// rather than composed.
+const REQUESTED_SCOPES: [&str; 7] = [
     "org:create_api_key",
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+    "user:plugins",
+];
+
+/// What a claude.ai grant carries: the request minus `org:create_api_key`,
+/// which only a console grant gives. Claude Code stores and refreshes with
+/// this set, so a token response that names no scope is recorded as this
+/// rather than as the request (#51).
+const SCOPES: [&str; 6] = [
     "user:profile",
     "user:inference",
     "user:sessions:claude_code",
@@ -164,7 +176,7 @@ pub fn authorize_url(ep: &Endpoints, port: u16, challenge: &str, state: &str) ->
         ("client_id", CLIENT_ID),
         ("response_type", "code"),
         ("redirect_uri", &redirect_uri(port)),
-        ("scope", &SCOPES.join(" ")),
+        ("scope", &REQUESTED_SCOPES.join(" ")),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
         ("state", state),

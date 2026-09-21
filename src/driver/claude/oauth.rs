@@ -84,15 +84,21 @@ pub fn usage_url(ep: &Endpoints) -> String {
 /// while one is in flight, which is the behaviour we want anyway.
 pub const REDIRECT_PORT: u16 = 54545;
 
-/// What a real Claude Code login asks for today, read off the credentials its
-/// own `/login` writes. Asking for a scope the registration does not grant
-/// fails the authorization, so this list is copied rather than composed.
-const SCOPES: [&str; 5] = [
+/// What a real Claude Code login asks for today: the list its own `/login`
+/// sends (Claude Code 2.1.278, the same set for the claude.ai and console
+/// hosts), in its order. The authorization server refuses a set that is not
+/// the registered one — a five-scope subset that was accepted until 2026-09-20
+/// now fails with "Invalid request format" (#50) — so this list is copied
+/// rather than composed, and `org:create_api_key` stays although a claude.ai
+/// grant never carries it.
+const SCOPES: [&str; 7] = [
+    "org:create_api_key",
     "user:profile",
     "user:inference",
     "user:sessions:claude_code",
     "user:mcp_servers",
     "user:file_upload",
+    "user:plugins",
 ];
 
 /// The exchange is a person's browser round trip away and may land on a cold
@@ -626,8 +632,12 @@ mod tests {
         // Reserved characters are encoded, in the value and in the redirect.
         assert!(url.contains("state=st%2F1"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback"));
-        // Space-joined, so every scope arrives as one parameter.
-        assert!(url.contains("scope=user%3Aprofile%20user%3Ainference"));
+        // Space-joined, so every scope arrives as one parameter, and the set
+        // is Claude Code's own, whole and in its order.
+        assert!(url.contains(
+            "scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20\
+             user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload%20user%3Aplugins&"
+        ));
     }
 
     #[test]

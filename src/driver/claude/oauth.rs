@@ -155,9 +155,14 @@ pub fn pkce() -> (String, String) {
 
 /// An opaque value the callback must echo, so a request that lands on the
 /// listener from anywhere else is refused rather than redeemed.
+///
+/// 32 bytes, like the verifier and like Claude Code's own: the authorization
+/// server refuses a 16-byte one with "Invalid request format" (#52, bisected
+/// in the browser 2026-09-21 — the same request with a 32-byte state went
+/// through).
 pub fn state() -> String {
     use base64::Engine as _;
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 32];
     for chunk in bytes.chunks_mut(8) {
         chunk.copy_from_slice(&rand::random::<u64>().to_le_bytes());
     }
@@ -623,6 +628,8 @@ mod tests {
             challenge,
             b64.encode(sha2::Sha256::digest(verifier.as_bytes()))
         );
+        // The state is the same 32 bytes, base64url.
+        assert_eq!(b64.decode(state()).unwrap().len(), 32);
         // Two calls are two sign-ins.
         assert_ne!(pkce().0, verifier);
         assert_ne!(state(), state());

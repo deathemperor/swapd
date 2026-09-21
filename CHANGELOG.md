@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `add-oauth` sends a 32-byte `state`, as Claude Code does, instead of 16: claude.ai's authorize page had begun refusing the shorter one with "Invalid request format", which is what actually failed every browser sign-in and re-login — bisected in the browser, the same request with the longer state went through (#52).
+
 - A sign-in whose token response names no scope is recorded with the scopes a claude.ai grant carries — the request minus `org:create_api_key` — not the request itself; #50 had made the request list the fallback, so such an account would have refreshed against a console-only scope (#51).
 
 - `add-oauth` asks for the scopes Claude Code itself asks for today — `org:create_api_key`, `user:plugins` and the five it already sent, in Claude Code's order — instead of a five-scope subset. The authorization server started refusing the subset with "Invalid request format", so every sign-in and re-login through the browser failed at the first page (#50).

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Signed in</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f8fa;
+        color: #18212e;
+        --muted: #556171;
+        --accent: #245bd6;
+        --hover: #1948b4;
+        --success: #18734c;
+        --success-bg: #e3f2e9;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; min-height: 100svh; display: grid; place-items: center; padding: 32px 24px; }
+      main { width: min(100%, 400px); text-align: center; }
+      .check { width: 56px; height: 56px; padding: 14px; border-radius: 50%; color: var(--success); background: var(--success-bg); }
+      h1 { margin: 24px 0 12px; font-size: clamp(28px, 6vw, 36px); line-height: 1.15; letter-spacing: -0.03em; }
+      p { margin: 0; color: var(--muted); font-size: 16px; line-height: 1.6; text-wrap: pretty; }
+      button { margin-top: 28px; min-height: 48px; padding: 12px 28px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+      button:hover { background: var(--hover); }
+      button:active { transform: translateY(1px); }
+      button:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+      .status { margin-top: 16px; font-size: 14px; min-height: 3.2em; }
+      ::selection { background: var(--accent); color: #fff; }
+      @media (prefers-color-scheme: dark) {
+        :root { background: #15191f; color: #eef1f6; --muted: #aab5c4; --accent: #356ee6; --hover: #427bf2; --success: #86d9ac; --success-bg: #20392d; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <svg class="check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10" /></svg>
+      <h1>Signed in</h1>
+      <p>Return to the app or terminal while it finishes adding your account.</p>
+      <button id="close" type="button" hidden>Close window</button>
+      <p class="status" id="status" role="status">You can close this window.</p>
+    </main>
+    <script>
+      const button = document.getElementById('close');
+      const status = document.getElementById('status');
+      let timer;
+      function closeWindow() {
+        clearTimeout(timer);
+        status.textContent = 'You can safely close this tab if it stays open.';
+        window.close();
+      }
+      button.hidden = false;
+      button.addEventListener('click', closeWindow);
+      status.textContent = 'This window will try to close automatically in 5 seconds.';
+      timer = setTimeout(closeWindow, 5000);
+    </script>
+  </body>
+</html>

@@ -242,18 +242,18 @@ fn serve(stream: TcpStream, state: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     let code = code.to_string();
-    respond(
-        &mut stream,
-        "200 OK",
-        "Signed in. You can close this window.",
-    );
+    respond_html(&mut stream, "200 OK", include_str!("oauth_complete.html"));
     Ok(Some(code))
 }
 
-/// A one-line HTML page and the connection closed. A failure to write it is not
+/// A plain error page and the connection closed. A failure to write it is not
 /// a failure of the sign-in: the code is already in hand.
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let body = format!("<!doctype html><meta charset=utf-8><p>{body}</p>");
+    respond_html(stream, status, &body);
+}
+
+fn respond_html(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = write!(
         stream,
         "HTTP/1.1 {status}\r\n\

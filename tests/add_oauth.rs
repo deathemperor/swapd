@@ -151,6 +151,11 @@ fn a_browser_round_trip_registers_the_account() {
     let page = callback(fx.port, &format!("code=ac-1&state={}", state_of(&url)));
     assert!(page.contains("200 OK"));
     assert!(page.contains("You can close this window"));
+    let (headers, body) = page.split_once("\r\n\r\n").unwrap();
+    assert!(headers.contains(&format!("Content-Length: {}", body.len())));
+    assert!(body.contains("<title>Signed in</title>"));
+    assert!(!body.contains("ac-1"));
+    assert!(!body.contains(&state_of(&url)));
 
     let out = read_line(&mut reader);
     assert!(child.wait().unwrap().success());
@@ -210,10 +215,12 @@ fn a_refused_sign_in_is_the_providers_own_word() {
 
     let (url_line, mut child, mut reader) = fx.begin(&[]);
     let url = url_line["url"].as_str().unwrap().to_string();
-    callback(
+    let page = callback(
         fx.port,
         &format!("error=access_denied&state={}", state_of(&url)),
     );
+    assert!(page.contains("Sign-in failed"));
+    assert!(!page.contains("<script>"));
 
     let out = read_line(&mut reader);
     assert!(!child.wait().unwrap().success());

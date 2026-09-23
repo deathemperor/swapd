@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A credential without a refresh token that Claude Code leaves in a slot's profile is no longer read back as a rotation. A stale, logged-out hashed keychain item shadowed one profile's seed, so every ignite or run there "rotated" the fresh login into that blank item and stored it, and the account asked for a re-login again minutes after each one.
+
 - `add-oauth` sends a 32-byte `state`, as Claude Code does, instead of 16: claude.ai's authorize page had begun refusing the shorter one with "Invalid request format", which is what actually failed every browser sign-in and re-login — bisected in the browser, the same request with the longer state went through (#52).
 
 - A sign-in whose token response names no scope is recorded with the scopes a claude.ai grant carries — the request minus `org:create_api_key` — not the request itself; #50 had made the request list the fallback, so such an account would have refreshed against a console-only scope (#51).

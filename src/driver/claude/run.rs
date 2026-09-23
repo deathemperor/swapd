@@ -388,6 +388,13 @@ fn rotated_login(
     if login.fingerprint() == baseline {
         return Ok(None);
     }
+    // A rotation always carries a refresh token. A profile credential without
+    // one is a logged-out or stale item Claude Code read instead of the seed
+    // (a hashed keychain entry shadows `.credentials.json`); reporting it would
+    // overwrite the stored login with a blank one and bench the account.
+    if !login.is_renewable() && !live::looks_like_api_key(&login.bytes) {
+        return Ok(None);
+    }
     Ok(Some(login))
 }
 
@@ -1404,6 +1411,29 @@ mod tests {
         assert!(fs::read_to_string(dir.join(".credentials.json"))
             .unwrap()
             .contains("rt-1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignite_ignores_a_profile_credential_without_a_refresh_token() {
+        let home = temp_home();
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        // A logged-out credential: what claude leaves behind (or reads from a
+        // stale hashed keychain item) when the profile holds no usable login.
+        write_script(
+            &bin.join("claude"),
+            "#!/bin/sh\nprintf '%s' \
+             '{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\"expiresAt\":0}}' \
+             > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\nexit 1\n",
+        );
+
+        let env = env_with(&home, [("USER", "tester"), ("PATH", bin.to_str().unwrap())]);
+        let driver = ClaudeDriver::new(LiveStore::File, endpoints());
+
+        let outcome = ignite(&driver, &env, 8, &login()).unwrap();
+        assert!(outcome.rotated.is_none());
     }
 
     #[cfg(unix)]

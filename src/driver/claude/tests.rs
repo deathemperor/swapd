@@ -105,7 +105,21 @@ mod http_tests {
     fn usage_keeps_the_banked_resets_and_a_claim_spends_one() {
         let server = MockServer::start();
         let usage = server.mock(|when, then| {
-            when.method(GET).path("/api/oauth/usage");
+            when.method(GET)
+                .path("/api/oauth/usage")
+                // Exactly one agent string: the request's overrides the
+                // agent's own `swapd/x.y.z`, never rides beside it — a proxy
+                // forwarding the first would earn `ineligible_reason: "surface"`.
+                .matches(|req| {
+                    req.headers.as_ref().is_some_and(|headers| {
+                        let agents: Vec<&str> = headers
+                            .iter()
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                            .map(|(_, value)| value.as_str())
+                            .collect();
+                        agents == [oauth::RESET_USER_AGENT]
+                    })
+                });
             then.status(200).header("content-type", "application/json").body(
                 r#"{"five_hour":{"utilization":1.0,"resets_at":"2026-09-09T15:59:59Z"},
                     "cedar_ember":{"eligible":true,"at_limit":false,"next_grant_id":"launch",

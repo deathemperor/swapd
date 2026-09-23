@@ -1001,6 +1001,7 @@ mod tests {
                 prefer: true,
                 refresh: true,
                 run: true,
+                reset: true,
             }
         }
         fn oauth_begin(

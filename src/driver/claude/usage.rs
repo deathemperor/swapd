@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use crate::contract::{Pace, Window, WindowKind};
 use crate::driver::claude::oauth::{self, Endpoints};
 use crate::driver::http_auth;
-use crate::driver::DriverError;
+use crate::driver::{DriverError, ResetBank, ResetGrant, ResetOutcome};
 use crate::timefmt::format_ts;
 
 /// Weekly windows reset on a fixed 7-day cadence (`pace.py:26`).
@@ -48,7 +48,10 @@ pub fn fetch(ep: &Endpoints, access_token: &str) -> Result<Value, DriverError> {
         oauth::READ_TIMEOUT_S,
         access_token,
         "usage",
-        &[("anthropic-beta", oauth::BETA_HEADER)],
+        &[
+            ("anthropic-beta", oauth::BETA_HEADER),
+            ("user-agent", oauth::RESET_USER_AGENT),
+        ],
     )?;
 
     if reply.status == 429 {
@@ -142,6 +145,106 @@ pub fn windows_at(raw: &Value, fetched_at: f64) -> Vec<Window> {
     }
 
     out
+}
+
+/// The `cedar_ember` block: the limit resets the provider has banked for
+/// this account, kept as reported. `None` when the response carries none or
+/// names no grant — an account the program does not cover.
+pub fn reset_bank(raw: &Value) -> Option<ResetBank> {
+    let block = raw.get("cedar_ember")?.as_object()?;
+    let text = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let flag = |v: Option<&Value>| v.and_then(Value::as_bool).unwrap_or(false);
+    let count = |v: Option<&Value>| v.and_then(Value::as_u64).unwrap_or(0) as u32;
+    let grants: Vec<ResetGrant> = block
+        .get("grants")
+        .and_then(Value::as_array)
+        .map(|grants| {
+            grants
+                .iter()
+                .filter_map(|g| {
+                    Some(ResetGrant {
+                        id: text(g.get("id"))?,
+                        label: text(g.get("label")),
+                        resets_left: count(g.get("resets_left")),
+                        resets_total: count(g.get("resets_total")),
+                        ends_at: text(g.get("ends_at")),
+                        paused: flag(g.get("paused")),
+                        usable_now: flag(g.get("usable_now")),
+                        use_requires_limit: flag(g.get("use_requires_limit")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if grants.is_empty() {
+        return None;
+    }
+    Some(ResetBank {
+        at_limit: flag(block.get("at_limit")),
+        next_grant_id: text(block.get("next_grant_id")),
+        cooldown_until: text(block.get("cooldown_until")),
+        grants,
+    })
+}
+
+/// Spend one banked reset: the CLI's `/reset` request, verbatim. The
+/// provider's refusals come back as the outcome's own word; only transport
+/// and auth failures are errors.
+pub fn claim_reset(
+    ep: &Endpoints,
+    access_token: &str,
+    organization_uuid: &str,
+    grant_id: &str,
+) -> Result<ResetOutcome, DriverError> {
+    // One id per attempt, so a retry after a timeout cannot be taken for a
+    // second claim; the server keys idempotency on it.
+    let request_id = format!(
+        "{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    );
+    let reply = http_auth::post_json(
+        oauth::reset_url(ep, organization_uuid),
+        oauth::RESET_TIMEOUT_S,
+        access_token,
+        "reset",
+        &[
+            ("anthropic-beta", oauth::BETA_HEADER),
+            ("user-agent", oauth::RESET_USER_AGENT),
+        ],
+        &serde_json::json!({
+            "program": "cedar_ember",
+            "grant_id": grant_id,
+            "request_id": request_id,
+        }),
+    )?;
+    if reply.status == 429 {
+        let retry_after = reply
+            .retry_after
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.max(0.0));
+        return Err(DriverError::Throttled { retry_after });
+    }
+    if reply.status == 401 {
+        return Err(DriverError::NeedsRefresh);
+    }
+    if reply.status != 200 {
+        return Err(DriverError::Http(format!("reset: http-{}", reply.status)));
+    }
+    let body: Value = serde_json::from_str(&reply.body)
+        .map_err(|_| DriverError::Http("reset: bad-response".to_string()))?;
+    let result = body
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| DriverError::Http("reset: bad-response".to_string()))?;
+    Ok(ResetOutcome {
+        result: result.to_string(),
+    })
 }
 
 /// `(utilization, resets_at)` of a `five_hour`/`seven_day` entry.

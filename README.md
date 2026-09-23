@@ -43,6 +43,7 @@ cargo install --git https://github.com/deathemperor/swapd swapd
 | `icon <ident> [icon\|--unset]` | set or clear a slot's icon |
 | `prefer <ident> on\|off` | pin or unpin an account the rotation lands on first |
 | `auto-ignite <ident> on\|off` | keep the account's 5h window running: the daemon ignites it whenever the window has gone cold |
+| `reset <ident>` | spend one of the account's banked limit resets (Claude's `/reset`), as that account; `list` reports them as `resets` |
 | `hold <ident>` / `unhold <ident>` | take an account out of / back into the rotation |
 | `reorder <idents>…` | set the rotation order: every slot, exactly once |
 | `remove <ident> --yes` | forget an account: its login, run profile and slot; the slots above it move down so the numbers stay 1…n |

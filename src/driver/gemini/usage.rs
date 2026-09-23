@@ -187,6 +187,7 @@ pub fn usage(driver: &GeminiDriver, login: &Login) -> Result<Usage, DriverError>
     Ok(Usage {
         windows: windows_at(&raw),
         fetched_at,
+        resets: None,
     })
 }
 

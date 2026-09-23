@@ -34,6 +34,7 @@ use crate::core::poll_policy::{
     SERVE_TTL_S,
 };
 use crate::core::store::{read_json, write_json_atomic, FileLock};
+use crate::driver::ResetBank;
 use crate::errors::Result;
 use crate::timefmt::format_ts;
 
@@ -156,6 +157,10 @@ pub struct Row {
     /// window at report time. `None` when neither was available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported_limit_resets_at: Option<f64>,
+    /// The banked limit resets the last good fetch reported. Written with
+    /// `last_good` and kept through failures, like it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets: Option<ResetBank>,
 }
 
 /// `usage.json` as stored.
@@ -195,6 +200,8 @@ pub struct Entry {
     pub claim_until: Option<f64>,
     pub reported_limit_at: Option<f64>,
     pub reported_limit_resets_at: Option<f64>,
+    /// The banked limit resets the last good fetch reported.
+    pub resets: Option<ResetBank>,
     /// Whether that report still outranks the stored measurement, resolved
     /// against the clock at snapshot time — like `trust_extended`, so every
     /// reader of one `entries()` pass judges it identically.
@@ -696,6 +703,7 @@ impl UsageStore {
                     claim_until: row.claim_until,
                     reported_limit_at: row.reported_limit_at,
                     reported_limit_resets_at: row.reported_limit_resets_at,
+                    resets: row.resets.clone(),
                     reported_limit_held: reported_limit_holds(row, now),
                 },
             );
@@ -770,11 +778,13 @@ impl UsageStore {
     /// clears the error, the backoff and the dead-token strikes — a success
     /// proves the token alive. `last_429_at` survives: the planner keeps the
     /// cadence floored while the saturated window ages out.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_success(
         &self,
         key: &str,
         claim: &str,
         windows: Vec<Window>,
+        resets: Option<ResetBank>,
         is_active: bool,
         threshold: f64,
         models: &[String],
@@ -823,6 +833,7 @@ impl UsageStore {
         } else {
             Some(stored)
         };
+        row.resets = resets;
         row.fetched_at = Some(now);
         row.last_attempt_at = Some(now);
         row.next_poll_at = Some(next_poll_at);
@@ -1099,7 +1110,7 @@ mod tests {
         let claims = store.reserve(&ident(), false, true).unwrap();
         let claim = claims["claude:1"].clone();
         store
-            .record_success("claude:1", &claim, windows, is_active, 80.0, &[])
+            .record_success("claude:1", &claim, windows, None, is_active, 80.0, &[])
             .unwrap();
     }
 
@@ -1176,7 +1187,7 @@ mod tests {
 
         // The late writer is dropped without touching the newer row.
         store
-            .record_success("claude:1", &stale, five(42.0), true, 80.0, &[])
+            .record_success("claude:1", &stale, five(42.0), None, true, 80.0, &[])
             .unwrap();
         assert_eq!(entry(&store).last_good, None);
         // A failure is fenced the same way.
@@ -1187,7 +1198,7 @@ mod tests {
 
         // The lease holder's write lands.
         store
-            .record_success("claude:1", &live, five(42.0), true, 80.0, &[])
+            .record_success("claude:1", &live, five(42.0), None, true, 80.0, &[])
             .unwrap();
         assert_eq!(entry(&store).last_good, Some(five(42.0)));
         // And the lease is released by recording.
@@ -1365,7 +1376,7 @@ mod tests {
         // holder's own outcome would be rejected in turn.
         assert!(live_claim(e.claim_until, store.now()));
         store
-            .record_success("claude:1", &live, five(10.0), true, 80.0, &[])
+            .record_success("claude:1", &live, five(10.0), None, true, 80.0, &[])
             .unwrap();
         assert_eq!(entry(&store).last_good, Some(five(10.0)));
     }

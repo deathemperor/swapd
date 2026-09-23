@@ -138,6 +138,7 @@ impl Driver for GeminiDriver {
             prefer: true,
             refresh: true,
             run: true,
+            reset: false,
         }
     }
     /// The Gemini CLI holds its own OAuth client; swapd captures what it wrote

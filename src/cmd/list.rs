@@ -179,6 +179,7 @@ mod tests {
             backoff_until: None,
             reported_limit_at: None,
             reported_limit_resets_at: None,
+            resets: None,
         }
     }
 

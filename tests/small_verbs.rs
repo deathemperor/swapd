@@ -917,3 +917,135 @@ fn config_refuses_to_write_a_settings_file_from_another_schema() {
     fx.run(&["config", "set", "claude.threshold", "60", "--json"]);
     assert_eq!(fx.settings()["schemaVersion"], 1);
 }
+
+/// `reset` spends the grant the provider names next, as that slot, and the
+/// board it reports carries the fetch made after the claim.
+#[test]
+fn reset_spends_the_next_grant_as_that_slot_and_reports_the_board() {
+    let fx = Fixture::new();
+    fx.board();
+    let bank = |left: u32| {
+        json!({"eligible": true, "at_limit": true, "next_grant_id": "launch",
+            "grants": [{"id": "launch", "label": "Launch: one reset", "resets_total": 1,
+                "resets_left": left, "ends_at": "2099-01-01T00:00:00Z", "paused": false,
+                "usable_now": left > 0, "use_requires_limit": false}]})
+    };
+    let usage = fx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/usage")
+            .query_param("cedar_ember", "1")
+            .header("Authorization", "Bearer tok-rt-2");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "five_hour": {"utilization": 100.0, "resets_at": "2099-01-01T00:00:00Z"},
+                "cedar_ember": bank(1),
+            }));
+    });
+    let claim = fx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/organizations/org-2/reset_rate_limits")
+            .header("Authorization", "Bearer tok-rt-2")
+            .json_body_partial(r#"{"program":"cedar_ember","grant_id":"launch"}"#);
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"result": "reset"}));
+    });
+
+    let out = fx.run(&["reset", "two@example.com", "--json"]);
+    claim.assert();
+    // The read before the claim and the forced fetch after it.
+    usage.assert_hits(2);
+    assert_eq!(account(&out, 2)["resets"]["available"], 1);
+    assert_eq!(account(&out, 2)["resets"]["label"], "Launch: one reset");
+    // The live login was never touched.
+    assert_eq!(out["providers"][0]["activeSlot"], 1);
+
+    // `list` serves the bank off the store, judged now.
+    let out = fx.run(&["list", "--json"]);
+    assert_eq!(account(&out, 2)["resets"]["nextGrantId"], "launch");
+    assert!(
+        account(&out, 1).get("resets").is_none(),
+        "no fetch, no bank"
+    );
+}
+
+/// The provider's refusal and a hold are errors with the reason, and no
+/// claim is sent for a hold.
+#[test]
+fn reset_refuses_a_held_or_refused_reset_with_the_reason() {
+    let fx = Fixture::new();
+    fx.board();
+    fx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/usage")
+            .header("Authorization", "Bearer tok-rt-2");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+                "cedar_ember": {"at_limit": false, "next_grant_id": "launch",
+                    "grants": [{"id": "launch", "resets_total": 1, "resets_left": 1,
+                        "usable_now": false, "use_requires_limit": true}]},
+            }));
+    });
+    let claim = fx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/organizations/org-2/reset_rate_limits");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"result": "not_limited"}));
+    });
+    let err = fx.run_err(&["reset", "2", "--json"]);
+    assert_eq!(err["error"]["code"], "invalid-input");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("at a limit"));
+    claim.assert_hits(0);
+
+    // Slot 3 carries no bank at all.
+    fx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/usage")
+            .header("Authorization", "Bearer tok-rt-3");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+            }));
+    });
+    let err = fx.run_err(&["reset", "3", "--json"]);
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no banked reset"));
+
+    // The provider's own word comes back when it refuses the claim.
+    fx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/usage")
+            .header("Authorization", "Bearer tok-rt-1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "five_hour": {"utilization": 100.0, "resets_at": "2099-01-01T00:00:00Z"},
+                "cedar_ember": {"at_limit": true, "next_grant_id": "launch",
+                    "grants": [{"id": "launch", "resets_total": 1, "resets_left": 1,
+                        "usable_now": true, "use_requires_limit": false}]},
+            }));
+    });
+    fx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/organizations/org-1/reset_rate_limits");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"result": "already_used"}));
+    });
+    let err = fx.run_err(&["reset", "1", "--json"]);
+    assert_eq!(err["error"]["code"], "http");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("already_used"));
+}

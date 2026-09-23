@@ -184,6 +184,7 @@ impl Driver for FakeDriver {
             Some(windows) => Ok(Usage {
                 windows: windows.clone(),
                 fetched_at: 0.0,
+                resets: None,
             }),
             None => Err(DriverError::Http("usage: http-500".to_string())),
         }
@@ -254,6 +255,7 @@ impl Driver for FakeDriver {
             prefer: true,
             refresh: true,
             run: true,
+            reset: true,
         }
     }
     fn oauth_begin(

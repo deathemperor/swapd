@@ -1,6 +1,6 @@
 [package]
 name = "swapd"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Multi-provider account switcher for AI coding CLIs"

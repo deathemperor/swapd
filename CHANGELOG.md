@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-09-23
 
 - `list` reports each account's banked limit resets (Claude's `/reset`, the `cedar_ember` program) as `resets` — how many are left, which grant spends next and why it cannot be spent right now — and `reset <ident>` spends one as that account without touching the live login. The usage request wears Claude Code's own agent string for it: the endpoint reports the bank to no other surface.
 

@@ -63,9 +63,13 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
             format!("slot {slot}'s reset cannot be spent now: {why}"),
         ));
     }
-    let grant = bank
-        .next_grant_id
-        .expect("a bank without a hold names its next grant");
+    // A bank with nothing left carries no hold and names no grant.
+    let grant = bank.next_grant_id.ok_or_else(|| {
+        SwapdError::new(
+            ErrorCode::InvalidInput,
+            format!("slot {slot} has no reset left"),
+        )
+    })?;
 
     // The slot's own identity, read at `add`; the profile only when it was
     // captured without one.
@@ -109,12 +113,14 @@ fn usage_refreshing(ctx: &Ctx, driver: &dyn Driver, slot: u32, login: &mut Login
     }
     match refresh_slot(ctx, driver, slot, login)? {
         Refreshed::Rotated(refreshed) | Refreshed::Adopted(refreshed) => *login = refreshed,
-        Refreshed::Failed(DriverError::TokenDead) => return Err(SwapdError::new(
-            ErrorCode::TokenDead,
-            format!(
+        Refreshed::Failed(DriverError::TokenDead) => {
+            return Err(SwapdError::new(
+                ErrorCode::TokenDead,
+                format!(
                 "slot {slot}'s login is expired and its refresh token was rejected; log in again"
             ),
-        )),
+            ))
+        }
         Refreshed::Failed(e) => return Err(e.into()),
     }
     driver.usage(login).map_err(SwapdError::from)

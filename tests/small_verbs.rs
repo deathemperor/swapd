@@ -1004,7 +1004,8 @@ fn reset_refuses_a_held_or_refused_reset_with_the_reason() {
         .contains("at a limit"));
     claim.assert_hits(0);
 
-    // Slot 3 carries no bank at all.
+    // Slot 3's bank is spent: a live grant with nothing left is no hold
+    // and no grant, and the refusal says so instead of panicking.
     fx.server.mock(|when, then| {
         when.method(GET)
             .path("/api/oauth/usage")
@@ -1013,15 +1014,38 @@ fn reset_refuses_a_held_or_refused_reset_with_the_reason() {
             .header("content-type", "application/json")
             .json_body(json!({
                 "five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+                "cedar_ember": {"at_limit": false, "next_grant_id": null,
+                    "grants": [{"id": "launch", "resets_total": 1, "resets_left": 0,
+                        "ends_at": "2099-01-01T00:00:00Z", "usable_now": false}]},
             }));
     });
     let err = fx.run_err(&["reset", "3", "--json"]);
+    assert_eq!(err["error"]["code"], "invalid-input");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no reset left"));
+
+    // And an account the program skips has no bank at all.
+    fx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/usage")
+            .header("Authorization", "Bearer tok-rt-1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+            }));
+    });
+    let err = fx.run_err(&["reset", "1", "--json"]);
     assert!(err["error"]["message"]
         .as_str()
         .unwrap()
         .contains("no banked reset"));
 
     // The provider's own word comes back when it refuses the claim.
+    let fx = Fixture::new();
+    fx.board();
     fx.server.mock(|when, then| {
         when.method(GET)
             .path("/api/oauth/usage")

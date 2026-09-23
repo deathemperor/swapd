@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 — 2026-09-23
 
 - A credential without a refresh token that Claude Code leaves in a slot's profile is no longer read back as a rotation. A stale, logged-out hashed keychain item shadowed one profile's seed, so every ignite or run there "rotated" the fresh login into that blank item and stored it, and the account asked for a re-login again minutes after each one.
 

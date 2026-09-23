@@ -158,12 +158,13 @@ impl ResetBank {
             .cooldown_until
             .as_deref()
             .filter(|s| parse_ts(s).is_some_and(|t| t > now));
+        // Nothing left is not held: there is nothing to hold.
         let hold = match next {
-            None if available > 0 => Some(ResetHold {
+            _ if available == 0 => None,
+            None => Some(ResetHold {
                 reason: ResetHoldReason::Blocked,
                 until: None,
             }),
-            None => None,
             Some(_) if cooling.is_some() => Some(ResetHold {
                 reason: ResetHoldReason::Cooldown,
                 until: cooling.map(str::to_string),

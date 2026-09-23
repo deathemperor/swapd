@@ -47,6 +47,14 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
                 format!("slot {slot} has no banked reset"),
             )
         })?;
+    // Nothing left comes before any hold: a spent bank is spent, whatever
+    // else is true of it.
+    if bank.available == 0 {
+        return Err(SwapdError::new(
+            ErrorCode::InvalidInput,
+            format!("slot {slot} has no reset left"),
+        ));
+    }
     if let Some(hold) = &bank.hold {
         let why = match hold.reason {
             ResetHoldReason::NotAtLimit => {
@@ -63,13 +71,9 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
             format!("slot {slot}'s reset cannot be spent now: {why}"),
         ));
     }
-    // A bank with nothing left carries no hold and names no grant.
-    let grant = bank.next_grant_id.ok_or_else(|| {
-        SwapdError::new(
-            ErrorCode::InvalidInput,
-            format!("slot {slot} has no reset left"),
-        )
-    })?;
+    let grant = bank
+        .next_grant_id
+        .expect("a bank with a reset left and no hold names its next grant");
 
     // The slot's own identity, read at `add`; the profile only when it was
     // captured without one.

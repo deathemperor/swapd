@@ -189,6 +189,7 @@ impl Driver for FakeDriver {
         Ok(Usage {
             windows,
             fetched_at: 1_757_000_000.0,
+            resets: None,
         })
     }
     fn ignite(
@@ -265,6 +266,7 @@ impl Driver for FakeDriver {
             prefer: true,
             refresh: true,
             run: true,
+            reset: true,
         }
     }
     fn oauth_begin(

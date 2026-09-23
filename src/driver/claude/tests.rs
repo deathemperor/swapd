@@ -102,15 +102,145 @@ mod http_tests {
     }
 
     #[test]
+    fn usage_keeps_the_banked_resets_and_a_claim_spends_one() {
+        let server = MockServer::start();
+        let usage = server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/usage");
+            then.status(200).header("content-type", "application/json").body(
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2026-09-09T15:59:59Z"},
+                    "cedar_ember":{"eligible":true,"at_limit":false,"next_grant_id":"launch",
+                      "cooldown_until":null,"weekly_resets_at":"2026-09-30T02:00:00+00:00",
+                      "grants":[{"id":"launch","label":"Launch: one reset","resets_total":1,
+                        "resets_left":1,"ends_at":"2026-10-22T16:00:00+00:00","paused":false,
+                        "usable_now":true,"use_requires_limit":false},
+                       {"id":"old","resets_total":2,"resets_left":0,"ends_at":"2026-01-01T00:00:00Z",
+                        "paused":false,"usable_now":false,"use_requires_limit":true}]}}"#,
+            );
+        });
+        let raw = usage::fetch(&endpoints_at(&server), "at-1").unwrap();
+        usage.assert();
+        let bank = usage::reset_bank(&raw).expect("a bank");
+        assert_eq!(bank.next_grant_id.as_deref(), Some("launch"));
+        assert_eq!(bank.grants.len(), 2);
+
+        // Judged at list time: the lapsed grant is out of the counts, the
+        // live one is what a caller may spend.
+        let view = bank.view(1_770_000_000.0).expect("a view");
+        assert_eq!((view.available, view.total), (1, 1));
+        assert_eq!(view.next_grant_id.as_deref(), Some("launch"));
+        assert_eq!(view.label.as_deref(), Some("Launch: one reset"));
+        assert_eq!(view.hold, None);
+        // Once every grant has lapsed there is nothing to report at all.
+        assert_eq!(bank.view(1_800_000_000.0), None);
+        // A response without the block is an account the program skips.
+        assert_eq!(
+            usage::reset_bank(&serde_json::json!({"five_hour": {}})),
+            None
+        );
+
+        let claim = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/organizations/org-0000/reset_rate_limits")
+                .header("authorization", "Bearer at-1")
+                .header("anthropic-beta", oauth::BETA_HEADER)
+                .header("user-agent", oauth::RESET_USER_AGENT)
+                .json_body_partial(r#"{"program":"cedar_ember","grant_id":"launch"}"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"result":"reset"}"#);
+        });
+        let outcome =
+            usage::claim_reset(&endpoints_at(&server), "at-1", "org-0000", "launch").unwrap();
+        claim.assert();
+        assert_eq!(outcome.result, "reset");
+    }
+
+    #[test]
+    fn a_bank_says_why_its_reset_cannot_be_spent() {
+        use crate::contract::ResetHoldReason;
+        use crate::driver::{ResetBank, ResetGrant};
+        let grant = |usable_now: bool, use_requires_limit: bool| ResetGrant {
+            id: "g".to_string(),
+            resets_left: 1,
+            resets_total: 1,
+            usable_now,
+            use_requires_limit,
+            ..ResetGrant::default()
+        };
+        let bank = |grant: ResetGrant,
+                    next: Option<&str>,
+                    cooldown: Option<&str>,
+                    at_limit: bool| ResetBank {
+            at_limit,
+            next_grant_id: next.map(str::to_string),
+            cooldown_until: cooldown.map(str::to_string),
+            grants: vec![grant],
+        };
+        let now = 1_760_000_000.0;
+        let reason = |b: ResetBank| b.view(now).unwrap().hold.map(|h| h.reason);
+        // Spends only at a limit, and the account is not at one.
+        assert_eq!(
+            reason(bank(grant(false, true), Some("g"), None, false)),
+            Some(ResetHoldReason::NotAtLimit)
+        );
+        // At a limit the same grant is spendable — the provider says so.
+        assert_eq!(reason(bank(grant(true, true), Some("g"), None, true)), None);
+        // A running cooldown outranks the grant's own flag, and names its end.
+        let held = bank(
+            grant(true, false),
+            Some("g"),
+            Some("2030-01-01T00:00:00Z"),
+            false,
+        )
+        .view(now)
+        .unwrap()
+        .hold
+        .unwrap();
+        assert_eq!(held.reason, ResetHoldReason::Cooldown);
+        assert_eq!(held.until.as_deref(), Some("2030-01-01T00:00:00Z"));
+        // A lapsed cooldown is no hold.
+        assert_eq!(
+            reason(bank(
+                grant(true, false),
+                Some("g"),
+                Some("2020-01-01T00:00:00Z"),
+                false
+            )),
+            None
+        );
+        // Resets left but the provider names no grant to spend them from.
+        assert_eq!(
+            reason(bank(grant(true, false), None, None, false)),
+            Some(ResetHoldReason::Blocked)
+        );
+        // Nothing left: no hold, and nothing to spend.
+        let empty = bank(
+            ResetGrant {
+                resets_left: 0,
+                ..grant(false, false)
+            },
+            None,
+            None,
+            false,
+        )
+        .view(now)
+        .unwrap();
+        assert_eq!((empty.available, empty.hold), (0, None));
+    }
+
+    #[test]
     fn usage_maps_five_hour_seven_day_scoped_spend() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/api/oauth/usage")
+                .query_param("cedar_ember", "1")
                 .header("authorization", "Bearer at-1")
                 // cswap sends the beta header on the usage request (and only
                 // there); without it the endpoint does not answer.
-                .header("anthropic-beta", oauth::BETA_HEADER);
+                .header("anthropic-beta", oauth::BETA_HEADER)
+                // The banked resets are reported to Claude Code's surface only.
+                .header("user-agent", oauth::RESET_USER_AGENT);
             then.status(200)
                 .header("content-type", "application/json")
                 .body(USAGE);

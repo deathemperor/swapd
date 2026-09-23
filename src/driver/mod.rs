@@ -89,6 +89,120 @@ pub struct Identity {
 pub struct Usage {
     pub windows: Vec<crate::contract::Window>,
     pub fetched_at: f64,
+    /// The account's banked limit resets, when the provider reports any.
+    pub resets: Option<ResetBank>,
+}
+
+/// The provider's own account of an account's banked limit resets (Claude's
+/// `cedar_ember` block), kept as reported so a later `list` can judge it
+/// against its own clock. Stored beside the windows; no secret in it.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResetBank {
+    pub at_limit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_grant_id: Option<String>,
+    /// RFC 3339, when a reset was spent recently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    pub grants: Vec<ResetGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResetGrant {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub resets_left: u32,
+    pub resets_total: u32,
+    /// RFC 3339; a grant past it is over whatever `resets_left` says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<String>,
+    pub paused: bool,
+    pub usable_now: bool,
+    /// The grant spends only while the account is at a limit.
+    pub use_requires_limit: bool,
+}
+
+impl ResetBank {
+    /// What a caller may do with the bank at `now`: the live grants' counts,
+    /// the grant the provider spends next and the hold on spending it. `None`
+    /// when no grant is live, so an account without resets carries no block.
+    pub fn view(&self, now: f64) -> Option<crate::contract::Resets> {
+        use crate::contract::{ResetHold, ResetHoldReason, Resets};
+        let live: Vec<&ResetGrant> = self
+            .grants
+            .iter()
+            .filter(|g| {
+                !g.paused
+                    && !g
+                        .ends_at
+                        .as_deref()
+                        .and_then(parse_ts)
+                        .is_some_and(|t| t <= now)
+            })
+            .collect();
+        if live.is_empty() {
+            return None;
+        }
+        let available = live.iter().map(|g| g.resets_left).sum();
+        let total = live.iter().map(|g| g.resets_total).sum();
+        let next = self
+            .next_grant_id
+            .as_deref()
+            .and_then(|id| live.iter().find(|g| g.id == id))
+            .copied();
+        let shown = next.unwrap_or(live[0]);
+        let cooling = self
+            .cooldown_until
+            .as_deref()
+            .filter(|s| parse_ts(s).is_some_and(|t| t > now));
+        // Nothing left is not held: there is nothing to hold.
+        let hold = match next {
+            _ if available == 0 => None,
+            None => Some(ResetHold {
+                reason: ResetHoldReason::Blocked,
+                until: None,
+            }),
+            Some(_) if cooling.is_some() => Some(ResetHold {
+                reason: ResetHoldReason::Cooldown,
+                until: cooling.map(str::to_string),
+            }),
+            Some(g) if !g.usable_now => Some(ResetHold {
+                reason: if g.use_requires_limit && !self.at_limit {
+                    ResetHoldReason::NotAtLimit
+                } else {
+                    ResetHoldReason::Blocked
+                },
+                until: None,
+            }),
+            Some(_) => None,
+        };
+        Some(Resets {
+            available,
+            total,
+            next_grant_id: next.map(|g| g.id.clone()),
+            label: shown.label.clone(),
+            ends_at: shown.ends_at.clone(),
+            hold,
+        })
+    }
+}
+
+/// An RFC 3339 instant as unix seconds; `None` for anything else.
+fn parse_ts(s: &str) -> Option<f64> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp() as f64)
+}
+
+/// What the provider answered a reset claim with: `reset` when it spent one;
+/// otherwise its own word for the refusal (`already_used`, `not_limited`,
+/// `cooldown`, `ineligible`, `unavailable`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResetOutcome {
+    pub result: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -318,6 +432,8 @@ pub struct Caps {
     pub prefer: bool,
     pub refresh: bool,
     pub run: bool,
+    /// The provider banks limit resets an account can spend (`reset`).
+    pub reset: bool,
 }
 
 /// A browser sign-in that has been started but not yet redeemed.
@@ -392,6 +508,17 @@ pub trait Driver: Send + Sync {
     /// when the login's access token is expired or the server rejects it — a
     /// driver never refreshes behind the caller's back.
     fn usage(&self, login: &Login) -> Result<Usage, DriverError>;
+    /// Spend one banked limit reset (`grant_id`, from `Usage::resets`) on
+    /// the organization this login belongs to. `NeedsRefresh` and `Throttled`
+    /// as for `usage`; the provider's own refusal is an `Ok` outcome.
+    fn reset(
+        &self,
+        _login: &Login,
+        _organization_uuid: &str,
+        _grant_id: &str,
+    ) -> Result<ResetOutcome, DriverError> {
+        Err(DriverError::Unsupported("reset"))
+    }
     /// Make one minimal request as this login, in the slot's own run profile.
     ///
     /// `Ok` for any *normal* exit, zero or not, carrying both the exit code and
@@ -635,6 +762,7 @@ mod tests {
                 prefer: true,
                 refresh: true,
                 run: true,
+                reset: true,
             }
         );
     }
@@ -656,6 +784,7 @@ mod tests {
                 prefer: true,
                 refresh: true,
                 run: true,
+                reset: false,
             }
         );
     }

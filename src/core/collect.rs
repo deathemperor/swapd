@@ -30,7 +30,7 @@ use crate::core::slots::{self, ProviderSlots, Slot, SlotsFile};
 use crate::core::store::{read_json, FileLock};
 use crate::core::usage_store::{Entry, STALE_OK_S};
 use crate::ctx::Ctx;
-use crate::driver::{Driver, DriverError, Login};
+use crate::driver::{Driver, DriverError, Login, ResetBank};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::secrets::slot_key;
 use crate::timefmt::format_ts;
@@ -945,7 +945,7 @@ fn fetch_one(
 
     match provider.usage(login) {
         Ok(usage) => {
-            record_success(ctx, st, claim, usage.windows)?;
+            record_success(ctx, st, claim, usage.windows, usage.resets)?;
             Ok(Fetched {
                 sentinel: None,
                 live_synced,
@@ -1193,7 +1193,7 @@ fn refresh_then_usage(
     // rather than spending another refresh token on it.
     match provider.usage(&refreshed) {
         Ok(usage) => {
-            record_success(ctx, st, claim, usage.windows)?;
+            record_success(ctx, st, claim, usage.windows, usage.resets)?;
             Ok(Fetched {
                 sentinel: None,
                 live_synced,
@@ -1209,11 +1209,18 @@ fn refresh_then_usage(
     }
 }
 
-fn record_success(ctx: &Ctx, st: &SlotState, claim: &str, windows: Vec<Window>) -> Result<()> {
+fn record_success(
+    ctx: &Ctx,
+    st: &SlotState,
+    claim: &str,
+    windows: Vec<Window>,
+    resets: Option<ResetBank>,
+) -> Result<()> {
     ctx.store.record_success(
         &st.key,
         claim,
         windows,
+        resets,
         st.active,
         ctx.settings.threshold,
         &ctx.settings.models,
@@ -1320,6 +1327,9 @@ fn account_view(st: &SlotState, entry: &Entry, now: f64) -> AccountView {
             .then_some(entry.reported_limit_resets_at)
             .flatten()
             .and_then(format_ts),
+        // Judged now, not at fetch time: a grant lapses and a cooldown lifts
+        // between polls, and a caller reads the hold to decide on a `reset`.
+        resets: entry.resets.as_ref().and_then(|bank| bank.view(now)),
     }
 }
 

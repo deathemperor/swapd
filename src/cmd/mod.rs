@@ -22,6 +22,7 @@ pub mod prefer;
 pub mod refresh;
 pub mod remove;
 pub mod reorder;
+pub mod reset;
 pub mod rotate;
 pub mod run;
 pub mod switch;

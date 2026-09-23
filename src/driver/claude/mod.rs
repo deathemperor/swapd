@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use crate::driver::claude::live::ClaudeDriver;
 use crate::driver::{
     Caps, Driver, DriverError, Env, Identity, IgniteFailure, IgniteOutcome, Login, OauthStart,
-    RunProfile, Usage,
+    ResetOutcome, RunProfile, Usage,
 };
 
 impl Driver for ClaudeDriver {
@@ -112,8 +112,23 @@ impl Driver for ClaudeDriver {
             .unwrap_or(0.0);
         Ok(Usage {
             windows: usage::windows_at(&raw, fetched_at),
+            resets: usage::reset_bank(&raw),
             fetched_at,
         })
+    }
+
+    fn reset(
+        &self,
+        login: &Login,
+        organization_uuid: &str,
+        grant_id: &str,
+    ) -> Result<ResetOutcome, DriverError> {
+        if oauth::is_expired(login, oauth::now_ms()) {
+            return Err(DriverError::NeedsRefresh);
+        }
+        let access_token = oauth::access_token(login)
+            .ok_or_else(|| DriverError::Invalid("no access token".to_string()))?;
+        usage::claim_reset(&self.endpoints, &access_token, organization_uuid, grant_id)
     }
 
     fn ignite(&self, env: &Env, slot: u32, login: &Login) -> Result<IgniteOutcome, IgniteFailure> {
@@ -168,6 +183,7 @@ impl Driver for ClaudeDriver {
             prefer: true,
             refresh: true,
             run: true,
+            reset: true,
         }
     }
 

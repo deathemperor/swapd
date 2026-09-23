@@ -18,6 +18,13 @@ use crate::http;
 /// (`oauth.py:16`). The usage endpoint only; `fetch_oauth_profile` sends no
 /// beta header, and we send exactly what cswap sends.
 pub const BETA_HEADER: &str = "oauth-2025-04-20";
+/// The usage endpoint only reports banked limit resets (`cedar_ember`) to
+/// Claude Code's own surface — any other agent string earns
+/// `ineligible_reason: "surface"` — so the usage and reset requests wear
+/// the CLI's. Eligibility, not identity: the token says who is asking.
+pub const RESET_USER_AGENT: &str = "claude-cli/2.1.280 (external, cli)";
+/// A reset claim is slow on the provider's side; the CLI waits 25 s.
+pub const RESET_TIMEOUT_S: u64 = 25;
 
 /// Treat a token as expired this long before its stated expiry
 /// (`oauth.py:17`), so a refresh happens before a request can 401.
@@ -73,7 +80,14 @@ pub fn profile_url(ep: &Endpoints) -> String {
 }
 
 pub fn usage_url(ep: &Endpoints) -> String {
-    format!("{}/api/oauth/usage", ep.api)
+    format!("{}/api/oauth/usage?cedar_ember=1", ep.api)
+}
+
+pub fn reset_url(ep: &Endpoints, organization_uuid: &str) -> String {
+    format!(
+        "{}/api/organizations/{organization_uuid}/reset_rate_limits",
+        ep.api
+    )
 }
 
 /// The loopback port the OAuth client is registered to redirect to.
@@ -611,7 +625,15 @@ mod tests {
             "http://web.test/cai/oauth/authorize"
         );
         assert_eq!(profile_url(&ep), "http://api.test/api/oauth/profile");
-        assert_eq!(usage_url(&ep), "http://api.test/api/oauth/usage");
+        // `cedar_ember=1` asks for the banked resets beside the windows.
+        assert_eq!(
+            usage_url(&ep),
+            "http://api.test/api/oauth/usage?cedar_ember=1"
+        );
+        assert_eq!(
+            reset_url(&ep, "org-0000"),
+            "http://api.test/api/organizations/org-0000/reset_rate_limits"
+        );
     }
 
     #[test]

@@ -92,6 +92,58 @@ pub struct AccountView {
     /// without one and none could be read off the stored 5-hour window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported_limit_resets_at: Option<String>,
+    /// The limit resets Claude has banked for this account (the CLI's
+    /// `/reset`, program `cedar_ember`), as the last good fetch reported them
+    /// and judged against the clock at list time. Absent when the provider
+    /// grants none, the account holds none that are live, or no fetch has
+    /// succeeded yet. `swapd reset <ident>` spends one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets: Option<Resets>,
+}
+
+/// One account's banked limit resets, the way a caller decides whether to
+/// offer a `reset`: how many are left across every live grant, which grant
+/// the provider would spend next and what stops it from being spent now.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Resets {
+    /// Resets left across the live grants.
+    pub available: u32,
+    /// Resets those grants started with.
+    pub total: u32,
+    /// The grant the provider spends next; absent when it names none that is
+    /// live, in which case `hold` says `blocked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_grant_id: Option<String>,
+    /// The provider's own wording for that grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// When that grant lapses, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<String>,
+    /// Why a reset cannot be spent right now; absent when one can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold: Option<ResetHold>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetHold {
+    pub reason: ResetHoldReason,
+    /// When the hold lifts, RFC 3339; only a cooldown has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResetHoldReason {
+    /// The grant only spends once the account is at a limit, and it is not.
+    NotAtLimit,
+    /// A reset was spent recently; `until` says when the next may be.
+    Cooldown,
+    /// The provider names no spendable grant.
+    Blocked,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -236,6 +288,7 @@ mod tests {
                     backoff_until: None,
                     reported_limit_at: None,
                     reported_limit_resets_at: None,
+                    resets: None,
                 }],
             }],
         };

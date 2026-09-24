@@ -1238,6 +1238,40 @@ fn all_exhausted_emits_earliest_reset() {
     assert_eq!(sleep["until"], format_ts(T0 + MAX_SLEEP_S).unwrap());
 }
 
+/// A spent account whose stored reset is already behind the clock came back
+/// at that reset: its reading predates the rollover, and its row is due again
+/// within a minute of it. The engine re-checks at its own cadence and lands
+/// on it, instead of crawling at the no-reset fallback past the moment it
+/// returned (every thread stopped at the limit for those five minutes).
+#[test]
+fn a_reset_already_passed_is_rechecked_at_cadence_not_crawled() {
+    let board = Board::new();
+    board.driver.set_usage(
+        "one@example.com",
+        vec![window(WindowKind::FiveHour, 100.0, T0 + 7200.0)],
+    );
+    board.driver.set_usage(
+        "two@example.com",
+        vec![window(WindowKind::FiveHour, 100.0, T0 + 30.0)],
+    );
+    assert_eq!(board.tick(), TickOutcome::Blocked);
+
+    // Slot 2's window rolls over; its row is not refetched until reset + slack.
+    board.driver.set_usage("two@example.com", cold(40.0, T0));
+    board.advance(60.0);
+    let (outcome, delay) = board.tick_and_schedule();
+    assert_eq!(outcome, TickOutcome::Blocked);
+    assert_eq!(
+        board.last("all-exhausted").unwrap()["earliestResetAt"],
+        format_ts(T0 + 30.0).unwrap()
+    );
+    assert_eq!(delay, board.ctx().settings.interval_seconds);
+
+    board.advance(delay);
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    assert_eq!(board.live_email(), "two@example.com");
+}
+
 /// The two ways a tick can find nobody to watch: a live login no slot owns
 /// (adding it is the fix), and no live login at all. Neither is acted on —
 /// switching would overwrite a credential no slot holds a copy of.

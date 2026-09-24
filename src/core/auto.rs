@@ -1229,17 +1229,18 @@ impl<'a> AutoEngine<'a> {
     /// whose exhausted windows carry no reset at all makes the whole answer
     /// unprovable: it could recover at any moment, and sleeping toward another
     /// account's later reset would miss it.
+    ///
+    /// A reset already behind the clock is kept: that account is back, its
+    /// reading just predates the rollover, and a past `at` makes `schedule`
+    /// wait the plain interval for the fetch that shows it. Treating it as
+    /// unprovable crawled at `NO_RESET_FALLBACK_S` past the moment it returned.
     fn earliest_recovery(&self, snap: &Snapshot, models: &[String]) -> Option<f64> {
-        let now = self.ctx.now();
         let mut earliest: Option<f64> = None;
         for windows in snap.windows.values() {
             if !relevant(windows, models).iter().any(|w| w.pct >= 100.0) {
                 continue;
             }
             let usable_at = limiting_reset_ts(windows, models)?;
-            if usable_at <= now {
-                return None;
-            }
             earliest = Some(earliest.map_or(usable_at, |e: f64| e.min(usable_at)));
         }
         earliest

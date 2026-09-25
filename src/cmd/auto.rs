@@ -1,14 +1,15 @@
 //! `swapd auto` — run the switching daemon, and stream what it decides.
 //!
 //! The loop is deliberately thin: `core::auto::AutoEngine` owns every
-//! decision, this owns the process. Three things live here because they are
+//! decision, this owns the process. Four things live here because they are
 //! about being a daemon rather than about switching accounts — the mutex that
-//! admits one engine per data dir, the supervised-child stdin watch, and the
-//! sleep between ticks.
+//! admits one engine per data dir, the supervised-child stdin watch, the
+//! wake-file watch, and the sleep between ticks.
 //!
-//! Idle cost between ticks is a blocked `recv_timeout` and, when supervised, a
-//! thread blocked in `read`: no polling loop, no timer thread, nothing that
-//! wakes to discover it has nothing to do.
+//! Idle cost between ticks is a blocked `recv_timeout`, one thread that reads
+//! the wake file once a second (`core::wake` — the one poll here, and the
+//! price of a wake any process can send without holding this one's stdin)
+//! and, when supervised, a thread blocked in `read`.
 
 use std::io::{BufRead as _, Write as _};
 use std::sync::mpsc;
@@ -19,6 +20,7 @@ use serde_json::json;
 use crate::core::auto::AutoEngine;
 use crate::core::events::{Emit, Event};
 use crate::core::store::FileLock;
+use crate::core::wake;
 use crate::ctx::Ctx;
 use crate::driver::Driver;
 use crate::errors::{ErrorCode, Result};
@@ -69,10 +71,20 @@ pub fn run(ctx: Ctx, driver: &dyn Driver, json: bool) -> Result<i32> {
     // an idle daemon costs nothing between ticks. The sender is kept alive for
     // the loop's lifetime on purpose — dropping it would make every
     // `recv_timeout` return `Disconnected` at once and spin the loop.
-    let (wake, rx) = mpsc::channel::<()>();
+    let (wakes, rx) = mpsc::channel::<()>();
     if ctx.env.vars.get(SUPERVISED_ENV).map(String::as_str) == Some("1") {
-        watch_stdin(wake.clone());
+        watch_stdin(wakes.clone());
     }
+    // Any process that changes the store can wake the daemon, not only one
+    // holding its stdin: `add` at a terminal, `add-oauth` from the app,
+    // `limit-hit` from the server — and the daemon the menu-bar helper runs
+    // under launchd has no supervisor at all. Same channel, so a burst of
+    // nudges collapses the way a burst of lines does.
+    wake::watch(
+        ctx.home.auto_wake_file(),
+        wake::POLL_INTERVAL,
+        wakes.clone(),
+    );
 
     let mut engine = AutoEngine::new(ctx, driver, Box::new(move |emit| print_event(emit, json)));
     loop {
@@ -80,9 +92,10 @@ pub fn run(ctx: Ctx, driver: &dyn Driver, json: bool) -> Result<i32> {
         let delay = engine.schedule(outcome, rand::random::<f64>);
         match rx.recv_timeout(Duration::from_secs_f64(delay.max(0.0))) {
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            // Woken early by the supervisor. Whatever it knows is already in
-            // the store (`swapd limit-hit`), so the wake carries nothing but
-            // "look now" — and a burst of them is one tick, not one each.
+            // Woken early: a supervisor's line, or a verb's nudge through the
+            // wake file. Whatever the sender knew is already in the store
+            // (`swapd limit-hit`, `swapd add`), so the wake carries nothing
+            // but "look now" — and a burst of them is one tick, not one each.
             Ok(()) => {
                 drain(&rx);
                 continue;

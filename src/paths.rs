@@ -103,6 +103,13 @@ impl Home {
         self.root.join("auto")
     }
 
+    /// The daemon's wake file (`core::wake`): a verb that changed what `auto`
+    /// decides on writes a fresh nonce here on its way out, and a sleeping
+    /// daemon ticks when it sees one. Read for its change, never its meaning.
+    pub fn auto_wake_file(&self) -> PathBuf {
+        self.root.join("auto.wake")
+    }
+
     pub fn credentials_dir(&self) -> PathBuf {
         self.root.join("credentials")
     }

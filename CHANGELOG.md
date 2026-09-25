@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3 — 2026-09-25
 
 - `auto` re-checks at its normal interval, not the five-minute no-reset crawl, when every account reads spent but one's stored reset is already behind the clock. That account came back at its reset and its reading only predated the rollover; the engine read the past reset as "no provable recovery", reported `all-exhausted` with no `earliestResetAt`, and slept five minutes before the fetch that would have shown it, so every session stayed stopped at the limit for that long. `earliestResetAt` now names the reset that passed.
 

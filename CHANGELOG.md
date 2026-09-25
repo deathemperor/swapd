@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `auto` wakes the moment a verb changes what it decides on, whichever process ran the verb: `add`, `add-oauth`, `add-token`, `import`, `remove`, `compact`, `switch`, `rotate`, `hold`, `unhold`, `prefer`, `auto-ignite`, `reorder`, `alias`, `limit-hit`, `reset` and `config set`/`unset` each write a fresh nonce to `<home>/auto.wake` on their way out, and a sleeping daemon reads that file once a second and ticks when it changes. Until now the only wake was a line on a supervised daemon's stdin, and the daemon Infinitus's menu-bar helper installs runs under launchd with no supervisor at all — so an account signed in through the app while every other read spent waited out the ten-minute `all-exhausted` sleep (six accounts spent, a seventh added at 15:23, the switch made by hand at 15:26, the daemon's next look at 15:32), and a refusal the server reported with `limit-hit` was read a poll later rather than at once.
+
 ## 0.3.3 — 2026-09-25
 
 - `auto` re-checks at its normal interval, not the five-minute no-reset crawl, when every account reads spent but one's stored reset is already behind the clock. That account came back at its reset and its reading only predated the rollover; the engine read the past reset as "no provable recovery", reported `all-exhausted` with no `earliestResetAt`, and slept five minutes before the fetch that would have shown it, so every session stayed stopped at the limit for that long. `earliestResetAt` now names the reset that passed.

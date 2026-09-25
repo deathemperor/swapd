@@ -1,9 +1,11 @@
-//! `swapd auto` as a process: the daemon mutex and the supervised exit.
+//! `swapd auto` as a process: the daemon mutex, the supervised exit and the
+//! wake another process sends.
 //!
 //! The engine's decisions are unit-tested in `src/core/auto.rs`, where a fake
 //! driver and an injected clock can drive a tick directly. What can only be
-//! tested out here is what a SECOND process sees (the mutex) and what happens
-//! when the parent goes away (the supervised stdin watch) — so these two tests
+//! tested out here is what a SECOND process sees (the mutex), what happens
+//! when the parent goes away (the supervised stdin watch) and what a verb run
+//! elsewhere does to a sleeping daemon (the wake file) — so these three tests
 //! are the only ones that pay for spawning a binary.
 //!
 //! Same hermetic contract as the other suites: a temp swapd home, a temp
@@ -14,6 +16,7 @@
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt as _;
@@ -64,6 +67,48 @@ impl Fixture {
             .expect("the daemon must emit its first event before it sleeps")
             .unwrap();
         (child, serde_json::from_str(&first).unwrap())
+    }
+
+    /// Start an unsupervised daemon and keep reading its stream on a thread:
+    /// every event, in order, as it is written. The reader ends with the pipe.
+    fn start_streaming(&self) -> (Child, mpsc::Receiver<Value>) {
+        let mut child = self
+            .cmd()
+            .args(["auto", "--json"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (events, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        (child, rx)
+    }
+}
+
+/// The next event of `kind` on the stream, or `None` once `within` has passed.
+fn next_event(events: &mpsc::Receiver<Value>, kind: &str, within: Duration) -> Option<Value> {
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match events.recv_timeout(left) {
+            Ok(event) if event["event"] == kind => return Some(event),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
     }
 }
 
@@ -160,4 +205,51 @@ fn second_auto_is_refused() {
     assert_eq!(first.try_wait().unwrap(), None);
     first.kill().unwrap();
     first.wait().unwrap();
+}
+
+/// How long a wake is given to reach the daemon. The watcher reads the wake
+/// file once a second, so a few seconds is generous — but the idle sleep it
+/// cuts short is about a minute, and the assertion below checks that, so a
+/// poll inside this deadline can only be the wake.
+const WAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long the first tick's events are given to arrive.
+const STREAM_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A verb that changed the daemon's picture wakes it, from any process. The
+/// daemon runs unsupervised under the menu-bar helper's launch agent, so the
+/// stdin line is not how the app's `add-oauth` or the server's `limit-hit`
+/// reach it — the wake file is (`core::wake`). An idle tick sleeps about a
+/// minute; the next poll arriving within seconds of the nudge is the proof.
+#[test]
+fn a_store_change_wakes_a_sleeping_daemon() {
+    let fixture = Fixture::new();
+    let (mut child, events) = fixture.start_streaming();
+    let first_sleep = next_event(&events, "sleep", STREAM_DEADLINE)
+        .expect("the first tick must end in a sleep event");
+    let idle_s = first_sleep["seconds"].as_f64().unwrap();
+    assert!(
+        idle_s > 2.0 * WAKE_DEADLINE.as_secs_f64(),
+        "the idle sleep ({idle_s}s) must be long enough to tell a wake from a tick"
+    );
+
+    // `config set` in another process: a policy knob the next tick reads.
+    let set = fixture
+        .cmd()
+        .args(["config", "set", "claude.threshold", "80"])
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let woke = next_event(&events, "poll", WAKE_DEADLINE);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        woke.is_some(),
+        "a store change must wake the daemon within {WAKE_DEADLINE:?} (it was asleep for {idle_s}s)"
+    );
 }

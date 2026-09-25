@@ -209,6 +209,39 @@ enum ConfigAction {
     Unset { key: String },
 }
 
+impl Command {
+    /// Whether the verb, once it has succeeded, changed something a running
+    /// `auto` decides on — the fleet, the live login, a flag, a reported
+    /// refusal, a policy knob — and so should wake it (`core::wake`). The
+    /// verbs that only read, run a CLI, or relabel a row (`icon`) are left
+    /// off: a tick spent on them learns nothing. `alias` is on, because
+    /// `preferred` may name one.
+    fn wakes_the_daemon(&self) -> bool {
+        matches!(
+            self,
+            Command::Add { .. }
+                | Command::AddOauth { .. }
+                | Command::AddToken { .. }
+                | Command::Import { .. }
+                | Command::Switch { .. }
+                | Command::Rotate { .. }
+                | Command::Alias { .. }
+                | Command::LimitHit { .. }
+                | Command::Prefer { .. }
+                | Command::AutoIgnite { .. }
+                | Command::Reset { .. }
+                | Command::Hold { .. }
+                | Command::Unhold { .. }
+                | Command::Reorder { .. }
+                | Command::Compact
+                | Command::Remove { .. }
+                | Command::Config {
+                    action: ConfigAction::Set { .. } | ConfigAction::Unset { .. },
+                }
+        )
+    }
+}
+
 /// The provider a single-provider verb operates on.
 pub const DEFAULT_PROVIDER: &str = "claude";
 
@@ -290,7 +323,17 @@ fn main() {
     let json = cli.json;
     let result = run(&cli);
     match result {
-        Ok(()) => {}
+        Ok(()) => {
+            // After the verb's own output: the daemon's next look is a
+            // consequence of the verb, not part of its answer. `Home::resolve`
+            // rather than a context, so nothing here creates a data dir; a
+            // nudge with nowhere to land (no dir, no daemon) is nothing.
+            if cli.command.wakes_the_daemon() {
+                if let Ok(home) = Home::resolve() {
+                    core::wake::nudge(&home);
+                }
+            }
+        }
         Err(err) => {
             output::emit_error(&err, json);
             std::process::exit(1);

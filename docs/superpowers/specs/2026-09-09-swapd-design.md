@@ -271,7 +271,12 @@ that driver's sub-spec is written.
   `SWAPD_SUPERVISED=1` the daemon exits on stdin EOF, and any line
   written to it means "re-evaluate now" — the wake carries nothing, since
   whatever the supervisor knows it has already written to the store
-  (`limit-hit`); queued wakes collapse into one tick.
+  (`limit-hit`); queued wakes collapse into one tick. The same wake
+  reaches an unsupervised daemon through `<home>/auto.wake` (2026-09-25):
+  every verb that changes what the daemon decides on — the fleet, the
+  live login, a flag, a reported refusal, a policy knob — writes a fresh
+  nonce there on its way out, and a sleeping daemon reads the file once
+  a second and ticks when the nonce has changed.
 - **Reported limits**: the usage endpoint lags a real limit by up to a
   poll interval, so a consumer that is refused reports it with
   `limit-hit`. The row's report overrides the stored 5-hour window for
@@ -387,5 +392,6 @@ TUI, directory mappings, session resume, cmux, Slack/Telegram sending
 - The auto tick nominates fetches like cswap `_collect_scheduled_usage` (active if due + one due candidate + escalation band) via `CollectOpts.only`; consume-first re-measures `{current, target}` before committing.
 - `collect` = `prepare` (lock, live, secrets, adopt/heal) + `execute` (fetch set); the auto tick prepares once and re-prepares after a switch; a second `execute` re-reads only the slots it claimed so a rotated token is never re-spent.
 - `ignite`/`run`: refresh-if-expired first; `rotated` persisted before a non-zero exit is reported; `run` on the active slot execs directly (same-account fast path); the profile seed marker advances only after the rotation is persisted (`commit_profile`); `remove` calls `forget_profile`, then `core::compact` renumbers the slots above it (row, credential, usage row, profile dir + keychain item via `relocate_profile`, quarantine entry, `preferred` pins); `run`/`ignite` hold a shared `run-<provider>-<slot>.lock` for the child's lifetime and a slot whose lock is held stops the renumber.
+- A running daemon is woken by the store-changing verbs through `<home>/auto.wake`, not only by a line on a supervised stdin (2026-09-25): the daemon Infinitus's menu-bar helper installs runs under launchd with `SWAPD_SUPERVISED=0` and no stdin, the app's `add-oauth` and the server's `limit-hit` run in processes that hold no pipe to it either, and a wake only a supervisor can send is a wake that never comes. Six accounts read spent, a seventh was signed in through the app at 15:23, the daemon was ten minutes into its `all-exhausted` sleep and looked again at 15:32; the switch had been made by hand at 15:26. The nudge is a fresh nonce written temp-and-rename (content compared, not mtime — a same-second nudge must not be lost to a coarse clock), read by the daemon once a second on a thread of its own; it carries nothing, like the stdin line, and collapses the same way. `main` writes it after any of `add`, `add-oauth`, `add-token`, `import`, `remove`, `compact`, `switch`, `rotate`, `hold`, `unhold`, `prefer`, `auto-ignite`, `reorder`, `alias` (`preferred` may name one), `limit-hit`, `reset`, `config set`/`unset` succeeds; the verbs that only read, run a CLI or relabel a row do not.
 - Tests never touch the real keychain, `~/.claude*`, `~/.swapd`, the real `claude` or the network: `SWAPD_SECRETS=file|memory`, `SWAPD_LIVE_STORE=file|keychain`, `SWAPD_HOME`, `SWAPD_URL_*`, `SWAPD_CLAUDE_CLI`, all via `Command::env`.
 

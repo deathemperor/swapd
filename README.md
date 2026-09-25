@@ -86,7 +86,7 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
 | `SWAPD_URL_CLAUDE_WEB` | overrides the base URL `add-oauth`'s authorize page hangs off |
 | `SWAPD_OAUTH_PORT` | overrides the loopback port `add-oauth` listens on (tests only: a real authorization server refuses a redirect its client registration does not name) |
 | `SWAPD_CLAUDE_CLI` | the `claude` binary to run, overriding PATH lookup |
-| `SWAPD_SUPERVISED` | set to `1` by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF, and re-evaluates at once on any line written to it |
+| `SWAPD_SUPERVISED` | set to `1` by a supervisor holding `auto`'s stdin open; the daemon exits when it sees EOF, and re-evaluates at once on any line written to it. Supervised or not, a verb that changes what the daemon decides on wakes it from any process, through `auto.wake` (see Storage) |
 
 ## Storage
 
@@ -105,6 +105,13 @@ shape, every verb's effect, `auto`'s NDJSON event stream — is
                                (list, add, export, run) and every write
   refresh-<provider>-<slot>.lock  held for one slot's token refresh
   auto.lock                    the `auto` daemon's mutex, one per data dir
+  auto.wake                    the daemon's wake: a verb that changes what it
+                               decides on (add, add-oauth, add-token, import,
+                               remove, compact, switch, rotate, hold, unhold,
+                               prefer, auto-ignite, reorder, alias, limit-hit,
+                               reset, config set/unset) writes a fresh nonce
+                               here on its way out, and a sleeping daemon
+                               reads it once a second and ticks when it changes
 ```
 
 ## Security

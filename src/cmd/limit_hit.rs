@@ -10,9 +10,10 @@
 //! It reports, it does not switch. The rule for what to do about a spent active
 //! account (the threshold, the cooldown bypass, the anti-flap bar, the ranking)
 //! belongs to `core::auto` and to `rotate`, and a second place deciding it is
-//! how the two come to disagree. A supervised `swapd auto` is nudged separately
-//! — a line on its stdin — so that it re-reads this the moment it lands rather
-//! than on its next tick.
+//! how the two come to disagree. A running `swapd auto` is nudged separately
+//! — the wake file every store-changing verb writes on its way out
+//! (`core::wake`), or a line on its stdin when it is supervised — so that it
+//! re-reads this the moment it lands rather than on its next tick.
 
 use crate::contract::ListPayload;
 use crate::core::collect::{collect, CollectOpts};

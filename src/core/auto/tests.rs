@@ -2081,3 +2081,41 @@ fn a_failed_ignite_is_reported_and_not_retried_every_tick() {
     board.tick();
     assert_eq!(board.count("ignited"), 1);
 }
+
+/// The daemon parked on `all-exhausted` and an account added under it (the
+/// user's board, 2026-09-25: six accounts spent, a seventh signed in through
+/// the app, and the switch made by hand ten minutes later). The tick after
+/// the add — which the wake file makes the next second, see `cmd::auto` —
+/// must nominate the never-measured slot and land on it: an at-limit escape
+/// takes any account with real headroom, and a slot with no usage row is the
+/// stalest candidate there is.
+#[test]
+fn an_account_added_while_every_other_is_spent_is_taken_on_the_next_tick() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(100.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(100.0, T0, 3600.0));
+    let mut engine = board.engine();
+
+    assert_eq!(engine.tick(), TickOutcome::Blocked);
+    assert!(board.last("all-exhausted").is_some());
+    assert!(board.driver.writes.lock().unwrap().is_empty());
+
+    // `swapd add` in another process: a login in a new slot and no usage row.
+    board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+    board
+        .driver
+        .set_usage("three@example.com", usage_at(20.0, T0, 3600.0));
+    board.advance(1.0);
+
+    assert_eq!(engine.tick(), TickOutcome::Switched);
+    let switched = board.last("switch").unwrap();
+    assert_eq!(switched["trigger"], "at-limit");
+    assert_eq!(switched["from"]["number"], 1);
+    assert_eq!(switched["to"]["number"], 3);
+    assert_eq!(switched["to"]["email"], "three@example.com");
+    assert_eq!(board.live_email(), "three@example.com");
+}

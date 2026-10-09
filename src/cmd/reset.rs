@@ -19,6 +19,7 @@ use crate::ctx::Ctx;
 use crate::driver::{Driver, DriverError, Login, Usage};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
+use crate::secrets::slot_key;
 
 pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
     let id = driver.id();
@@ -89,6 +90,11 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
             format!("the provider refused the reset: {}", outcome.result),
         ));
     }
+    // A limit someone reported on this account (`swapd limit-hit`) is the one
+    // the reset just ended; left in place it would overrule every reading
+    // until its own deadline and keep the account out of the rotation.
+    ctx.store
+        .clear_reported_limit(&slot_key(id, slot), &meta.email, &meta.organization_uuid)?;
 
     // The board after the reset: the windows it cleared are only visible in
     // a fetch made after it, so this one ignores the serve TTL.

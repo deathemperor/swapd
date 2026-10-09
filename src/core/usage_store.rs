@@ -905,6 +905,21 @@ impl UsageStore {
         Ok(resets_at)
     }
 
+    /// Forget a refusal the provider has since lifted: a spent banked reset
+    /// (`swapd reset`) ends the limit the report was a deadline for, so the
+    /// next measurement must be read as it stands rather than overruled.
+    pub fn clear_reported_limit(&self, key: &str, email: &str, org: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut rows = self.read_rows()?;
+        let Some(row) = rows.get_mut(key).filter(|row| matches(row, email, org)) else {
+            return Ok(());
+        };
+        row.reported_limit_at = None;
+        row.reported_limit_resets_at = None;
+        row.next_poll_at = Some(self.now());
+        self.write_rows(rows)
+    }
+
     /// Merge a failed fetch, fenced by its lease (`usage_store.py:1116-1137`).
     /// Never touches `last_good`/`fetched_at` — stale-on-error — so a failing
     /// account keeps its last measurement while its trust ages out.
@@ -1775,6 +1790,27 @@ mod tests {
         // And it lifts on the clock alone — no fetch has to land to free it.
         clock.set(T0 + 3600.5);
         assert!(!entry(&store).reported_limit_held);
+    }
+
+    #[test]
+    fn a_spent_reset_lifts_a_reported_limit_before_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        fetch_ok(&store, five(10.0));
+        report_limit(&store, Some(T0 + 86_400.0));
+        assert!(entry(&store).reported_limit_held);
+
+        store
+            .clear_reported_limit("claude:1", "you@example.com", "org-0000")
+            .unwrap();
+        clock.advance(MIN_INTERVAL_S + 1.0);
+        fetch_ok(&store, five(4.0));
+        let e = entry(&store);
+        assert!(!e.reported_limit_held);
+        assert_eq!(e.reported_limit_at, None);
+        assert_eq!(e.decision_windows().unwrap()[0].pct, 4.0);
     }
 
     #[test]

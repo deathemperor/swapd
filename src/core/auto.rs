@@ -230,6 +230,10 @@ struct Snapshot {
     fresh: BTreeMap<u32, bool>,
     /// Slot → when its trusted measurement was fetched.
     fetched_at: BTreeMap<u32, Option<f64>>,
+    /// Slot → the headroom its last good reading showed, for a slot whose
+    /// trust has lapsed under usage 429s alone. Not decision-grade: only an
+    /// at-limit escape with nothing measurable to land on reads it.
+    throttled: BTreeMap<u32, f64>,
 }
 
 impl Snapshot {
@@ -249,6 +253,10 @@ impl Snapshot {
 
     fn fetched_at(&self, slot: u32) -> Option<f64> {
         self.fetched_at.get(&slot).copied().flatten()
+    }
+
+    fn throttled(&self, slot: u32) -> Option<f64> {
+        self.throttled.get(&slot).copied()
     }
 }
 
@@ -1177,6 +1185,7 @@ impl<'a> AutoEngine<'a> {
             fetch_errors: BTreeMap::new(),
             fresh: BTreeMap::new(),
             fetched_at: BTreeMap::new(),
+            throttled: BTreeMap::new(),
         };
         for account in &view.accounts {
             let entry = entries.get(&self.key_of(account.slot));
@@ -1190,6 +1199,16 @@ impl<'a> AutoEngine<'a> {
             if headroom.is_none() {
                 if let Some(kind) = entry.and_then(|e| e.last_error.clone()) {
                     snap.fetch_errors.insert(account.slot, kind);
+                }
+                // A usage 429 throttles the endpoint, not the account: an
+                // account nobody uses can sit in it for hours, long past the
+                // trust ceiling, with all of its quota intact.
+                let last_good = entry
+                    .filter(|e| measurable && e.last_error.as_deref() == Some("http-429"))
+                    .and_then(|e| e.last_good.as_deref());
+                let models = &self.ctx.settings.models;
+                if let Some(pct) = last_good.and_then(|w| binding_pct(w, models)) {
+                    snap.throttled.insert(account.slot, 100.0 - pct);
                 }
             }
             snap.fresh
@@ -1507,6 +1526,21 @@ impl<'a> AutoEngine<'a> {
             qualifying.push((key, index, slot));
         }
 
+        // Last resort, for an active account known to be refused: a peer
+        // only the usage endpoint's throttle hides, by the headroom it last
+        // showed. Landing on one that turns out spent costs a switch; staying
+        // costs the session. Never on failover — the active account is
+        // unreadable there too, and this would hop between blind targets.
+        if qualifying.is_empty() && fallback.is_empty() && trigger == "at-limit" {
+            for (index, slot) in candidates.iter().copied().enumerate() {
+                if Some(slot) == no_return {
+                    continue;
+                }
+                if let Some(h) = snap.throttled(slot).filter(|h| *h > 0.0) {
+                    fallback.push((Key::new(&[-h]), index, slot));
+                }
+            }
+        }
         let mut ranked = if qualifying.is_empty() {
             fallback
         } else {

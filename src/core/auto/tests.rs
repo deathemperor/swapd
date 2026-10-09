@@ -52,6 +52,8 @@ struct FakeDriver {
     /// email → the windows `usage()` reports for it once it has been ignited
     /// (the window the run opened). An email not listed stays as it was.
     warm: Mutex<BTreeMap<String, Vec<Window>>>,
+    /// Accounts whose usage endpoint answers 429.
+    throttled: Mutex<Vec<String>>,
 }
 
 impl FakeDriver {
@@ -65,6 +67,7 @@ impl FakeDriver {
             live_reads: Mutex::new(0),
             ignites: Mutex::new(Vec::new()),
             warm: Mutex::new(BTreeMap::new()),
+            throttled: Mutex::new(Vec::new()),
         }
     }
 
@@ -77,6 +80,12 @@ impl FakeDriver {
     /// table answers the way the real one does when it errors).
     fn fail_usage(&self, email: &str) {
         self.usage.lock().unwrap().remove(email);
+    }
+
+    /// Make this account's usage endpoint answer 429, the throttle that
+    /// leaves the account itself untouched.
+    fn throttle_usage(&self, email: &str) {
+        self.throttled.lock().unwrap().push(email.to_string());
     }
 
     fn set_usage(&self, email: &str, windows: Vec<Window>) {
@@ -180,6 +189,9 @@ impl Driver for FakeDriver {
     fn usage(&self, login: &Login) -> std::result::Result<Usage, DriverError> {
         let email = Self::email_of(login);
         self.usage_calls.lock().unwrap().push(email.clone());
+        if self.throttled.lock().unwrap().contains(&email) {
+            return Err(DriverError::Throttled { retry_after: None });
+        }
         match self.usage.lock().unwrap().get(&email) {
             Some(windows) => Ok(Usage {
                 windows: windows.clone(),
@@ -1329,6 +1341,66 @@ fn a_switch_in_flight_is_reported_as_switch_in_progress() {
         board.driver.take_usage_calls().is_empty(),
         "a fenced store is served from the table, not fetched"
     );
+}
+
+/// An idle account whose usage endpoint has 429'd past the trust ceiling is
+/// still where an at-limit escape lands when every readable peer is spent: the
+/// throttle is the endpoint's, not the account's (a fleet sat on a refused
+/// account for hours beside three unused ones, 2026-10-09). An account
+/// unreadable for any other reason is not.
+#[test]
+fn an_at_limit_escape_lands_on_a_peer_only_the_usage_throttle_hides() {
+    for throttled in [true, false] {
+        let board = Board::new();
+        board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+        board
+            .driver
+            .set_usage("one@example.com", usage_at(50.0, T0, 3600.0));
+        board
+            .driver
+            .set_usage("two@example.com", usage_at(100.0, T0, 18_000.0));
+        board
+            .driver
+            .set_usage("three@example.com", usage_at(0.0, T0, 3600.0));
+        // Every account read once while the endpoint still answers.
+        for _ in 0..5 {
+            board.tick();
+            board.advance(60.0);
+        }
+        assert!(board.last("switch").is_none());
+
+        if throttled {
+            board.driver.throttle_usage("three@example.com");
+        } else {
+            board.driver.fail_usage("three@example.com");
+        }
+        board.advance(3.0 * 3600.0);
+        let now = board.now();
+        board
+            .driver
+            .set_usage("one@example.com", usage_at(100.0, now, 18_000.0));
+        board
+            .driver
+            .set_usage("two@example.com", usage_at(100.0, now, 18_000.0));
+        for _ in 0..10 {
+            board.tick();
+            if board.last("switch").is_some() {
+                break;
+            }
+            board.advance(60.0);
+        }
+
+        let switch = board.last("switch");
+        if throttled {
+            let switch = switch.expect("the throttled idle peer is the escape");
+            assert_eq!(switch["to"]["number"], 3);
+            assert_eq!(switch["trigger"], "at-limit");
+            assert_eq!(board.live_email(), "three@example.com");
+        } else {
+            assert!(switch.is_none(), "an account failing for real is no target");
+            assert_eq!(board.live_email(), "one@example.com");
+        }
+    }
 }
 
 /// Two ways the ranking can come back empty with the active account at its

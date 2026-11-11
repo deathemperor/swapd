@@ -1787,6 +1787,7 @@ fn the_account_just_left_is_not_taken_straight_back() {
             trigger: "proactive".to_string(),
             headroom: Some(23.0),
             recovery_at: Some(T0 + 3600.0),
+            at: None,
         }),
         ignited_at: BTreeMap::new(),
     });
@@ -1828,6 +1829,103 @@ fn leaving_slot_one() -> Board {
     board
         .driver
         .set_usage("three@example.com", usage_at(80.0, T0, 3600.0));
+    board
+}
+
+/// An account left at its limit is barred until its window resets, because a
+/// healthy reading before then is the API lagging. A banked reset spent on it
+/// early (on claude.ai, by the CLI's `/reset` or by `swapd reset`) is not that
+/// reading: its usage FELL while its window had time to run, and the bar
+/// releases on it, so an at-limit escape can land there again.
+#[test]
+fn a_reset_spent_on_the_account_left_at_its_limit_releases_the_bar() {
+    let board = Board::new();
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(100.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(10.0, T0, 3600.0));
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    let departure = board.state().left_at_limit.unwrap();
+    assert_eq!(departure.trigger, "at-limit");
+    assert_eq!(departure.recovery_at, Some(T0 + 3600.0));
+    assert_eq!(departure.at, Some(T0));
+
+    // Slot 1 is reset early; slot 2 then runs out with the hour still to go.
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(0.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(100.0, T0, 3600.0));
+    board.advance(700.0);
+
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    let switched = board.last("switch").unwrap();
+    assert_eq!(switched["trigger"], "at-limit");
+    assert_eq!(switched["to"]["number"], 1);
+    assert_eq!(board.live_email(), "one@example.com");
+}
+
+/// The other half: an account left at its limit that merely READS healthy,
+/// with no fall on record, stays barred until its reset, so the at-limit escape
+/// takes the next account instead.
+#[test]
+fn an_account_left_at_its_limit_that_only_reads_healthy_stays_barred() {
+    let departed = |at: Option<f64>| AutoState {
+        schema_version: 1,
+        left_at_limit: Some(Departure {
+            from: 1,
+            to: 2,
+            trigger: "at-limit".to_string(),
+            headroom: Some(0.0),
+            recovery_at: Some(T0 + 3600.0),
+            at,
+        }),
+        ..AutoState::default()
+    };
+
+    let board = two_spent_one_reads_healthy();
+    board.set_state(&departed(Some(T0 - 60.0)));
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    assert_eq!(board.last("switch").unwrap()["to"]["number"], 3);
+
+    // A state file from before departures carried their time reads the same.
+    let board = two_spent_one_reads_healthy();
+    board.set_state(&departed(None));
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    assert_eq!(board.last("switch").unwrap()["to"]["number"], 3);
+
+    // The counterfactual: with no departure on record, slot 1 wins outright.
+    let board = two_spent_one_reads_healthy();
+    assert_eq!(board.tick(), TickOutcome::Switched);
+    assert_eq!(board.last("switch").unwrap()["to"]["number"], 1);
+}
+
+/// Slot 2 live and spent, slot 1 reading 30% (first measurement, so no fall),
+/// slot 3 at 60%.
+fn two_spent_one_reads_healthy() -> Board {
+    let board = Board::new();
+    board.seed(3, "three@example.com", "rt-3", T0 + 86_400.0);
+    board
+        .driver
+        .write_live(
+            &board.ctx().env,
+            &Login {
+                bytes: login("two@example.com", "rt-2", T0 + 86_400.0),
+            },
+        )
+        .unwrap();
+    board
+        .driver
+        .set_usage("two@example.com", usage_at(100.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("one@example.com", usage_at(30.0, T0, 3600.0));
+    board
+        .driver
+        .set_usage("three@example.com", usage_at(60.0, T0, 3600.0));
     board
 }
 

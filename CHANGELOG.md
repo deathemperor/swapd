@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `auto` goes back to an account it left at its limit once a banked reset is spent on it, instead of waiting out the reset it recorded on the way out. The no-return bar held that account until its old reset whatever was measured, so a reset spent on claude.ai, by the CLI's `/reset` or by `swapd reset` left it out of reach even when it was the only account with quota. The bar now releases when a fetch after the departure shows a window falling before its own reset (#68).
+
 - A `limit-hit` report with a reset time no longer outlasts a reset spent before it: when a window's usage falls while its own reset is still ahead, a banked reset was spent (on claude.ai, by the CLI's `/reset` or by `swapd reset`), and the next good fetch forgets the report. Until now a dated report outranked every reading until its date, so an account reset on claude.ai to 3% still read spent for two days and `auto` reported `all-exhausted` beside it (#46).
 
 - `list` splits each account's banked resets by what they refill, as Claude's `/reset` now offers them: `resets.kinds` lists `session`, `weekly`, `fable` and `full` resets, each with its own count, grant and hold, and `reset <ident> --kind fable` spends a Fable reset even when the provider names a weekly one next. A Fable reset is judged the CLI's way, by `gives_back_weekly`, since Claude labels it `type: full`. The aggregate fields are unchanged.

@@ -213,6 +213,11 @@ pub struct Departure {
     /// When its binding window was due back, `None` for unknown/never
     /// (`inf` is not portable JSON).
     pub recovery_at: Option<f64>,
+    /// When the switch was made. A banked reset spent on the account after
+    /// this releases an at-limit bar early; `None` in a state file written
+    /// before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<f64>,
 }
 
 /// The decision-grade picture of one tick, derived from the collection pass
@@ -230,6 +235,8 @@ struct Snapshot {
     fresh: BTreeMap<u32, bool>,
     /// Slot → when its trusted measurement was fetched.
     fetched_at: BTreeMap<u32, Option<f64>>,
+    /// Slot → when a fetch last showed a banked reset spent early on it.
+    reset_spent_at: BTreeMap<u32, Option<f64>>,
 }
 
 impl Snapshot {
@@ -249,6 +256,10 @@ impl Snapshot {
 
     fn fetched_at(&self, slot: u32) -> Option<f64> {
         self.fetched_at.get(&slot).copied().flatten()
+    }
+
+    fn reset_spent_at(&self, slot: u32) -> Option<f64> {
+        self.reset_spent_at.get(&slot).copied().flatten()
     }
 }
 
@@ -1177,6 +1188,7 @@ impl<'a> AutoEngine<'a> {
             fetch_errors: BTreeMap::new(),
             fresh: BTreeMap::new(),
             fetched_at: BTreeMap::new(),
+            reset_spent_at: BTreeMap::new(),
         };
         for account in &view.accounts {
             let entry = entries.get(&self.key_of(account.slot));
@@ -1198,6 +1210,8 @@ impl<'a> AutoEngine<'a> {
             snap.windows.insert(account.slot, windows);
             snap.fetched_at
                 .insert(account.slot, entry.and_then(|e| e.fetched_at));
+            snap.reset_spent_at
+                .insert(account.slot, entry.and_then(|e| e.reset_spent_at));
         }
         snap
     }
@@ -1540,7 +1554,7 @@ impl<'a> AutoEngine<'a> {
         // escape MUST move and may go anywhere — except back onto an account
         // whose own at-limit departure has not reset yet.
         if !matches!(input.trigger, "proactive" | "consume-first")
-            && !left_at_limit_holds(departure, input.now)
+            && !left_at_limit_holds(departure, input.snap, input.now)
         {
             return None;
         }
@@ -1587,7 +1601,7 @@ impl<'a> AutoEngine<'a> {
         // Proven spent by its own at-limit departure and not yet reset: until
         // then no usage reading can release it, because the API lags a real
         // limit by up to a poll interval.
-        if left_at_limit_holds(departure, input.now) {
+        if left_at_limit_holds(departure, input.snap, input.now) {
             return false;
         }
         let models = &input.settings.models;
@@ -1833,6 +1847,7 @@ impl<'a> AutoEngine<'a> {
             trigger: trigger.to_string(),
             headroom,
             recovery_at: recovery.is_finite().then_some(recovery),
+            at: Some(now),
         });
         self.mutate_state(|state| {
             state.cooldown_until = Some(now + cooldown);
@@ -1995,8 +2010,18 @@ fn every_account_above_threshold(
 /// window has not reset yet (`autoswitch.py:1753-1762`). Until then no usage
 /// reading can release it: the API lags a real limit by up to a poll interval,
 /// and that reading is exactly what would make a spent account look best.
-fn left_at_limit_holds(departure: &Departure, now: f64) -> bool {
-    departure.trigger == "at-limit" && departure.recovery_at.is_some_and(|until| now < until)
+///
+/// Except one that shows a banked reset spent on it since we left: a window
+/// that fell before its own reset (`UsageStore::record_success`) is no lagging
+/// read, since usage only rises inside a window.
+fn left_at_limit_holds(departure: &Departure, snap: &Snapshot, now: f64) -> bool {
+    let reset_since = departure
+        .at
+        .zip(snap.reset_spent_at(departure.from))
+        .is_some_and(|(left, spent)| spent > left);
+    departure.trigger == "at-limit"
+        && departure.recovery_at.is_some_and(|until| now < until)
+        && !reset_since
 }
 
 /// When this account's BINDING window comes back, as a sort key

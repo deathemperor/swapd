@@ -157,6 +157,11 @@ pub struct Row {
     /// window at report time. `None` when neither was available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported_limit_resets_at: Option<f64>,
+    /// When a good fetch last showed a banked reset spent early
+    /// (`reset_spent_early`) — the evidence the auto engine's no-return bar
+    /// releases on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_spent_at: Option<f64>,
     /// The banked limit resets the last good fetch reported. Written with
     /// `last_good` and kept through failures, like it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,6 +205,7 @@ pub struct Entry {
     pub claim_until: Option<f64>,
     pub reported_limit_at: Option<f64>,
     pub reported_limit_resets_at: Option<f64>,
+    pub reset_spent_at: Option<f64>,
     /// The banked limit resets the last good fetch reported.
     pub resets: Option<ResetBank>,
     /// Whether that report still outranks the stored measurement, resolved
@@ -722,6 +728,7 @@ impl UsageStore {
                     claim_until: row.claim_until,
                     reported_limit_at: row.reported_limit_at,
                     reported_limit_resets_at: row.reported_limit_resets_at,
+                    reset_spent_at: row.reset_spent_at,
                     resets: row.resets.clone(),
                     reported_limit_held: reported_limit_holds(row, now),
                 },
@@ -819,15 +826,16 @@ impl UsageStore {
         // the 429 backoff this success is about to clear, and movement is
         // measured against the last-good this success is about to replace.
         let previous = row.last_good.take().unwrap_or_default();
+        let spent_early = reset_spent_early(&previous, &windows, now);
         // A fall measured against a reading taken after the report: the reset
         // it shows was spent after the refusal, so the refusal is over. One
         // measured against an older reading could be the reset the refusal
         // came after, and proves nothing.
-        let reset_after_report = row
-            .reported_limit_at
-            .zip(row.fetched_at)
-            .is_some_and(|(reported, fetched)| fetched >= reported)
-            && reset_spent_early(&previous, &windows, now);
+        let reset_after_report = spent_early
+            && row
+                .reported_limit_at
+                .zip(row.fetched_at)
+                .is_some_and(|(reported, fetched)| fetched >= reported);
         let recent_429 = Entry {
             last_error: row.last_error.clone(),
             backoff_until: row.backoff_until,
@@ -870,6 +878,9 @@ impl UsageStore {
         row.last_error = None;
         row.backoff_until = None;
         row.auth_dead_strikes = 0;
+        if spent_early {
+            row.reset_spent_at = Some(now);
+        }
         // Forget a report this very measurement has outlived, so a refusal
         // swapd could never corroborate does not sit on the row forever, and
         // one a spent reset has answered. One that still holds survives: this

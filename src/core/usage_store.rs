@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use crate::contract::{Window, WindowKind};
 use crate::core::gating::relevant;
 use crate::core::poll_policy::{
-    self, parse_reset_ts, plan_after_fetch, PlanInput, EDGE_BACKOFF_S, RECENT_429_WINDOW_S,
-    SERVE_TTL_S,
+    self, parse_reset_ts, plan_after_fetch, PlanInput, EDGE_BACKOFF_S, MOVEMENT_DELTA_PCT,
+    RECENT_429_WINDOW_S, SERVE_TTL_S,
 };
 use crate::core::store::{read_json, write_json_atomic, FileLock};
 use crate::driver::ResetBank;
@@ -300,6 +300,10 @@ impl Entry {
 /// disagreeing with the report, it simply has not caught up. After that the
 /// endpoint wins: a refusal swapd cannot corroborate must not strand an account
 /// that has since recovered.
+///
+/// A known reset proves the account blocked only until a reset is spent early,
+/// which `record_success` sees as a fall (`reset_spent_early`) and answers by
+/// forgetting the report outright; this function never has to weigh it.
 fn reported_limit_holds(row: &Row, now: f64) -> bool {
     let Some(reported_at) = row.reported_limit_at else {
         return false;
@@ -309,6 +313,21 @@ fn reported_limit_holds(row: &Row, now: f64) -> bool {
     }
     row.fetched_at
         .is_none_or(|at| at < reported_at + poll_policy::MIN_INTERVAL_S)
+}
+
+/// Whether a window fell by `MOVEMENT_DELTA_PCT` or more while its own reset
+/// was still ahead. Usage only rises inside a window, so that is a banked reset
+/// spent early — by `swapd reset`, on claude.ai, or by the CLI's own `/reset` —
+/// and not the window rolling over, which a fall after its reset is.
+fn reset_spent_early(previous: &[Window], new: &[Window], now: f64) -> bool {
+    new.iter().any(|w| {
+        previous.iter().any(|p| {
+            p.kind == w.kind
+                && p.name == w.name
+                && parse_reset_ts(p.resets_at.as_deref()).is_some_and(|at| now < at)
+                && p.pct - w.pct >= MOVEMENT_DELTA_PCT
+        })
+    })
 }
 
 /// `windows` with the 5-hour window at 100%, creating one when there is none
@@ -800,6 +819,15 @@ impl UsageStore {
         // the 429 backoff this success is about to clear, and movement is
         // measured against the last-good this success is about to replace.
         let previous = row.last_good.take().unwrap_or_default();
+        // A fall measured against a reading taken after the report: the reset
+        // it shows was spent after the refusal, so the refusal is over. One
+        // measured against an older reading could be the reset the refusal
+        // came after, and proves nothing.
+        let reset_after_report = row
+            .reported_limit_at
+            .zip(row.fetched_at)
+            .is_some_and(|(reported, fetched)| fetched >= reported)
+            && reset_spent_early(&previous, &windows, now);
         let recent_429 = Entry {
             last_error: row.last_error.clone(),
             backoff_until: row.backoff_until,
@@ -843,10 +871,10 @@ impl UsageStore {
         row.backoff_until = None;
         row.auth_dead_strikes = 0;
         // Forget a report this very measurement has outlived, so a refusal
-        // swapd could never corroborate does not sit on the row forever. One
-        // that still holds survives: this fetch may be the lagging read the
-        // report exists to overrule.
-        if !reported_limit_holds(row, now) {
+        // swapd could never corroborate does not sit on the row forever, and
+        // one a spent reset has answered. One that still holds survives: this
+        // fetch may be the lagging read the report exists to overrule.
+        if reset_after_report || !reported_limit_holds(row, now) {
             row.reported_limit_at = None;
             row.reported_limit_resets_at = None;
         }
@@ -1775,6 +1803,77 @@ mod tests {
         // And it lifts on the clock alone — no fetch has to land to free it.
         clock.set(T0 + 3600.5);
         assert!(!entry(&store).reported_limit_held);
+    }
+
+    /// One window of `kind` at `pct`, resetting at `resets_at`.
+    fn at(kind: WindowKind, pct: f64, resets_at: f64) -> Window {
+        window(kind, pct, format_ts(resets_at).as_deref())
+    }
+
+    #[test]
+    fn a_reset_spent_early_lifts_a_dated_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+        let weekly = T0 + 2.0 * 86_400.0;
+
+        fetch_ok(&store, vec![at(WindowKind::SevenDay, 98.0, weekly)]);
+        report_limit(&store, Some(weekly));
+        clock.advance(30.0);
+        fetch_ok(&store, vec![at(WindowKind::SevenDay, 100.0, weekly)]);
+        assert!(entry(&store).reported_limit_held);
+
+        // The reset spent on claude.ai, in the CLI or by `swapd reset`: the
+        // week has two days to run and its usage fell. The refusal is over,
+        // whatever deadline it named.
+        clock.advance(30.0);
+        fetch_ok(&store, vec![at(WindowKind::SevenDay, 3.0, weekly)]);
+        let e = entry(&store);
+        assert!(!e.reported_limit_held);
+        assert_eq!(e.reported_limit_at, None);
+        assert_eq!(e.decision_windows().unwrap()[0].pct, 3.0);
+    }
+
+    #[test]
+    fn a_fall_from_a_reading_older_than_the_report_leaves_it_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+        let weekly = T0 + 2.0 * 86_400.0;
+
+        // The reset may be the one the refusal came after: only a reading
+        // taken since the report can show the reset ended it.
+        fetch_ok(&store, vec![at(WindowKind::SevenDay, 90.0, weekly)]);
+        clock.advance(30.0);
+        report_limit(&store, Some(weekly));
+        clock.advance(30.0);
+        fetch_ok(&store, vec![at(WindowKind::SevenDay, 5.0, weekly)]);
+        assert!(entry(&store).reported_limit_held);
+    }
+
+    #[test]
+    fn a_window_rolling_over_is_not_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+        let weekly = T0 + 2.0 * 86_400.0;
+        let board = |five_pct: f64, five_at: f64| {
+            vec![
+                at(WindowKind::FiveHour, five_pct, five_at),
+                at(WindowKind::SevenDay, 60.0, weekly),
+            ]
+        };
+
+        fetch_ok(&store, board(100.0, T0 + 60.0));
+        report_limit(&store, Some(weekly));
+        clock.advance(30.0);
+        fetch_ok(&store, board(100.0, T0 + 60.0));
+
+        // The 5-hour window came back on its own clock: its fall is the roll,
+        // not a spent reset, and the dated report still stands.
+        clock.advance(MIN_INTERVAL_S);
+        fetch_ok(&store, board(0.0, T0 + 18_000.0));
+        assert!(entry(&store).reported_limit_held);
     }
 
     #[test]

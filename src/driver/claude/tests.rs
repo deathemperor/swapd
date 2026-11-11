@@ -222,6 +222,12 @@ mod http_tests {
         let view = usage::reset_bank(&spent).unwrap().view(now).unwrap();
         let fable = view.kinds.iter().find(|k| k.kind == "fable").unwrap();
         assert_eq!((fable.available, fable.total, &fable.hold), (0, 1, &None));
+
+        // An answer whose grants name no kind is not split.
+        let plain = serde_json::json!({"cedar_ember": {"eligible": true, "next_grant_id": "g",
+            "grants": [{"id": "g", "resets_total": 1, "resets_left": 1, "usable_now": true}]}});
+        let view = usage::reset_bank(&plain).unwrap().view(now).unwrap();
+        assert!(view.kinds.is_empty());
     }
 
     #[test]

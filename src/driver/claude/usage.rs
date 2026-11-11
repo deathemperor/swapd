@@ -175,7 +175,7 @@ pub fn reset_bank(raw: &Value) -> Option<ResetBank> {
                         paused: flag(g.get("paused")),
                         usable_now: flag(g.get("usable_now")),
                         use_requires_limit: flag(g.get("use_requires_limit")),
-                        kind: Some(grant_kind(g)),
+                        kind: names_kind(g).then(|| grant_kind(g)),
                         unavailable_reason: text(g.get("unavailable_reason")),
                     })
                 })
@@ -191,6 +191,14 @@ pub fn reset_bank(raw: &Value) -> Option<ResetBank> {
         cooldown_until: text(block.get("cooldown_until")),
         grants,
     })
+}
+
+/// Claude split its bank by kind once grants carried these; an answer
+/// without them is not split.
+fn names_kind(grant: &Value) -> bool {
+    ["type", "clears", "gives_back_weekly"]
+        .iter()
+        .any(|key| grant.get(*key).is_some_and(|v| !v.is_null()))
 }
 
 /// What a reset from `grant` refills, the CLI's rule: a grant that gives

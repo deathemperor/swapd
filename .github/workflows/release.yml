@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-26
             targets: "aarch64-apple-darwin x86_64-apple-darwin"
             artifact: macos
           - runner: ubuntu-24.04

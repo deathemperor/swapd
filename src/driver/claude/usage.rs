@@ -175,6 +175,8 @@ pub fn reset_bank(raw: &Value) -> Option<ResetBank> {
                         paused: flag(g.get("paused")),
                         usable_now: flag(g.get("usable_now")),
                         use_requires_limit: flag(g.get("use_requires_limit")),
+                        kind: names_kind(g).then(|| grant_kind(g)),
+                        unavailable_reason: text(g.get("unavailable_reason")),
                     })
                 })
                 .collect()
@@ -189,6 +191,43 @@ pub fn reset_bank(raw: &Value) -> Option<ResetBank> {
         cooldown_until: text(block.get("cooldown_until")),
         grants,
     })
+}
+
+/// Claude split its bank by kind once grants carried these; an answer
+/// without them is not split.
+fn names_kind(grant: &Value) -> bool {
+    ["type", "clears", "gives_back_weekly"]
+        .iter()
+        .any(|key| grant.get(*key).is_some_and(|v| !v.is_null()))
+}
+
+/// What a reset from `grant` refills, the CLI's rule: a grant that gives
+/// back what Fable used of the week is `fable` whatever its `type` says;
+/// otherwise its `type`, or failing that what it `clears`.
+fn grant_kind(grant: &Value) -> String {
+    if grant.get("gives_back_weekly").and_then(Value::as_bool) == Some(true) {
+        return "fable".to_string();
+    }
+    if let Some(kind) = grant
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return kind.to_string();
+    }
+    let clears: Vec<&str> = grant
+        .get("clears")
+        .and_then(Value::as_array)
+        .map(|c| c.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let session = clears.contains(&"five_hour");
+    let other = clears.iter().any(|c| *c != "five_hour");
+    match (session, other) {
+        (true, false) => "session",
+        (false, true) => "weekly",
+        _ => "full",
+    }
+    .to_string()
 }
 
 /// Spend one banked reset: the CLI's `/reset` request, verbatim. The

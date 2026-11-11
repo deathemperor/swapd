@@ -148,7 +148,14 @@ enum Command {
     /// the daemon ignites it whenever the window has gone cold.
     AutoIgnite { ident: String, state: String },
     /// Spend one of an account's banked limit resets, as that account.
-    Reset { ident: String },
+    Reset {
+        ident: String,
+        /// Spend this kind (`session`, `weekly`, `fable`, `full`, as `list`
+        /// names them under `resets.kinds`) instead of the grant the
+        /// provider names next.
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Take an account out of the rotation, keeping its login.
     Hold { ident: String },
     /// Put a held account back into the rotation.
@@ -518,11 +525,14 @@ fn run(cli: &Cli) -> Result<()> {
                 cli.json,
             )
         }
-        Command::Reset { ident } => {
+        Command::Reset { ident, kind } => {
             refuse_in_shadow("reset")?;
             let driver = single_driver(cli)?;
             let ctx = ctx::Ctx::from_env()?;
-            emit_list(&cmd::reset::run(&ctx, driver.as_ref(), ident)?, cli.json)
+            emit_list(
+                &cmd::reset::run(&ctx, driver.as_ref(), ident, kind.as_deref())?,
+                cli.json,
+            )
         }
         Command::Hold { ident } => {
             let driver = single_driver(cli)?;

@@ -2,15 +2,16 @@
 //!
 //! The provider banks a few resets per account (Claude's `/reset`, program
 //! `cedar_ember`); `list` reports them on the row as `resets`. This verb
-//! spends the one the provider names next, as that account, without touching
-//! the live login — the same way `ignite` runs as a slot.
+//! spends the one the provider names next, or with `--kind` the first usable
+//! grant of that kind (a Fable reset beside a weekly one), as that account,
+//! without touching the live login — the same way `ignite` runs as a slot.
 //!
 //! The bank is read fresh before the claim rather than off the store: a reset
 //! is also spendable by the CLI itself, and a stored count can be minutes old.
 //! The provider's own refusal (`already_used`, `not_limited`, `cooldown`,
 //! `ineligible`, `unavailable`) comes back as the error's message.
 
-use crate::contract::{ListPayload, ResetHoldReason};
+use crate::contract::{ListPayload, ResetHold, ResetHoldReason};
 use crate::core::collect::{collect, CollectOpts};
 use crate::core::refresh::{refresh_slot, Refreshed};
 use crate::core::slots;
@@ -20,7 +21,7 @@ use crate::driver::{Driver, DriverError, Login, Usage};
 use crate::errors::{ErrorCode, Result, SwapdError};
 use crate::output;
 
-pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
+pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str, kind: Option<&str>) -> Result<ListPayload> {
     let id = driver.id();
     let slots = slots::load(&ctx.home, id)?;
     let slot = resolve(&slots, id, ident)?;
@@ -37,7 +38,7 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
 
     let mut login = super::login_to_run(ctx, driver, slot)?;
     let usage = usage_refreshing(ctx, driver, slot, &mut login)?;
-    let bank = usage
+    let view = usage
         .resets
         .as_ref()
         .and_then(|bank| bank.view(ctx.now()))
@@ -47,6 +48,30 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
                 format!("slot {slot} has no banked reset"),
             )
         })?;
+    let bank = match kind {
+        None => Bank {
+            available: view.available,
+            next_grant_id: view.next_grant_id,
+            hold: view.hold,
+        },
+        Some(kind) => {
+            let found = view
+                .kinds
+                .into_iter()
+                .find(|k| k.kind == kind)
+                .ok_or_else(|| {
+                    SwapdError::new(
+                        ErrorCode::InvalidInput,
+                        format!("slot {slot} has no banked {kind} reset"),
+                    )
+                })?;
+            Bank {
+                available: found.available,
+                next_grant_id: found.next_grant_id,
+                hold: found.hold,
+            }
+        }
+    };
     // Nothing left comes before any hold: a spent bank is spent, whatever
     // else is true of it.
     if bank.available == 0 {
@@ -104,6 +129,13 @@ pub fn run(ctx: &Ctx, driver: &dyn Driver, ident: &str) -> Result<ListPayload> {
         schema_version: output::SCHEMA_VERSION,
         providers: vec![view],
     })
+}
+
+/// The part of a bank, or of one kind of it, a claim is judged on.
+struct Bank {
+    available: u32,
+    next_grant_id: Option<String>,
+    hold: Option<ResetHold>,
 }
 
 /// One usage read as `login`, refreshing it once under the slot's refresh

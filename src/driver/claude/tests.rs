@@ -170,6 +170,61 @@ mod http_tests {
     }
 
     #[test]
+    fn a_bank_splits_its_resets_by_what_they_refill() {
+        use crate::contract::ResetHoldReason;
+        // Claude's own payload: the Fable grant says `type: full` but gives
+        // back the week's Fable use, and the "full" one says `type: weekly`.
+        let raw = serde_json::json!({"cedar_ember": {
+        "eligible": true, "at_limit": false, "next_grant_id": "full-reset-2611",
+        "cooldown_until": null,
+        "grants": [
+            {"id": "full-reset-2611", "label": "One full limit reset (November 2026)",
+             "resets_total": 1, "resets_left": 1, "ends_at": "2026-12-10T22:00:00+00:00",
+             "clears": ["seven_day", "seven_day_overage_included"], "paused": false,
+             "usable_now": true, "use_requires_limit": false, "type": "weekly",
+             "unavailable_reason": null, "gives_back_weekly": false},
+            {"id": "launch-2610-fable", "label": "New model launch: one Fable reset",
+             "resets_total": 1, "resets_left": 1, "ends_at": "2027-03-09T07:59:00+00:00",
+             "clears": ["seven_day_overage_included"], "paused": false,
+             "usable_now": false, "use_requires_limit": true, "type": "full",
+             "unavailable_reason": "needs_limit", "gives_back_weekly": true},
+            {"id": "five", "resets_total": 1, "resets_left": 1,
+             "clears": ["five_hour"], "usable_now": true}
+        ]}});
+        let now = 1_762_000_000.0;
+        let view = usage::reset_bank(&raw).unwrap().view(now).unwrap();
+        // The aggregate is what it always was.
+        assert_eq!((view.available, view.total), (3, 3));
+        assert_eq!(view.next_grant_id.as_deref(), Some("full-reset-2611"));
+        let kinds: Vec<_> = view
+            .kinds
+            .iter()
+            .map(|k| (k.kind.as_str(), k.available, k.next_grant_id.as_deref()))
+            .collect();
+        // In the CLI's order; a `type`-less grant is judged by what it clears.
+        assert_eq!(
+            kinds,
+            [
+                ("session", 1, Some("five")),
+                ("weekly", 1, Some("full-reset-2611")),
+                ("fable", 1, None),
+            ]
+        );
+        assert_eq!(view.kinds[1].hold, None);
+        assert_eq!(
+            view.kinds[2].hold.as_ref().map(|h| h.reason),
+            Some(ResetHoldReason::NotAtLimit)
+        );
+
+        // A spent Fable grant stays on the board at zero, with nothing held.
+        let mut spent = raw.clone();
+        spent["cedar_ember"]["grants"][1]["resets_left"] = 0.into();
+        let view = usage::reset_bank(&spent).unwrap().view(now).unwrap();
+        let fable = view.kinds.iter().find(|k| k.kind == "fable").unwrap();
+        assert_eq!((fable.available, fable.total, &fable.hold), (0, 1, &None));
+    }
+
+    #[test]
     fn a_bank_says_why_its_reset_cannot_be_spent() {
         use crate::contract::ResetHoldReason;
         use crate::driver::{ResetBank, ResetGrant};

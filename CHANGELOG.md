@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `list` splits each account's banked resets by what they refill, as Claude's `/reset` now offers them: `resets.kinds` lists `session`, `weekly`, `fable` and `full` resets, each with its own count, grant and hold, and `reset <ident> --kind fable` spends a Fable reset even when the provider names a weekly one next. A Fable reset is judged the CLI's way, by `gives_back_weekly`, since Claude labels it `type: full`. The aggregate fields are unchanged.
+
 - `auto` wakes the moment a verb changes what it decides on, whichever process ran the verb: `add`, `add-oauth`, `add-token`, `import`, `remove`, `compact`, `switch`, `rotate`, `hold`, `unhold`, `prefer`, `auto-ignite`, `reorder`, `alias`, `limit-hit`, `reset` and `config set`/`unset` each write a fresh nonce to `<home>/auto.wake` on their way out, and a sleeping daemon reads that file once a second and ticks when it changes. Until now the only wake was a line on a supervised daemon's stdin, and the daemon Infinitus's menu-bar helper installs runs under launchd with no supervisor at all — so an account signed in through the app while every other read spent waited out the ten-minute `all-exhausted` sleep (six accounts spent, a seventh added at 15:23, the switch made by hand at 15:26, the daemon's next look at 15:32), and a refusal the server reported with `limit-hit` was read a poll later rather than at once.
 
 ## 0.3.3 — 2026-09-25

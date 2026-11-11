@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+use crate::contract::ResetKind;
 use crate::errors::{ErrorCode, SwapdError};
 use crate::paths::Home;
 
@@ -123,7 +124,18 @@ pub struct ResetGrant {
     pub usable_now: bool,
     /// The grant spends only while the account is at a limit.
     pub use_requires_limit: bool,
+    /// What a reset from this grant refills (`session`, `weekly`, `fable`,
+    /// `full`), judged the way Claude's CLI does; `None` on a bank stored
+    /// before kinds were read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The provider's word for why the grant cannot be spent now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
+
+/// The order Claude's `/reset` lists kinds in; an unknown kind goes last.
+const KIND_ORDER: [&str; 4] = ["session", "weekly", "fable", "full"];
 
 impl ResetBank {
     /// What a caller may do with the bank at `now`: the live grants' counts,
@@ -186,7 +198,69 @@ impl ResetBank {
             label: shown.label.clone(),
             ends_at: shown.ends_at.clone(),
             hold,
+            kinds: self.kinds(&live, cooling),
         })
+    }
+
+    /// The live grants by kind. A kind's reset is its first grant the
+    /// provider calls usable now — the one the CLI's `/reset` claims, which
+    /// need not be `next_grant_id`.
+    fn kinds(&self, live: &[&ResetGrant], cooling: Option<&str>) -> Vec<ResetKind> {
+        use crate::contract::{ResetHold, ResetHoldReason};
+        let mut kinds: Vec<ResetKind> = Vec::new();
+        for g in live {
+            let Some(kind) = g.kind.as_deref() else {
+                continue;
+            };
+            if kinds.iter().any(|k| k.kind == kind) {
+                continue;
+            }
+            let grants: Vec<&ResetGrant> = live
+                .iter()
+                .filter(|g| g.kind.as_deref() == Some(kind))
+                .copied()
+                .collect();
+            let available = grants.iter().map(|g| g.resets_left).sum();
+            let target = grants.iter().find(|g| g.usable_now && g.resets_left > 0);
+            let shown = target
+                .or_else(|| grants.iter().find(|g| g.resets_left > 0))
+                .unwrap_or(&grants[0]);
+            let hold = match target {
+                _ if available == 0 => None,
+                _ if cooling.is_some() => Some(ResetHold {
+                    reason: ResetHoldReason::Cooldown,
+                    until: cooling.map(str::to_string),
+                }),
+                Some(_) => None,
+                None => Some(ResetHold {
+                    reason: if shown.unavailable_reason.as_deref() == Some("needs_limit")
+                        || (shown.use_requires_limit && !self.at_limit)
+                    {
+                        ResetHoldReason::NotAtLimit
+                    } else {
+                        ResetHoldReason::Blocked
+                    },
+                    until: None,
+                }),
+            };
+            kinds.push(ResetKind {
+                kind: kind.to_string(),
+                available,
+                total: grants.iter().map(|g| g.resets_total).sum(),
+                next_grant_id: target.map(|g| g.id.clone()),
+                label: shown.label.clone(),
+                ends_at: shown.ends_at.clone(),
+                hold,
+            });
+        }
+        let rank = |k: &ResetKind| {
+            KIND_ORDER
+                .iter()
+                .position(|o| *o == k.kind)
+                .unwrap_or(KIND_ORDER.len())
+        };
+        kinds.sort_by_key(rank);
+        kinds
     }
 }
 

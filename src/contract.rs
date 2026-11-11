@@ -124,6 +124,31 @@ pub struct Resets {
     /// Why a reset cannot be spent right now; absent when one can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold: Option<ResetHold>,
+    /// The same bank split by what a reset refills, the way Claude's own
+    /// `/reset` offers them: `session`, `weekly`, `fable` (gives back what
+    /// Fable used of the week) or `full`, in that order. Each is spent on its
+    /// own with `reset <ident> --kind <kind>`. Empty when the provider names
+    /// no kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<ResetKind>,
+}
+
+/// One kind of banked reset: its counts across the live grants of that kind,
+/// the grant a `reset --kind` spends and what stops it now.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetKind {
+    pub kind: String,
+    pub available: u32,
+    pub total: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_grant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold: Option<ResetHold>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

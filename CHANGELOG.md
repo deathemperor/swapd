@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.4 — 2026-11-19
 
 - `auto` goes back to an account it left at its limit once a banked reset is spent on it, instead of waiting out the reset it recorded on the way out. The no-return bar held that account until its old reset whatever was measured, so a reset spent on claude.ai, by the CLI's `/reset` or by `swapd reset` left it out of reach even when it was the only account with quota. The bar now releases when a fetch after the departure shows a window falling before its own reset (#68).
 

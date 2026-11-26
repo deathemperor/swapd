@@ -410,6 +410,33 @@ mod http_tests {
     }
 
     #[test]
+    fn usage_403_for_an_org_without_oauth_is_no_subscription() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/usage");
+            then.status(403).body(
+                r#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_visibility":"user_facing","error_code":"oauth_not_allowed_for_organization"}}}"#,
+            );
+        });
+
+        let err = usage::fetch(&endpoints_at(&server), "at-1").unwrap_err();
+        assert!(matches!(err, DriverError::Http(ref m) if m == "usage: no-subscription"));
+    }
+
+    #[test]
+    fn usage_403_without_that_code_stays_http_403() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/usage");
+            then.status(403)
+                .body(r#"{"type":"error","error":{"type":"permission_error"}}"#);
+        });
+
+        let err = usage::fetch(&endpoints_at(&server), "at-1").unwrap_err();
+        assert!(matches!(err, DriverError::Http(ref m) if m == "usage: http-403"));
+    }
+
+    #[test]
     fn refresh_invalid_grant_is_token_dead() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {

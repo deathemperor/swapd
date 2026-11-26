@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- An account whose subscription lapsed reads `no-subscription` instead of an endless `http-403`/`http-429` backoff. Its login still works and refreshes, but the usage endpoint answers 403 `oauth_not_allowed_for_organization` for a `claude_free` organization, so a downgraded account sat `stale` behind three-day-old windows and a `Max 20x` label, looking throttled. A later 429 no longer overwrites the reason; the next good fetch, after a resubscribe, clears it.
+
 ## 0.3.4 — 2026-11-19
 
 - `auto` goes back to an account it left at its limit once a banked reset is spent on it, instead of waiting out the reset it recorded on the way out. The no-return bar held that account until its old reset whatever was measured, so a reset spent on claude.ai, by the CLI's `/reset` or by `swapd reset` left it out of reach even when it was the only account with quota. The bar now releases when a fetch after the departure shows a window falling before its own reset (#68).

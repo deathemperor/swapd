@@ -977,7 +977,11 @@ impl UsageStore {
         };
         let rate_limited = kind == "http-429";
         row.consecutive_failures += 1;
-        row.last_error = Some(kind.to_string());
+        // A throttle says nothing about the lapsed plan it interrupts; only a
+        // good fetch proves the account was resubscribed.
+        if !(rate_limited && row.last_error.as_deref() == Some("no-subscription")) {
+            row.last_error = Some(kind.to_string());
+        }
         row.last_attempt_at = Some(now);
         if rate_limited {
             // Kept across later successes: the planner floors the cadence
@@ -1285,6 +1289,32 @@ mod tests {
             .record_failure("claude:1", &claim, "http-429", Some(3600.0), None)
             .unwrap();
         assert_eq!(entry(&store).backoff_until, Some(now + 4500.0));
+    }
+
+    #[test]
+    fn no_subscription_outlives_a_later_429_until_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new();
+        let store = store(&dir, &clock);
+
+        let claim = store.reserve(&ident(), false, true).unwrap()["claude:1"].clone();
+        store
+            .record_failure("claude:1", &claim, "no-subscription", None, None)
+            .unwrap();
+        let claim = store.reserve(&ident(), false, true).unwrap()["claude:1"].clone();
+        store
+            .record_failure("claude:1", &claim, "http-429", Some(60.0), None)
+            .unwrap();
+        let e = entry(&store);
+        assert_eq!(e.last_error.as_deref(), Some("no-subscription"));
+        assert_eq!(e.last_429_at, Some(T0));
+
+        clock.advance(120.0);
+        let claim = store.reserve(&ident(), false, true).unwrap()["claude:1"].clone();
+        store
+            .record_success("claude:1", &claim, five(10.0), None, true, 80.0, &[])
+            .unwrap();
+        assert_eq!(entry(&store).last_error, None);
     }
 
     #[test]

@@ -67,11 +67,24 @@ pub fn fetch(ep: &Endpoints, access_token: &str) -> Result<Value, DriverError> {
         // never sees, so the caller is told to do it and retry.
         return Err(DriverError::NeedsRefresh);
     }
+    if reply.status == 403 && no_subscription(&reply.body) {
+        return Err(DriverError::Http("usage: no-subscription".to_string()));
+    }
     if reply.status != 200 {
         return Err(DriverError::Http(format!("usage: http-{}", reply.status)));
     }
     serde_json::from_str(&reply.body)
         .map_err(|_| DriverError::Http("usage: bad-response".to_string()))
+}
+
+/// What the endpoint answers once a subscription lapses: the token still
+/// signs in, but a `claude_free` organization may not use OAuth.
+fn no_subscription(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|v| {
+        v.pointer("/error/details/error_code")
+            .and_then(Value::as_str)
+            == Some("oauth_not_allowed_for_organization")
+    })
 }
 
 /// `build_usage_result` against the current clock.

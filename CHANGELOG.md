@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.5 — 2026-11-26
 
 - An account whose subscription lapsed reads `no-subscription` instead of an endless `http-403`/`http-429` backoff. Its login still works and refreshes, but the usage endpoint answers 403 `oauth_not_allowed_for_organization` for a `claude_free` organization, so a downgraded account sat `stale` behind three-day-old windows and a `Max 20x` label, looking throttled. A later 429 no longer overwrites the reason; the next good fetch, after a resubscribe, clears it.
 
